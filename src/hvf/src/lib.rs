@@ -354,6 +354,39 @@ pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
     Ok(())
 }
 
+fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64)]) {
+    for &(guest_addr, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+
+        let range_end = guest_addr.saturating_add(size);
+        for region in regions.iter_mut() {
+            let region_end = region.guest_addr.saturating_add(region.size);
+            let start = guest_addr.max(region.guest_addr);
+            let end = range_end.min(region_end);
+            if start >= end {
+                continue;
+            }
+
+            let first_block = ((start - region.guest_addr) / DIRTY_BLOCK_SIZE) as usize;
+            let last_block = ((end - 1 - region.guest_addr) / DIRTY_BLOCK_SIZE) as usize;
+            for index in first_block..=last_block {
+                region.blocks[index] = true;
+            }
+        }
+    }
+}
+
+pub fn mark_dirty_ranges(ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(());
+    }
+    mark_dirty_ranges_in_regions(&mut tracker.regions, ranges);
+    Ok(())
+}
+
 pub fn take_dirty_blocks_and_reprotect() -> Result<Vec<DirtyBlock>, Error> {
     let mut tracker = DIRTY_TRACKER.lock().unwrap();
     if !tracker.enabled {
@@ -415,6 +448,72 @@ fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
         return Ok(true);
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_dirty_ranges_marks_intersecting_blocks_only() {
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE * 4,
+            blocks: vec![false; 4],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[(
+                0x1000_0000 + DIRTY_BLOCK_SIZE - 0x1000,
+                DIRTY_BLOCK_SIZE + 0x2000,
+            )],
+        );
+
+        assert_eq!(regions[0].blocks, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn mark_dirty_ranges_ignores_non_overlapping_ranges() {
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE,
+            blocks: vec![false],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[
+                (0x1000_0000 - 0x2000, 0x1000),
+                (0x1000_0000 + DIRTY_BLOCK_SIZE, 0x1000),
+            ],
+        );
+
+        assert_eq!(regions[0].blocks, vec![false]);
+    }
+
+    #[test]
+    fn mark_dirty_ranges_handles_one_tib_region_sparse() {
+        let one_tib = 1_u64 << 40;
+        let block_count = (one_tib / DIRTY_BLOCK_SIZE) as usize;
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x8000_0000,
+            size: one_tib,
+            blocks: vec![false; block_count],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[
+                (0x8000_0000, 0x1000),
+                (0x8000_0000 + one_tib - 0x1000, 0x1000),
+            ],
+        );
+
+        assert_eq!(regions[0].blocks.iter().filter(|block| **block).count(), 2);
+        assert!(regions[0].blocks[0]);
+        assert!(regions[0].blocks[block_count - 1]);
+    }
 }
 
 #[derive(Debug)]

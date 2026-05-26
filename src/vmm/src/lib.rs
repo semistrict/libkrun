@@ -278,7 +278,9 @@ impl Vmm {
         _intc: &IrqChip,
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(u64, u64)>> {
+        let mut written_ranges = Vec::new();
+
         #[cfg(target_arch = "x86_64")]
         {
             let cmdline_len = if cfg!(feature = "tee") {
@@ -301,7 +303,7 @@ impl Vmm {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
-            fdt::create_fdt(
+            let fdt = fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vcpu_mpidr,
@@ -311,16 +313,20 @@ impl Vmm {
                 initrd,
             )
             .map_err(Error::SetupFDT)?;
+            written_ranges.push((self.arch_memory_info.fdt_addr, fdt.len() as u64));
         }
 
         #[cfg(target_arch = "aarch64")]
         {
-            arch::aarch64::configure_system(
+            if let Some(smbios_size) = arch::aarch64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 _smbios_oem_strings,
             )
-            .map_err(Error::ConfigureSystem)?;
+            .map_err(Error::ConfigureSystem)?
+            {
+                written_ranges.push((arch::aarch64::layout::SMBIOS_START, smbios_size));
+            }
         }
 
         #[cfg(target_arch = "riscv64")]
@@ -340,7 +346,7 @@ impl Vmm {
                 .map_err(Error::ConfigureSystem)?;
         }
 
-        Ok(())
+        Ok(written_ranges)
     }
 
     /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
@@ -444,13 +450,17 @@ impl Vmm {
 
     /// Arm write-protect dirty tracking before vCPUs have started running.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn arm_dirty_tracking_pre_vcpu_start(&self) -> std::result::Result<(), String> {
+    pub fn arm_dirty_tracking_pre_vcpu_start(
+        &self,
+        initial_dirty_ranges: &[(u64, u64)],
+    ) -> std::result::Result<(), String> {
         let ranges = self
             .guest_memory
             .iter()
             .map(|region| (region.start_addr().raw_value(), region.len()))
             .collect::<Vec<_>>();
-        hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())
+        hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())?;
+        hvf::mark_dirty_ranges(initial_dirty_ranges).map_err(|e| e.to_string())
     }
 
     /// Restore a previously-captured snapshot into this VMM. The VMM must

@@ -579,6 +579,9 @@ pub fn build_microvm(
             &payload,
         )?;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut initial_dirty_ranges = payload_config.written_ranges.clone();
+
     // Snapshot restore mode (macOS arm64): replace the freshly initialized
     // RAM with the captured pages.img contents before HVF maps guest memory.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1141,17 +1144,24 @@ pub fn build_microvm(
     let restoring_snapshot = false;
 
     if !restoring_snapshot {
-        vmm.configure_system(
-            vcpus.as_slice(),
-            &intc,
-            &payload_config.initrd_config,
-            &vm_resources.smbios_oem_strings,
-        )
-        .map_err(StartMicrovmError::Internal)?;
+        let system_written_ranges = vmm
+            .configure_system(
+                vcpus.as_slice(),
+                &intc,
+                &payload_config.initrd_config,
+                &vm_resources.smbios_oem_strings,
+            )
+            .map_err(StartMicrovmError::Internal)?;
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        vmm.arm_dirty_tracking_pre_vcpu_start()
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("dirty tracking: {e}")))?;
+        {
+            initial_dirty_ranges.extend(system_written_ranges);
+            vmm.arm_dirty_tracking_pre_vcpu_start(&initial_dirty_ranges)
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("dirty tracking: {e}")))?;
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = system_written_ranges;
     }
 
     #[cfg(feature = "tee")]
@@ -1238,7 +1248,16 @@ fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
     external_kernel: &ExternalKernel,
-) -> std::result::Result<(GuestAddress, Option<InitrdConfig>, Option<String>), StartMicrovmError> {
+) -> std::result::Result<
+    (
+        GuestAddress,
+        Option<InitrdConfig>,
+        Option<String>,
+        Vec<(u64, u64)>,
+    ),
+    StartMicrovmError,
+> {
+    let mut written_ranges = Vec::new();
     let entry_addr = match external_kernel.format {
         // Raw images are treated as bundled kernels on x86_64
         #[cfg(target_arch = "x86_64")]
@@ -1248,6 +1267,7 @@ fn load_external_kernel(
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::RawOpenKernel)?;
             guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
+            record_memory_write(&mut written_ranges, 0x8000_0000, data.len());
             GuestAddress(0x8000_0000)
         }
         #[cfg(target_arch = "x86_64")]
@@ -1278,6 +1298,7 @@ fn load_external_kernel(
                 guest_mem
                     .write(&kernel_data, GuestAddress(0x8000_0000))
                     .unwrap();
+                record_memory_write(&mut written_ranges, 0x8000_0000, kernel_data.len());
                 GuestAddress(0x8000_0000)
             } else {
                 return Err(StartMicrovmError::PeGzInvalid);
@@ -1369,6 +1390,7 @@ fn load_external_kernel(
         guest_mem
             .write(&data, GuestAddress(arch_mem_info.initrd_addr))
             .unwrap();
+        record_memory_write(&mut written_ranges, arch_mem_info.initrd_addr, data.len());
         Some(InitrdConfig {
             address: GuestAddress(arch_mem_info.initrd_addr),
             size: data.len(),
@@ -1377,7 +1399,12 @@ fn load_external_kernel(
         None
     };
 
-    Ok((entry_addr, initrd_config, external_kernel.cmdline.clone()))
+    Ok((
+        entry_addr,
+        initrd_config,
+        external_kernel.cmdline.clone(),
+        written_ranges,
+    ))
 }
 
 fn load_payload(
@@ -1391,12 +1418,14 @@ fn load_payload(
         GuestAddress,
         Option<InitrdConfig>,
         Option<String>,
+        Vec<(u64, u64)>,
     ),
     StartMicrovmError,
 > {
     match payload {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         Payload::KernelCopy => {
+            let mut written_ranges = Vec::new();
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
                     (
@@ -1420,7 +1449,14 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
-            Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
+            record_memory_write(&mut written_ranges, kernel_guest_addr, kernel_size);
+            Ok((
+                guest_mem,
+                GuestAddress(kernel_entry_addr),
+                None,
+                None,
+                written_ranges,
+            ))
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
         Payload::KernelMmap => {
@@ -1522,17 +1558,25 @@ fn load_payload(
                 GuestAddress(kernel_entry_addr),
                 None,
                 None,
+                Vec::new(),
             ))
         }
         Payload::ExternalKernel(external_kernel) => {
-            let (entry_addr, initrd_config, cmdline) =
+            let (entry_addr, initrd_config, cmdline, written_ranges) =
                 load_external_kernel(&guest_mem, _arch_mem_info, external_kernel)?;
-            Ok((guest_mem, entry_addr, initrd_config, cmdline))
+            Ok((
+                guest_mem,
+                entry_addr,
+                initrd_config,
+                cmdline,
+                written_ranges,
+            ))
         }
         #[cfg(test)]
-        Payload::Empty => Ok((guest_mem, GuestAddress(0), None, None)),
+        Payload::Empty => Ok((guest_mem, GuestAddress(0), None, None, Vec::new())),
         #[cfg(feature = "tee")]
         Payload::Tee => {
+            let mut written_ranges = Vec::new();
             let (kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
                     (
@@ -1548,6 +1592,7 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
+            record_memory_write(&mut written_ranges, kernel_guest_addr, kernel_size);
 
             let (qboot_host_addr, qboot_size) =
                 if let Some(qboot_bundle) = &_vm_resources.qboot_bundle {
@@ -1560,6 +1605,7 @@ fn load_payload(
             guest_mem
                 .write(qboot_data, GuestAddress(arch::FIRMWARE_START))
                 .unwrap();
+            record_memory_write(&mut written_ranges, arch::FIRMWARE_START, qboot_size);
 
             let (initrd_host_addr, initrd_size) =
                 if let Some(initrd_bundle) = &_vm_resources.initrd_bundle {
@@ -1572,6 +1618,7 @@ fn load_payload(
             guest_mem
                 .write(initrd_data, GuestAddress(_arch_mem_info.initrd_addr))
                 .unwrap();
+            record_memory_write(&mut written_ranges, _arch_mem_info.initrd_addr, initrd_size);
 
             let initrd_config = InitrdConfig {
                 address: GuestAddress(_arch_mem_info.initrd_addr),
@@ -1583,9 +1630,22 @@ fn load_payload(
                 GuestAddress(arch::RESET_VECTOR),
                 Some(initrd_config),
                 None,
+                written_ranges,
             ))
         }
-        Payload::Firmware => Ok((guest_mem, GuestAddress(arch::RESET_VECTOR), None, None)),
+        Payload::Firmware => Ok((
+            guest_mem,
+            GuestAddress(arch::RESET_VECTOR),
+            None,
+            None,
+            Vec::new(),
+        )),
+    }
+}
+
+fn record_memory_write(written_ranges: &mut Vec<(u64, u64)>, guest_addr: u64, size: usize) {
+    if size != 0 {
+        written_ranges.push((guest_addr, size as u64));
     }
 }
 
@@ -1593,6 +1653,7 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+    written_ranges: Vec<(u64, u64)>,
 }
 
 pub fn create_guest_memory(
@@ -1737,7 +1798,7 @@ pub fn create_guest_memory(
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
-    let (guest_mem, entry_addr, initrd_config, cmdline) =
+    let (guest_mem, entry_addr, initrd_config, cmdline, mut written_ranges) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
     // Only write firmware if data exists AND this isn't an ExternalKernel payload
@@ -1747,6 +1808,11 @@ pub fn create_guest_memory(
             guest_mem
                 .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
                 .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+            record_memory_write(
+                &mut written_ranges,
+                arch_mem_info.firmware_addr,
+                firmware_data.len(),
+            );
         }
     }
 
@@ -1754,6 +1820,7 @@ pub fn create_guest_memory(
         entry_addr,
         initrd_config,
         kernel_cmdline: cmdline.clone(),
+        written_ranges,
     };
 
     Ok((guest_mem, arch_mem_info, shm_manager, payload_config))

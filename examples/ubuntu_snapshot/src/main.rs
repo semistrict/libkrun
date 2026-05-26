@@ -2,10 +2,13 @@ use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,6 +65,7 @@ fn main() -> Result<()> {
 
     let (run_tx, run_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
+    let command_done = Arc::new(AtomicBool::new(false));
 
     unsafe {
         call_i32(krun::krun_set_log_level(2), "krun::krun_set_log_level")?;
@@ -110,13 +114,31 @@ fn main() -> Result<()> {
         }
 
         configure_runner(ctx, &home, &cwd)?;
-        spawn_command_client(ctx, have_snapshot, socket.clone(), command, run_rx, done_tx);
-        spawn_snapshot_after_command(ctx, snapshot.clone(), terminal_state.clone(), done_rx);
+        spawn_command_client(
+            ctx,
+            have_snapshot,
+            socket.clone(),
+            console_output.clone(),
+            command,
+            run_rx,
+            done_tx,
+        );
+        spawn_snapshot_after_command(
+            ctx,
+            snapshot.clone(),
+            terminal_state.clone(),
+            command_done.clone(),
+            done_rx,
+        );
         run_tx.send(()).context("start command client")?;
 
         let rc = krun::krun_start_enter(ctx);
         if rc != 0 && have_snapshot {
             restart_without_snapshot(&snapshot, &terminal_state)?;
+        }
+        if !command_done.load(Ordering::SeqCst) {
+            restore_terminal(&terminal_state);
+            bail!("{}", vm_exit_detail(rc, &console_output));
         }
         bail_krun(rc, "krun::krun_start_enter")?;
     }
@@ -241,6 +263,8 @@ fn install_guest_runner(rootfs: &Path) -> Result<()> {
         include_bytes!(concat!(env!("OUT_DIR"), "/krun-command-runner")),
     )
     .with_context(|| format!("write {}", runner_path.display()))?;
+    fs::set_permissions(&runner_path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod 0755 {}", runner_path.display()))?;
     Ok(())
 }
 
@@ -271,6 +295,7 @@ fn spawn_command_client(
     ctx: u32,
     have_snapshot: bool,
     socket: PathBuf,
+    console_output: PathBuf,
     command: Vec<String>,
     start: mpsc::Receiver<()>,
     done: mpsc::Sender<Result<CommandResult, String>>,
@@ -281,8 +306,13 @@ fn spawn_command_client(
             if have_snapshot {
                 arm_dirty_tracking(ctx)?;
             }
-            let mut stream = connect_unix(&socket, Duration::from_secs(30))
-                .with_context(|| format!("connect {}", socket.display()))?;
+            let mut stream = connect_unix(&socket, Duration::from_secs(30)).with_context(|| {
+                format!(
+                    "connect {}{}",
+                    socket.display(),
+                    console_log_hint(&console_output)
+                )
+            })?;
             write_command_vector(&mut stream, &command).context("send command")?;
 
             let mut buf = Vec::new();
@@ -381,17 +411,23 @@ fn spawn_snapshot_after_command(
     ctx: u32,
     snapshot: PathBuf,
     terminal_state: Option<String>,
+    command_done: Arc<AtomicBool>,
     done: mpsc::Receiver<Result<CommandResult, String>>,
 ) {
     thread::spawn(move || {
         let command_result = match done.recv() {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => {
+                command_done.store(true, Ordering::SeqCst);
+                result
+            }
             Ok(Err(e)) => {
+                command_done.store(true, Ordering::SeqCst);
                 restore_terminal(&terminal_state);
                 eprintln!("{e}");
                 std::process::exit(1);
             }
             Err(e) => {
+                command_done.store(true, Ordering::SeqCst);
                 restore_terminal(&terminal_state);
                 eprintln!("command client failed: {e}");
                 std::process::exit(1);
@@ -426,6 +462,39 @@ fn spawn_snapshot_after_command(
         write_command_output_or_exit(&command_result.output);
         std::process::exit(command_result.exit_status);
     });
+}
+
+fn vm_exit_detail(rc: i32, console_output: &Path) -> String {
+    let mut message = if rc == 0 {
+        "VM exited before the command runner completed".to_string()
+    } else {
+        format!("krun::krun_start_enter failed: {}", os_error(rc))
+    };
+    message.push_str(&console_log_hint(console_output));
+    message
+}
+
+fn console_log_hint(path: &Path) -> String {
+    match console_log_excerpt(path) {
+        Some(excerpt) => format!("\n\nVM console:\n{excerpt}"),
+        None => String::new(),
+    }
+}
+
+fn console_log_excerpt(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(4096);
+    let excerpt = String::from_utf8_lossy(&bytes[start..])
+        .trim_end()
+        .to_string();
+    if excerpt.is_empty() {
+        None
+    } else {
+        Some(excerpt)
+    }
 }
 
 fn write_command_output_or_exit(output: &[u8]) {

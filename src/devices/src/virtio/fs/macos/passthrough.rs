@@ -1224,9 +1224,14 @@ fn remove_security_capability(file: &InodeHandle) {
         },
     };
 
-    // ENODATA means the attribute didn't exist, which is fine
-    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-        warn!("Error removing security.capability from file");
+    // ENODATA/ENOATTR mean the attribute didn't exist, which is fine.
+    // ENOTSUP means this host filesystem cannot store the attribute anyway.
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOATTR | libc::ENOTSUP) => {}
+            _ => warn!("Error removing security.capability from file: {err}"),
+        }
     }
 }
 

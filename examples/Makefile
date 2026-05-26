@@ -27,11 +27,11 @@ all: $(EXAMPLES)
 
 krun:
 	rustup target add aarch64-unknown-linux-musl
-	cargo build -p ubuntu_snapshot --bin krun --release
+	cargo build -p krun --bin krun --release
 	rm -rf "$$HOME/.libkrun"/krun-snapshot-*
-	cp target/release/krun $@
+	cp target/release/krun krun/krun
 ifeq ($(OS),Darwin)
-	codesign --entitlements chroot_vm.entitlements --timestamp=none --force -s - $@
+	codesign --entitlements chroot_vm.entitlements --timestamp=none --force -s - krun/krun
 endif
 
 chroot_vm: chroot_vm.c
@@ -80,4 +80,4 @@ rootfs:
 	podman rm libkrun_chroot_vm
 
 clean:
-	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles krun
+	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles krun/krun

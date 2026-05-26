@@ -967,6 +967,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "krun"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "libkrun",
+]
+
+[[package]]
 name = "krun-arch"
 version = "0.1.0-1.18.0"
 dependencies = [
@@ -1745,15 +1754,6 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
-
-[[package]]
-name = "ubuntu_snapshot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "libkrun",
-]
 
 [[package]]
 name = "unicode-ident"

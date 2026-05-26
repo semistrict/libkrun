@@ -1,5 +1,5 @@
 [package]
-name = "ubuntu_snapshot"
+name = "krun"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,4 +10,4 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.98"
 dirs = "6.0.0"
-krun = { package = "libkrun", path = "../../src/libkrun" }
+libkrun = { package = "libkrun", path = "../../src/libkrun" }

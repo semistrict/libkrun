@@ -68,48 +68,51 @@ fn main() -> Result<()> {
     let command_done = Arc::new(AtomicBool::new(false));
 
     unsafe {
-        call_i32(krun::krun_set_log_level(2), "krun::krun_set_log_level")?;
-        let ctx = krun::krun_create_ctx();
+        call_i32(
+            libkrun::krun_set_log_level(2),
+            "libkrun::krun_set_log_level",
+        )?;
+        let ctx = libkrun::krun_create_ctx();
         if ctx < 0 {
-            bail_krun(ctx, "krun::krun_create_ctx")?;
+            bail_krun(ctx, "libkrun::krun_create_ctx")?;
         }
         let ctx = ctx as u32;
 
         let console_output_c = cstring_path(&console_output)?;
         call_i32(
-            krun::krun_set_console_output(ctx, console_output_c.as_ptr()),
-            "krun::krun_set_console_output",
+            libkrun::krun_set_console_output(ctx, console_output_c.as_ptr()),
+            "libkrun::krun_set_console_output",
         )?;
 
         call_i32(
-            krun::krun_set_vm_config(ctx, 2, 8192),
-            "krun::krun_set_vm_config",
+            libkrun::krun_set_vm_config(ctx, 2, 8192),
+            "libkrun::krun_set_vm_config",
         )?;
 
         let rootfs_c = cstring_path(&rootfs)?;
         call_i32(
-            krun::krun_set_root(ctx, rootfs_c.as_ptr()),
-            "krun::krun_set_root",
+            libkrun::krun_set_root(ctx, rootfs_c.as_ptr()),
+            "libkrun::krun_set_root",
         )?;
 
         let home_tag_c = CString::new(HOME_TAG)?;
         let home_c = cstring_path(&home)?;
         call_i32(
-            krun::krun_add_virtiofs3(ctx, home_tag_c.as_ptr(), home_c.as_ptr(), 0, false),
-            "krun::krun_add_virtiofs3(home)",
+            libkrun::krun_add_virtiofs3(ctx, home_tag_c.as_ptr(), home_c.as_ptr(), 0, false),
+            "libkrun::krun_add_virtiofs3(home)",
         )?;
 
         let socket_c = cstring_path(&socket)?;
         call_i32(
-            krun::krun_add_vsock_port2(ctx, RUNNER_PORT, socket_c.as_ptr(), true),
-            "krun::krun_add_vsock_port2(runner)",
+            libkrun::krun_add_vsock_port2(ctx, RUNNER_PORT, socket_c.as_ptr(), true),
+            "libkrun::krun_add_vsock_port2(runner)",
         )?;
 
         if have_snapshot {
             let snapshot_c = cstring_path(&snapshot)?;
             call_i32(
-                krun::krun_set_snapshot_path(ctx, snapshot_c.as_ptr()),
-                "krun::krun_set_snapshot_path",
+                libkrun::krun_set_snapshot_path(ctx, snapshot_c.as_ptr()),
+                "libkrun::krun_set_snapshot_path",
             )?;
         }
 
@@ -132,7 +135,7 @@ fn main() -> Result<()> {
         );
         run_tx.send(()).context("start command client")?;
 
-        let rc = krun::krun_start_enter(ctx);
+        let rc = libkrun::krun_start_enter(ctx);
         if rc != 0 && have_snapshot {
             restart_without_snapshot(&snapshot, &terminal_state)?;
         }
@@ -140,7 +143,7 @@ fn main() -> Result<()> {
             restore_terminal(&terminal_state);
             bail!("{}", vm_exit_detail(rc, &console_output));
         }
-        bail_krun(rc, "krun::krun_start_enter")?;
+        bail_krun(rc, "libkrun::krun_start_enter")?;
     }
 
     Ok(())
@@ -286,8 +289,8 @@ unsafe fn configure_runner(ctx: u32, home: &Path, cwd: &Path) -> Result<()> {
         ptr::null(),
     ];
     call_i32(
-        unsafe { krun::krun_set_exec(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) },
-        "krun::krun_set_exec",
+        unsafe { libkrun::krun_set_exec(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) },
+        "libkrun::krun_set_exec",
     )
 }
 
@@ -351,12 +354,12 @@ struct CommandResult {
 fn arm_dirty_tracking(ctx: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let rc = krun::krun_arm_dirty_tracking(ctx);
+        let rc = libkrun::krun_arm_dirty_tracking(ctx);
         if rc == 0 {
             return Ok(());
         }
         if rc != -ENOENT || Instant::now() >= deadline {
-            bail_krun(rc, "krun::krun_arm_dirty_tracking")?;
+            bail_krun(rc, "libkrun::krun_arm_dirty_tracking")?;
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -440,11 +443,11 @@ fn spawn_snapshot_after_command(
             std::process::exit(1);
         });
         let started = Instant::now();
-        let rc = unsafe { krun::krun_snapshot(ctx, snapshot_c.as_ptr()) };
+        let rc = unsafe { libkrun::krun_snapshot(ctx, snapshot_c.as_ptr()) };
         let snapshot_ms = started.elapsed().as_millis();
         if rc != 0 {
             restore_terminal(&terminal_state);
-            eprintln!("krun::krun_snapshot failed: {}", os_error(rc));
+            eprintln!("libkrun::krun_snapshot failed: {}", os_error(rc));
             std::process::exit(1);
         }
         if let Err(e) = fs::write(snapshot.join("metadata"), SNAPSHOT_METADATA) {
@@ -454,7 +457,7 @@ fn spawn_snapshot_after_command(
         }
         if let Some(home) = dirs::home_dir() {
             let _ = fs::write(
-                home.join(".libkrun/run/ubuntu_snapshot.snapshot_ms"),
+                home.join(".libkrun/run/krun.snapshot_ms"),
                 format!("{snapshot_ms}\n"),
             );
         }
@@ -468,7 +471,7 @@ fn vm_exit_detail(rc: i32, console_output: &Path) -> String {
     let mut message = if rc == 0 {
         "VM exited before the command runner completed".to_string()
     } else {
-        format!("krun::krun_start_enter failed: {}", os_error(rc))
+        format!("libkrun::krun_start_enter failed: {}", os_error(rc))
     };
     message.push_str(&console_log_hint(console_output));
     message

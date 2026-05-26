@@ -21,7 +21,7 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -39,6 +39,30 @@ fn cntvct_el0() -> u64 {
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
 const HV_EXIT_REASON_EXCEPTION: hv_exit_reason_t = 1;
 const HV_EXIT_REASON_VTIMER_ACTIVATED: hv_exit_reason_t = 2;
+
+pub const DIRTY_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirtyBlock {
+    pub guest_addr: u64,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DirtyRegion {
+    guest_addr: u64,
+    size: u64,
+    blocks: Vec<bool>,
+}
+
+#[derive(Default, Debug)]
+struct DirtyTracker {
+    enabled: bool,
+    regions: Vec<DirtyRegion>,
+}
+
+static DIRTY_TRACKER: LazyLock<Mutex<DirtyTracker>> =
+    LazyLock::new(|| Mutex::new(DirtyTracker::default()));
 
 const TMR_CTL_ENABLE: u64 = 1 << 0;
 const TMR_CTL_IMASK: u64 = 1 << 1;
@@ -301,6 +325,98 @@ impl HvfVm {
     }
 }
 
+pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let mut regions = Vec::new();
+    for &(guest_addr, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+        let block_count = size.div_ceil(DIRTY_BLOCK_SIZE) as usize;
+        let ret = unsafe {
+            hv_vm_protect(
+                guest_addr,
+                size as usize,
+                (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::MemoryMap);
+        }
+        regions.push(DirtyRegion {
+            guest_addr,
+            size,
+            blocks: vec![false; block_count],
+        });
+    }
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    tracker.enabled = true;
+    tracker.regions = regions;
+    Ok(())
+}
+
+pub fn take_dirty_blocks_and_reprotect() -> Result<Vec<DirtyBlock>, Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(Vec::new());
+    }
+
+    let mut dirty = Vec::new();
+    for region in &mut tracker.regions {
+        for (index, is_dirty) in region.blocks.iter_mut().enumerate() {
+            if !*is_dirty {
+                continue;
+            }
+            *is_dirty = false;
+            let offset = index as u64 * DIRTY_BLOCK_SIZE;
+            let guest_addr = region.guest_addr + offset;
+            let size = DIRTY_BLOCK_SIZE.min(region.size - offset);
+            let ret = unsafe {
+                hv_vm_protect(
+                    guest_addr,
+                    size as usize,
+                    (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::MemoryMap);
+            }
+            dirty.push(DirtyBlock { guest_addr, size });
+        }
+    }
+    Ok(dirty)
+}
+
+fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(false);
+    }
+
+    for region in &mut tracker.regions {
+        if pa < region.guest_addr || pa >= region.guest_addr + region.size {
+            continue;
+        }
+        let offset = pa - region.guest_addr;
+        let block_index = (offset / DIRTY_BLOCK_SIZE) as usize;
+        let block_offset = block_index as u64 * DIRTY_BLOCK_SIZE;
+        let block_addr = region.guest_addr + block_offset;
+        let block_size = DIRTY_BLOCK_SIZE.min(region.size - block_offset);
+        region.blocks[block_index] = true;
+        let ret = unsafe {
+            hv_vm_protect(
+                block_addr,
+                block_size as usize,
+                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::MemoryMap);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 #[derive(Debug)]
 pub enum VcpuExit<'a> {
     Breakpoint,
@@ -309,6 +425,7 @@ pub enum VcpuExit<'a> {
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
+    DirtyMemory,
     PsciHandled,
     SecureMonitorCall,
     Shutdown,
@@ -664,9 +781,14 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
-                self.pending_advance_pc = true;
 
                 if iswrite {
+                    if dirty_tracking_handle_write_fault(pa)? {
+                        self.pending_advance_pc = false;
+                        return Ok(VcpuExit::DirtyMemory);
+                    }
+
+                    self.pending_advance_pc = true;
                     let val = if srt < 31 {
                         self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
                     } else {
@@ -682,6 +804,7 @@ impl HvfVcpu<'_> {
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
                 } else {
+                    self.pending_advance_pc = true;
                     self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
                     Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
                 }

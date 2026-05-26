@@ -91,7 +91,11 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 const INIT_PATH: &str = "/init.krun";
 
 static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+    LazyLock::new(|| unsafe {
+        std::env::var_os("KRUNFW_PATH")
+            .and_then(|path| libloading::Library::new(path).ok())
+            .or_else(|| libloading::Library::new(KRUNFW_NAME).ok())
+    });
 
 pub struct KrunfwBindings {
     get_kernel: libloading::Symbol<
@@ -2909,6 +2913,32 @@ pub unsafe extern "C" fn krun_snapshot(ctx_id: u32, c_path: *const c_char) -> i3
             }
         }
     }
+}
+
+/// Mac+arm64 only. Arm dirty RAM tracking for a running VM. This is intended
+/// to be called after a restored guest reaches a stable command boundary and
+/// before the command whose effects should be captured incrementally.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[no_mangle]
+pub extern "C" fn krun_arm_dirty_tracking(ctx_id: u32) -> i32 {
+    let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(v) => v,
+        None => return -libc::ENOENT,
+    };
+    let result = vmm.lock().unwrap().arm_dirty_tracking();
+    match result {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("krun_arm_dirty_tracking failed: {e}");
+            -libc::EIO
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[no_mangle]
+pub extern "C" fn krun_arm_dirty_tracking(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
 }
 
 /// Mac+arm64 only. Stub on other targets — always returns -ENOSYS.

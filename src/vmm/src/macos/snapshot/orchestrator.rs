@@ -23,10 +23,10 @@ use crossbeam_channel::RecvTimeoutError;
 use devices::legacy::{GicV3, GicV3State, IrqChip, VcpuList, VcpuListState};
 use devices::virtio::{DeviceSnapshot, MmioTransport, MmioTransportState};
 use serde::{Deserialize, Serialize};
-use vm_memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 use super::container::{SectionId, SnapshotWriter};
-use super::ram::{write_pages_img, RamLayout};
+use super::ram::{clone_and_patch_dirty_pages_img, write_sparse_pages_img, RamLayout};
 use super::{Result, SnapshotError};
 
 const VCPU_PAUSE_TIMEOUT_MS: u64 = 2000;
@@ -41,7 +41,7 @@ pub struct MetaSection {
     pub virtio_bases: Vec<u64>,
     pub vcpu_count: u32,
     pub nested_enabled: bool,
-    /// `CNTVCT_EL0` at capture, for timer rebase on restore.
+    /// `CNTVCT_EL0` at capture, for timer re-arm on restore.
     pub capture_mach_time: u64,
 }
 
@@ -99,6 +99,23 @@ pub fn capture(inputs: CaptureInputs<'_>, dir: &Path) -> Result<()> {
     result?;
     device_resume?;
     vcpu_resume?;
+    Ok(())
+}
+
+pub fn arm_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
+    let vcpu_states = match pause_vcpus(inputs.vcpu_handles, inputs.vcpu_ids) {
+        Ok(states) => states,
+        Err(e) => {
+            let _ = resume_vcpus(inputs.vcpu_handles);
+            return Err(e);
+        }
+    };
+    drop(vcpu_states);
+
+    let result = enable_dirty_tracking(inputs.guest_memory);
+    let resume = resume_vcpus(inputs.vcpu_handles);
+    result?;
+    resume?;
     Ok(())
 }
 
@@ -169,7 +186,13 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
     std::fs::create_dir_all(&stage_dir)?;
 
     let result = (|| {
-        let ram = write_pages_img(inputs.guest_memory, &stage_dir)?;
+        let dirty_blocks = hvf::take_dirty_blocks_and_reprotect()
+            .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("dirty RAM: {e}"))))?;
+        let ram = if dir.join(super::PAGES_IMG).exists() {
+            clone_and_patch_dirty_pages_img(inputs.guest_memory, dir, &stage_dir, &dirty_blocks)?
+        } else {
+            write_sparse_pages_img(inputs.guest_memory, &stage_dir, &dirty_blocks)?
+        };
 
         // 5. Assemble vmstate.bin.
         let mut total_ram: u64 = 0;
@@ -208,6 +231,7 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
 
         writer.write_to_dir(&stage_dir)?;
         publish_snapshot_dir(&stage_dir, dir)?;
+        enable_dirty_tracking(inputs.guest_memory)?;
         Ok(())
     })();
 
@@ -228,6 +252,15 @@ fn resume_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
             .map_err(|e| SnapshotError::DeviceRefused(format!("resume: {e}")))?;
     }
     Ok(())
+}
+
+fn enable_dirty_tracking(mem: &GuestMemoryMmap) -> Result<()> {
+    let ranges = mem
+        .iter()
+        .map(|region| (region.start_addr().raw_value(), region.len()))
+        .collect::<Vec<_>>();
+    hvf::enable_dirty_tracking(&ranges)
+        .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
 }
 
 fn staging_dir(dir: &Path) -> PathBuf {
@@ -320,7 +353,7 @@ fn resume_vcpus(handles: &[crate::vstate::VcpuHandle]) -> Result<()> {
 
 /// Restore-side: given a fully-built (post-activate but pre-vCPU-run) VMM and
 /// a SnapshotReader, push the captured state into vCPUs, GIC, and devices,
-/// then rebase the virtual timer. Caller has already constructed memory from
+/// then re-arm the virtual timer. Caller has already constructed memory from
 /// `pages.img`, so guest RAM is in place.
 pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Result<()> {
     use crate::vstate::{VcpuEvent, VcpuResponse};

@@ -484,8 +484,8 @@ impl HvfVcpu<'_> {
             }
         }
 
-        // Restore the captured offset as a baseline. The snapshot orchestrator
-        // then adds the host elapsed-time delta before the vCPU is resumed.
+        // Restore the captured offset as the baseline. The snapshot
+        // orchestrator later re-arms pending timer state before resuming.
         unsafe {
             let _ = hv_vcpu_set_vtimer_offset(id, st.vtimer_offset);
         }
@@ -508,22 +508,10 @@ impl HvfVcpu<'_> {
         Ok(())
     }
 
-    /// Add `delta_ticks` to HVF's vtimer offset so the guest sees no time
-    /// elapsed across snapshot/restore. Uses `hv_vcpu_set_vtimer_offset` —
-    /// the userspace-accessible CNTVOFF equivalent that works in non-nested
-    /// HVF (unlike CNTVOFF_EL2 which requires nested virt).
-    pub fn rebase_timer(&self, delta_ticks: u64) -> Result<(), Error> {
-        let mut cur: u64 = 0;
-        // SAFETY: FFI. Read current offset, add the wall-time delta, write back.
-        // This is the userspace-accessible equivalent of advancing CNTVOFF_EL2:
-        // the guest's CNTVCT_EL0 now reads back the same value it did at capture,
-        // not the (much later) host counter.
-        let new_offset_target;
-        unsafe {
-            hv_vcpu_get_vtimer_offset(self.vcpuid, &mut cur as *mut _);
-            new_offset_target = cur.wrapping_add(delta_ticks);
-            let _ = hv_vcpu_set_vtimer_offset(self.vcpuid, new_offset_target);
-        }
+    /// Restore-side timer kick after host time elapsed while the VM was not
+    /// running. The saved vtimer offset already makes CNTVCT_EL0 advance by
+    /// wall time on restore, so do not offset it again here.
+    pub fn rebase_timer(&self, _delta_ticks: u64) -> Result<(), Error> {
         if let (Ok(cval), Ok(ctl)) = (
             Self::raw_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16),
             Self::raw_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16),
@@ -552,7 +540,7 @@ impl HvfVcpu<'_> {
             let _ = Self::raw_set_sys_reg(
                 self.vcpuid,
                 hv_sys_reg_t_HV_SYS_REG_CNTHP_CVAL_EL2 as u16,
-                cval.wrapping_add(delta_ticks),
+                cval,
             );
             if let Ok(ctl) =
                 Self::raw_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_CNTHP_CTL_EL2 as u16)

@@ -63,7 +63,7 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
@@ -419,6 +419,38 @@ impl Vmm {
             nested_enabled: ctx.nested_enabled,
         };
         crate::macos::snapshot::capture(inputs, path).map_err(|e| e.to_string())
+    }
+
+    /// Pause the restored VM briefly and arm write-protect dirty tracking for
+    /// subsequent incremental snapshot capture.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn arm_dirty_tracking(&mut self) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::orchestrator::arm_dirty_tracking(&inputs).map_err(|e| e.to_string())
+    }
+
+    /// Arm write-protect dirty tracking before vCPUs have started running.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn arm_dirty_tracking_pre_vcpu_start(&self) -> std::result::Result<(), String> {
+        let ranges = self
+            .guest_memory
+            .iter()
+            .map(|region| (region.start_addr().raw_value(), region.len()))
+            .collect::<Vec<_>>();
+        hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())
     }
 
     /// Restore a previously-captured snapshot into this VMM. The VMM must

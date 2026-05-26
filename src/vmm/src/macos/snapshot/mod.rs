@@ -2,7 +2,7 @@
 //
 // On-disk layout (directory):
 //   <path>/vmstate.bin   — header + TOC + bincode-encoded sections (small)
-//   <path>/pages.img     — raw guest RAM, page-aligned, used as mmap backing on restore
+//   <path>/pages.img     — raw guest RAM, patched incrementally after first capture
 
 pub mod container;
 pub mod orchestrator;

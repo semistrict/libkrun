@@ -1135,27 +1135,23 @@ pub fn build_microvm(
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
-
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(snap_path) = &vm_resources.snapshot_restore_path {
-        use crate::macos::snapshot::{
-            container::SnapshotReader, orchestrator::MetaSection, ram::load_pages_img_into,
-            SectionId,
-        };
-        let reader = SnapshotReader::open(snap_path)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
-        let meta: MetaSection = reader
-            .get_bincode(SectionId::Meta, 0)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
-        load_pages_img_into(&vmm.guest_memory, snap_path, &meta.ram)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img reload: {e}")))?;
+    let restoring_snapshot = vm_resources.snapshot_restore_path.is_some();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let restoring_snapshot = false;
+
+    if !restoring_snapshot {
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        vmm.arm_dirty_tracking_pre_vcpu_start()
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("dirty tracking: {e}")))?;
     }
 
     #[cfg(feature = "tee")]

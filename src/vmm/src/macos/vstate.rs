@@ -409,6 +409,7 @@ impl Vcpu {
                     }
                     Ok(VcpuEmulation::Handled)
                 }
+                VcpuExit::DirtyMemory => Ok(VcpuEmulation::Handled),
                 VcpuExit::PsciHandled => {
                     debug!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)
@@ -660,8 +661,7 @@ pub enum VcpuEvent {
     Resume,
     /// Apply a captured HvfVcpuState (bincode-encoded) — only legal while paused.
     RestoreState(Vec<u8>),
-    /// Add `delta_ticks` to CNTVOFF_EL2 — only legal while paused. Used to
-    /// rebase the guest's view of the virtual counter after a snapshot/restore.
+    /// Re-arm virtual timer state after snapshot restore — only legal while paused.
     RebaseTimer(u64),
 }
 

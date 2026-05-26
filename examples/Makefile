@@ -11,7 +11,9 @@ CFLAGS = -O2 -g -I../include
 ROOTFS_DISTRO := fedora
 ROOTFS_DIR = rootfs_$(ROOTFS_DISTRO)
 
-.PHONY: clean rootfs
+.DEFAULT_GOAL := krun
+
+.PHONY: clean rootfs krun
 
 EXAMPLES := boot_efi chroot_vm external_kernel consoles snapshot_demo
 ifeq ($(SEV),1)
@@ -22,6 +24,15 @@ ifeq ($(TDX),1)
 endif
 
 all: $(EXAMPLES)
+
+krun:
+	rustup target add aarch64-unknown-linux-musl
+	cargo build -p ubuntu_snapshot --bin krun --release
+	rm -rf "$$HOME/.libkrun"/krun-snapshot-*
+	cp target/release/krun $@
+ifeq ($(OS),Darwin)
+	codesign --entitlements chroot_vm.entitlements --timestamp=none --force -s - $@
+endif
 
 chroot_vm: chroot_vm.c
 	gcc -o $@ $< $(CFLAGS) $(LDFLAGS_$(ARCH)_$(OS))
@@ -69,4 +80,4 @@ rootfs:
 	podman rm libkrun_chroot_vm
 
 clean:
-	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles
+	rm -rf chroot_vm $(ROOTFS_DIR) launch-tee boot_efi external_kernel nitro consoles krun

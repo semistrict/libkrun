@@ -209,6 +209,10 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+
+    // Snapshot/restore support (macOS arm64 / HVF only).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    snapshot_ctx: Option<crate::macos::vstate::SnapshotCtx>,
 }
 
 impl Vmm {
@@ -393,6 +397,53 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
+    }
+
+    /// Capture a snapshot of this running VMM into `path` (a directory).
+    /// Pauses every vCPU and virtio device, writes vmstate.bin + pages.img,
+    /// then resumes. Mac+arm64 only.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::capture(inputs, path).map_err(|e| e.to_string())
+    }
+
+    /// Restore a previously-captured snapshot into this VMM. The VMM must
+    /// already have been built with matching configuration (vcpu count,
+    /// device count, MMIO bases) and vCPUs started — but kernel boot will be
+    /// overridden by the captured PC.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_from(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let reader =
+            crate::macos::snapshot::SnapshotReader::open(path).map_err(|e| e.to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
     }
 }
 

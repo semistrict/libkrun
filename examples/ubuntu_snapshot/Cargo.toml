@@ -1,0 +1,8 @@
+[package]
+name = "ubuntu_snapshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+dirs = "6.0.0"

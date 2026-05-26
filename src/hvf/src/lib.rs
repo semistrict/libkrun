@@ -8,6 +8,8 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod state;
 
 #[macro_use]
 extern crate log;
@@ -26,8 +28,12 @@ use std::time::Duration;
 use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
 use log::debug;
 
-extern "C" {
-    pub fn mach_absolute_time() -> u64;
+#[cfg(target_arch = "aarch64")]
+fn cntvct_el0() -> u64 {
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+    unsafe { mach_absolute_time() }
 }
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
@@ -156,7 +162,7 @@ pub enum InterruptType {
     Fiq,
 }
 
-pub trait Vcpus {
+pub trait Vcpus: Send + Sync {
     fn set_vtimer_irq(&self, vcpuid: u64);
     fn should_wait(&self, vcpuid: u64) -> bool;
     fn has_pending_irq(&self, vcpuid: u64) -> bool;
@@ -516,11 +522,35 @@ impl HvfVcpu<'_> {
             .unwrap();
         let irq_state = (ctl & (TMR_CTL_ENABLE | TMR_CTL_IMASK | TMR_CTL_ISTATUS))
             == (TMR_CTL_ENABLE | TMR_CTL_ISTATUS);
-        vcpu_list.set_vtimer_irq(self.vcpuid);
+        if irq_state {
+            vcpu_list.set_vtimer_irq(self.vcpuid);
+        }
         if !irq_state {
             vcpu_set_vtimer_mask(self.vcpuid, false).unwrap();
             self.vtimer_masked = false;
         }
+    }
+
+    pub fn vtimer_wait_duration(&self) -> Option<Duration> {
+        let ctl = self
+            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)
+            .ok()?;
+        if (ctl & TMR_CTL_ENABLE) == 0 || (ctl & TMR_CTL_IMASK) != 0 {
+            return None;
+        }
+
+        let cval = self
+            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)
+            .ok()?;
+        let mut offset: u64 = 0;
+        unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
+        let guest_now = cntvct_el0().wrapping_sub(offset);
+        let duration = if guest_now >= cval {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq))
+        };
+        Some(duration)
     }
 
     fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
@@ -550,9 +580,7 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
-
+    pub fn complete_pending_emulation(&mut self) -> Result<(), Error> {
         if let Some(mmio_read) = self.pending_mmio_read.take() {
             if mmio_read.srt < 31 {
                 let val = match mmio_read.len {
@@ -576,7 +604,16 @@ impl HvfVcpu<'_> {
             self.pending_advance_pc = false;
         }
 
+        Ok(())
+    }
+
+    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+
+        self.complete_pending_emulation()?;
+
         if pending_irq {
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, false)?;
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
 
@@ -710,14 +747,17 @@ impl HvfVcpu<'_> {
                     return Ok(VcpuExit::WaitForEvent);
                 }
 
-                // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
-                if now > cval {
+                let mut offset: u64 = 0;
+                // SAFETY: FFI.
+                unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
+                let host_now = cntvct_el0();
+                let guest_now = host_now.wrapping_sub(offset);
+                if guest_now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
-
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                let timeout =
+                    Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq));
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),
@@ -725,7 +765,22 @@ impl HvfVcpu<'_> {
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }
-            _ => panic!("unexpected exception: 0x{ec:x}"),
+            _ => {
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);
+                let hcr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_HCR_EL2)
+                    .unwrap_or(0);
+                let vtcr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_VTCR_EL2)
+                    .unwrap_or(0);
+                let vttbr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2)
+                    .unwrap_or(0);
+                panic!(
+                    "unexpected exception: ec=0x{ec:x} syndrome=0x{syndrome:x} pc=0x{pc:x} ipa=0x{:x} hcr=0x{hcr:x} vtcr=0x{vtcr:x} vttbr=0x{vttbr:x}",
+                    self.vcpu_exit.exception.physical_address
+                )
+            }
         }
     }
 }

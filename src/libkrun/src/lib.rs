@@ -166,6 +166,10 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    /// If set, `krun_start_enter` will restore from this snapshot directory
+    /// instead of doing a fresh boot.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    snapshot_restore_path: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -430,6 +434,12 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 }
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Registry of running VMMs, populated by `krun_start_enter` so that
+/// `krun_snapshot` can find the Vmm to operate on from another thread.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static RUNNING_VMMS: Lazy<Mutex<HashMap<u32, std::sync::Arc<Mutex<vmm::Vmm>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
@@ -2796,6 +2806,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        ctx_cfg.vmr.snapshot_restore_path = ctx_cfg.snapshot_restore_path.clone();
+    }
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
@@ -2808,6 +2823,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        RUNNING_VMMS.lock().unwrap().insert(ctx_id, _vmm.clone());
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
@@ -2853,4 +2873,76 @@ fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
             -libc::EINVAL
         }
     }
+}
+
+/// Mac+arm64 only. Capture a snapshot of a running VM into `path` (a directory
+/// that will be created). The VM must have been started by a prior call to
+/// `krun_start_enter` on this ctx_id; the call blocks until the snapshot is
+/// durable and the VM has been resumed.
+///
+/// Returns 0 on success, a negated errno on failure (-ENOENT if the ctx is not
+/// running, -EPERM if a device refuses snapshot, -EIO on I/O errors).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot(ctx_id: u32, c_path: *const c_char) -> i32 {
+    if c_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match CStr::from_ptr(c_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return -libc::EINVAL,
+    };
+    let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(v) => v,
+        None => return -libc::ENOENT,
+    };
+    let result = vmm.lock().unwrap().snapshot(&path);
+    match result {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("krun_snapshot failed: {e}");
+            // Crude mapping: device-refused → EPERM, everything else → EIO.
+            if e.contains("device refused") || e.contains("connections") {
+                -libc::EPERM
+            } else {
+                -libc::EIO
+            }
+        }
+    }
+}
+
+/// Mac+arm64 only. Stub on other targets — always returns -ENOSYS.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot(_ctx_id: u32, _c_path: *const c_char) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Mark this ctx for restore-from-snapshot. Must be called before
+/// `krun_start_enter`. Caller is responsible for matching vcpu count, RAM
+/// size, and device configuration to what was captured.
+///
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_snapshot_path(ctx_id: u32, c_path: *const c_char) -> i32 {
+    if c_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match CStr::from_ptr(c_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return -libc::EINVAL,
+    };
+    match CTX_MAP.lock().unwrap().get_mut(&ctx_id) {
+        Some(cfg) => {
+            cfg.snapshot_restore_path = Some(path);
+            KRUN_SUCCESS
+        }
+        None => -libc::ENOENT,
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_snapshot_path(_ctx_id: u32, _c_path: *const c_char) -> i32 {
+    -libc::ENOSYS
 }

@@ -134,6 +134,19 @@ impl UnixProxy {
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
+        #[cfg(target_os = "macos")]
+        {
+            let option_value: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &option_value as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&option_value) as libc::socklen_t,
+                )
+            };
+        }
         UnixProxy {
             id,
             cid,
@@ -501,11 +514,22 @@ impl Proxy for UnixProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         self.switch_to_connected();
+        let (signal_queue, wait_credit) = self.recv_pkt();
 
-        ProxyUpdate {
+        let mut update = ProxyUpdate {
             polling: Some((self.id, self.fd.as_raw_fd(), EventSet::IN)),
+            signal_queue,
             ..Default::default()
+        };
+        if wait_credit {
+            self.status = ProxyStatus::WaitingCreditUpdate;
+            update.push_credit_req = Some(MuxerRx::CreditRequest {
+                local_port: self.local_port,
+                peer_port: self.peer_port,
+                fwd_cnt: self.tx_cnt.0,
+            });
         }
+        update
     }
 
     fn enqueue_accept(&mut self) {
@@ -627,6 +651,17 @@ pub struct UnixAcceptorProxy {
 
 impl UnixAcceptorProxy {
     pub fn new(id: u64, path: &PathBuf, peer_port: u32) -> Result<Self, ProxyError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(ProxyError::CreatingSocket(
+                    e.raw_os_error()
+                        .map(Errno::from_raw)
+                        .unwrap_or(Errno::EINVAL),
+                ));
+            }
+        }
         let fd = socket(
             AddressFamily::Unix,
             SockType::Stream,
@@ -697,6 +732,10 @@ impl Proxy for UnixAcceptorProxy {
         if evset.contains(EventSet::IN) {
             match accept(self.fd.as_raw_fd()) {
                 Ok(accept_fd) => {
+                    info!(
+                        "unix acceptor accepted host connection: id={} peer_port={}",
+                        self.id, self.peer_port
+                    );
                     // Safe because we've just obtained the FD from the `accept` call above.
                     let new_fd = unsafe { OwnedFd::from_raw_fd(accept_fd) };
                     update.new_proxy = Some((

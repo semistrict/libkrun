@@ -8,13 +8,17 @@ use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice, TYPE_NET,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    InterruptTransport, QueueConfig, VirtioDevice, TYPE_NET,
 };
 use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
-use super::worker::NetWorker;
+use super::worker::{NetWorker, NetWorkerStopResult};
+
+use serde::{Deserialize, Serialize};
+use std::thread::JoinHandle;
+use utils::eventfd::EventFd;
 
 use std::cmp;
 use std::io::Write;
@@ -79,6 +83,9 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    worker_thread: Option<(JoinHandle<NetWorkerStopResult>, EventFd)>,
+    paused: Option<NetWorkerStopResult>,
 }
 
 impl Net {
@@ -109,6 +116,9 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+
+            worker_thread: None,
+            paused: None,
         })
     }
 
@@ -190,7 +200,12 @@ impl VirtioDevice for Net {
             self.cfg_backend.clone(),
         ) {
             Ok(worker) => {
-                worker.run();
+                let stop_fd = worker.stop_fd().try_clone().map_err(|err| {
+                    error!("dup net stop_fd: {err}");
+                    ActivateError::BadActivate
+                })?;
+                let handle = worker.run();
+                self.worker_thread = Some((handle, stop_fd));
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }
@@ -207,4 +222,90 @@ impl VirtioDevice for Net {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn pause(&mut self) -> std::result::Result<(), DeviceSnapshotError> {
+        if self.paused.is_some() {
+            return Ok(());
+        }
+        let (handle, stop_fd) = match self.worker_thread.take() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let _ = stop_fd.write(1);
+        let res = handle
+            .join()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("net worker join: {e:?}")))?;
+        self.paused = Some(res);
+        Ok(())
+    }
+
+    fn resume(&mut self) -> std::result::Result<(), DeviceSnapshotError> {
+        let stop = match self.paused.take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(m, i) => (m.clone(), i.clone()),
+            DeviceState::Inactive => {
+                return Err(DeviceSnapshotError::Invalid(
+                    "net resume on inactive device".into(),
+                ))
+            }
+        };
+        let worker = NetWorker::from_parts(stop.rx_q, stop.tx_q, interrupt, mem, stop.backend)
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("net resume: {e:?}")))?;
+        let stop_fd = worker
+            .stop_fd()
+            .try_clone()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("dup net stop_fd: {e}")))?;
+        let handle = worker.run();
+        self.worker_thread = Some((handle, stop_fd));
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> std::result::Result<DeviceSnapshot, DeviceSnapshotError> {
+        let stop = self
+            .paused
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("net serialize before pause".into()))?;
+        let queues = vec![stop.rx_q.queue.to_state(), stop.tx_q.queue.to_state()];
+        let body = NetSnapshotBody {
+            mac: self.config.mac,
+            acked_features: self.acked_features,
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(
+        &mut self,
+        snap: &DeviceSnapshot,
+    ) -> std::result::Result<(), DeviceSnapshotError> {
+        let stop = self
+            .paused
+            .as_mut()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("net restore before pause".into()))?;
+        if snap.queues.len() != 2 {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "net: expected 2 queues, got {}",
+                snap.queues.len()
+            )));
+        }
+        let body: NetSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        if body.mac != self.config.mac {
+            return Err(DeviceSnapshotError::Invalid("net MAC mismatch".into()));
+        }
+        self.acked_features = body.acked_features;
+        stop.rx_q.queue.restore_state(&snap.queues[0]);
+        stop.tx_q.queue.restore_state(&snap.queues[1]);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NetSnapshotBody {
+    mac: [u8; 6],
+    acked_features: u64,
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -14,8 +14,8 @@ use super::reaper::ReaperThread;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
-use super::tsi_stream::TsiStreamProxy;
-use super::unix::UnixProxy;
+use super::tsi_stream::{StreamListenerSnapshot, TsiStreamProxy};
+use super::unix::{UnixAcceptorProxy, UnixProxy};
 use super::TsiFlags;
 use super::VsockError;
 use crossbeam_channel::{unbounded, Sender};
@@ -171,6 +171,97 @@ impl VsockMuxer {
 
     pub(crate) fn has_pending_rx(&self) -> bool {
         !self.rxq.lock().unwrap().is_empty()
+    }
+
+    pub fn stream_listener_snapshots(&self) -> Vec<StreamListenerSnapshot> {
+        self.proxy_map
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|proxy| proxy.lock().unwrap().stream_listener_snapshot())
+            .collect()
+    }
+
+    pub fn restore_stream_listeners(
+        &self,
+        listeners: &[StreamListenerSnapshot],
+    ) -> Result<(), String> {
+        let mem = self
+            .mem
+            .as_ref()
+            .ok_or_else(|| "vsock muxer not activated".to_string())?
+            .clone();
+        let queue = self
+            .queue
+            .as_ref()
+            .ok_or_else(|| "vsock muxer missing rx queue".to_string())?
+            .clone();
+
+        let mut proxy_map = self.proxy_map.write().unwrap();
+        for listener in listeners {
+            if let Some(old) = proxy_map.remove(&listener.id) {
+                let fd = old.lock().unwrap().as_raw_fd();
+                self.update_polling(listener.id, fd, EventSet::empty());
+            }
+            let proxy = TsiStreamProxy::restore_listener(
+                listener,
+                self.cid,
+                mem.clone(),
+                queue.clone(),
+                self.rxq.clone(),
+            )
+            .map_err(|e| format!("restore listener {}: {e}", listener.id))?;
+            let fd = proxy.as_raw_fd();
+            proxy_map.insert(listener.id, Mutex::new(Box::new(proxy)));
+            self.update_polling(listener.id, fd, EventSet::IN);
+        }
+        Ok(())
+    }
+
+    pub fn restore_unix_acceptors(&self) -> Result<(), String> {
+        let Some(ipc_map) = &self.unix_ipc_port_map else {
+            return Ok(());
+        };
+
+        let mut proxy_map = self.proxy_map.write().unwrap();
+        for (port, (path, do_listen)) in ipc_map {
+            if !do_listen {
+                continue;
+            }
+
+            let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            info!(
+                "restoring listening vsock proxy at {:?} for guest port {}",
+                path, port
+            );
+            if let Some(old) = proxy_map.remove(&id) {
+                let fd = old.lock().unwrap().as_raw_fd();
+                self.update_polling(id, fd, EventSet::empty());
+            }
+
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "remove stale vsock listener path {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+
+            let proxy = UnixAcceptorProxy::new(id, path, *port)
+                .map_err(|e| format!("restore unix acceptor {}: {e}", path.display()))?;
+            let fd = proxy.as_raw_fd();
+            proxy_map.insert(id, Mutex::new(Box::new(proxy)));
+            self.update_polling(id, fd, EventSet::IN);
+            info!(
+                "restored listening vsock proxy at {:?} for guest port {}",
+                path, port
+            );
+        }
+
+        Ok(())
     }
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
@@ -527,8 +618,24 @@ impl VsockMuxer {
             _ => {
                 if pkt.op() == uapi::VSOCK_OP_RW {
                     self.process_dgram_rw(pkt);
+                } else if pkt.op() == uapi::VSOCK_OP_RST {
+                    debug!(
+                        "ignoring dgram reset packet: src_cid={} dst_cid={} src_port={} dst_port={}",
+                        pkt.src_cid(),
+                        pkt.dst_cid(),
+                        pkt.src_port(),
+                        pkt.dst_port()
+                    );
                 } else {
-                    error!("unexpected dgram pkt: {}", pkt.op());
+                    error!(
+                        "unexpected dgram pkt: op={} src_cid={} dst_cid={} src_port={} dst_port={} len={}",
+                        pkt.op(),
+                        pkt.src_cid(),
+                        pkt.dst_cid(),
+                        pkt.src_port(),
+                        pkt.dst_port(),
+                        pkt.len()
+                    );
                 }
             }
         }

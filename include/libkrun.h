@@ -1353,6 +1353,37 @@ int32_t krun_set_root_disk_remount(uint32_t ctx_id, const char *device, const ch
  */
 int32_t krun_start_enter(uint32_t ctx_id);
 
+/**
+ * Capture a snapshot of a running VM into `path` (a directory that will be
+ * created or overwritten). Blocks until the snapshot is durable on disk and
+ * the VM has been resumed.
+ *
+ * macOS arm64 only. Returns -ENOSYS on other targets.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID whose VM is running.
+ *  "path"   - directory path for the snapshot; will contain vmstate.bin +
+ *             pages.img on success.
+ *
+ * Returns:
+ *  0        - success.
+ *  -ENOENT  - no running VM for this ctx_id.
+ *  -EPERM   - a device refused snapshot (e.g. vsock has open connections).
+ *  -EIO     - I/O failure writing the snapshot.
+ *  -EINVAL  - bad arguments.
+ *  -ENOSYS  - snapshot not supported on this target.
+ */
+int32_t krun_snapshot(uint32_t ctx_id, const char *path);
+
+/**
+ * Mark a context to restore from a snapshot instead of doing a fresh boot.
+ * Must be called before `krun_start_enter`. The caller is responsible for
+ * configuring the VM (vcpu count, RAM size, devices) to match the snapshot.
+ *
+ * macOS arm64 only. Returns -ENOSYS on other targets.
+ */
+int32_t krun_set_snapshot_path(uint32_t ctx_id, const char *path);
+
 #ifdef __cplusplus
 }
 #endif

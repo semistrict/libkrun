@@ -11,17 +11,20 @@ use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    Queue as VirtQueue, QueueConfig, VirtioDevice,
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
+use super::tsi_stream::StreamListenerSnapshot;
 use super::TsiFlags;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+
+use serde::{Deserialize, Serialize};
 
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
@@ -40,6 +43,7 @@ pub struct Vsock {
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
+    pub(crate) queue_ev: Option<Arc<Mutex<VirtQueue>>>,
     // Queue events are stored separately for event handling.
     pub(crate) queue_events: Vec<Arc<EventFd>>,
     pub(crate) avail_features: u64,
@@ -61,6 +65,7 @@ impl Vsock {
             muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
             queue_rx: None,
             queue_tx: None,
+            queue_ev: None,
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -178,6 +183,39 @@ impl Vsock {
 
         have_used
     }
+
+    fn send_transport_reset_event(&self) -> Result<(), DeviceSnapshotError> {
+        let (mem, interrupt) = match self.device_state {
+            DeviceState::Activated(ref mem, ref interrupt) => (mem, interrupt),
+            DeviceState::Inactive => return Ok(()),
+        };
+
+        let queue_ev = self
+            .queue_ev
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("vsock event queue missing".into()))?;
+        let mut queue_ev = queue_ev.lock().unwrap();
+        let Some(head) = queue_ev.pop(mem) else {
+            return Err(DeviceSnapshotError::Invalid(
+                "vsock event queue has no descriptor for transport reset".into(),
+            ));
+        };
+
+        let event = uapi::VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le_bytes();
+        mem.write_slice(&event, head.addr).map_err(|e| {
+            DeviceSnapshotError::Invalid(format!("vsock transport reset event write: {e:?}"))
+        })?;
+        queue_ev
+            .add_used(mem, head.index, event.len() as u32)
+            .map_err(|e| {
+                DeviceSnapshotError::Invalid(format!(
+                    "vsock transport reset event used ring: {e:?}"
+                ))
+            })?;
+        interrupt.signal_used_queue();
+
+        Ok(())
+    }
 }
 
 impl VirtioDevice for Vsock {
@@ -255,13 +293,13 @@ impl VirtioDevice for Vsock {
 
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
-        // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
+        let ev_queue = queues_vec.pop().unwrap();
         let tx_queue = queues_vec.pop().unwrap();
         let rx_queue = queues_vec.pop().unwrap();
 
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
+        self.queue_ev = Some(Arc::new(Mutex::new(ev_queue)));
         self.muxer.activate(
             mem.clone(),
             self.queue_rx.clone().unwrap(),
@@ -276,4 +314,78 @@ impl VirtioDevice for Vsock {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            interrupt.signal_used_queue();
+        }
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        self.send_transport_reset_event()?;
+
+        let mut queues = Vec::new();
+        for q in [&self.queue_rx, &self.queue_tx, &self.queue_ev] {
+            let q = q
+                .as_ref()
+                .ok_or_else(|| DeviceSnapshotError::Invalid("vsock not activated".into()))?;
+            queues.push(q.lock().unwrap().to_state());
+        }
+
+        let body = VsockSnapshotBody {
+            cid: self.cid,
+            acked_features: self.acked_features,
+            stream_listeners: self.muxer.stream_listener_snapshots(),
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        if snap.queues.len() != 3 {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock: expected 3 queues, got {}",
+                snap.queues.len()
+            )));
+        }
+        let body: VsockSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        if body.cid != self.cid {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock cid mismatch: snapshot={} current={}",
+                body.cid, self.cid
+            )));
+        }
+        self.acked_features = body.acked_features;
+        if let Some(q) = &self.queue_rx {
+            q.lock().unwrap().restore_state(&snap.queues[0]);
+        }
+        if let Some(q) = &self.queue_tx {
+            q.lock().unwrap().restore_state(&snap.queues[1]);
+        }
+        if let Some(q) = &self.queue_ev {
+            q.lock().unwrap().restore_state(&snap.queues[2]);
+        }
+        self.muxer
+            .restore_unix_acceptors()
+            .map_err(DeviceSnapshotError::Invalid)?;
+        self.muxer
+            .restore_stream_listeners(&body.stream_listeners)
+            .map_err(DeviceSnapshotError::Invalid)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VsockSnapshotBody {
+    cid: u64,
+    acked_features: u64,
+    #[serde(default)]
+    stream_listeners: Vec<StreamListenerSnapshot>,
 }

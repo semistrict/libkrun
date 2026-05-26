@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::Wrapping;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
@@ -37,6 +37,90 @@ use utils::epoll::EventSet;
 
 use vm_memory::GuestMemoryMmap;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum StreamListenerAddr {
+    Inet {
+        ip: [u8; 4],
+        port: u16,
+    },
+    Inet6 {
+        ip: [u8; 16],
+        port: u16,
+        flowinfo: u32,
+        scope_id: u32,
+    },
+    Unix {
+        path: PathBuf,
+    },
+}
+
+impl StreamListenerAddr {
+    fn from_sockaddr(addr: &SockaddrStorage) -> Option<Self> {
+        if let Some(sin) = addr.as_sockaddr_in() {
+            return Some(Self::Inet {
+                ip: sin.ip().octets(),
+                port: sin.port(),
+            });
+        }
+        if let Some(sin6) = addr.as_sockaddr_in6() {
+            return Some(Self::Inet6 {
+                ip: sin6.ip().octets(),
+                port: sin6.port(),
+                flowinfo: sin6.flowinfo(),
+                scope_id: sin6.scope_id(),
+            });
+        }
+        if let Some(unix) = addr.as_unix_addr() {
+            return unix.path().map(|path| Self::Unix {
+                path: path.to_path_buf(),
+            });
+        }
+        None
+    }
+
+    fn to_sockaddr(&self) -> SockaddrStorage {
+        match self {
+            Self::Inet { ip, port } => SocketAddrV4::new(Ipv4Addr::from(*ip), *port).into(),
+            Self::Inet6 {
+                ip,
+                port,
+                flowinfo,
+                scope_id,
+            } => SocketAddrV6::new(Ipv6Addr::from(*ip), *port, *flowinfo, *scope_id).into(),
+            Self::Unix { path } => {
+                let unix = nix::sys::socket::UnixAddr::new(path).unwrap();
+                unsafe {
+                    SockaddrStorage::from_raw(
+                        unix.as_ptr() as *const libc::sockaddr,
+                        Some(unix.len()),
+                    )
+                    .unwrap()
+                }
+            }
+        }
+    }
+
+    fn family(&self) -> AddressFamily {
+        match self {
+            Self::Inet { .. } => AddressFamily::Inet,
+            Self::Inet6 { .. } => AddressFamily::Inet6,
+            Self::Unix { .. } => AddressFamily::Unix,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StreamListenerSnapshot {
+    pub id: u64,
+    pub peer_port: u32,
+    pub control_port: u32,
+    pub vm_port: u32,
+    pub backlog: i32,
+    pub pending_accepts: u64,
+    pub waiting_on_accept: bool,
+    pub addr: StreamListenerAddr,
+}
+
 pub struct TsiStreamProxy {
     id: u64,
     cid: u64,
@@ -58,6 +142,8 @@ pub struct TsiStreamProxy {
     push_cnt: Wrapping<u32>,
     pending_accepts: u64,
     unixsock_path: Option<PathBuf>,
+    listener_addr: Option<StreamListenerAddr>,
+    listener_backlog: Option<i32>,
 }
 
 impl TsiStreamProxy {
@@ -138,6 +224,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            listener_addr: None,
+            listener_backlog: None,
         })
     }
 
@@ -176,7 +264,89 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            listener_addr: None,
+            listener_backlog: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_listener(
+        snap: &StreamListenerSnapshot,
+        cid: u64,
+        mem: GuestMemoryMmap,
+        queue: Arc<Mutex<VirtQueue>>,
+        rxq: Arc<Mutex<MuxerRxQ>>,
+    ) -> Result<Self, ProxyError> {
+        let fd = socket(
+            snap.addr.family(),
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .map_err(ProxyError::CreatingSocket)?;
+
+        if snap.addr.family() == AddressFamily::Unix {
+            setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(ProxyError::SettingReuseAddr)?;
+        } else {
+            setsockopt(&fd, sockopt::ReusePort, &true).map_err(ProxyError::SettingReusePort)?;
+        }
+
+        let addr = snap.addr.to_sockaddr();
+        if let StreamListenerAddr::Unix { path } = &snap.addr {
+            let _ = fs::remove_file(path);
+        }
+        bind(fd.as_raw_fd(), &addr).map_err(ProxyError::CreatingSocket)?;
+        let backlog = Backlog::new(snap.backlog.clamp(0, libc::SOMAXCONN))
+            .map_err(ProxyError::CreatingSocket)?;
+        listen(&fd, backlog).map_err(ProxyError::CreatingSocket)?;
+
+        Ok(TsiStreamProxy {
+            id: snap.id,
+            cid,
+            parent_id: 0,
+            family: snap.addr.family(),
+            local_port: defs::TSI_PROXY_PORT,
+            peer_port: snap.peer_port,
+            control_port: snap.control_port,
+            fd,
+            status: if snap.waiting_on_accept {
+                ProxyStatus::WaitingOnAccept
+            } else {
+                ProxyStatus::Listening
+            },
+            mem,
+            queue,
+            rxq,
+            rx_cnt: Wrapping(0),
+            tx_cnt: Wrapping(0),
+            last_tx_cnt_sent: Wrapping(0),
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: Wrapping(0),
+            push_cnt: Wrapping(0),
+            pending_accepts: snap.pending_accepts,
+            unixsock_path: match &snap.addr {
+                StreamListenerAddr::Unix { path } => Some(path.clone()),
+                _ => None,
+            },
+            listener_addr: Some(snap.addr.clone()),
+            listener_backlog: Some(snap.backlog),
+        })
+    }
+
+    pub fn listener_snapshot(&self) -> Option<StreamListenerSnapshot> {
+        if self.status != ProxyStatus::Listening && self.status != ProxyStatus::WaitingOnAccept {
+            return None;
+        }
+        Some(StreamListenerSnapshot {
+            id: self.id,
+            peer_port: self.peer_port,
+            control_port: self.control_port,
+            vm_port: self.peer_port,
+            backlog: self.listener_backlog?,
+            pending_accepts: self.pending_accepts,
+            waiting_on_accept: self.status == ProxyStatus::WaitingOnAccept,
+            addr: self.listener_addr.clone()?,
+        })
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -662,6 +832,8 @@ impl Proxy for TsiStreamProxy {
         if result == 0 {
             self.peer_port = req.vm_port;
             self.status = ProxyStatus::Listening;
+            self.listener_addr = StreamListenerAddr::from_sockaddr(&req.addr);
+            self.listener_backlog = Some(req.backlog);
             update.polling = Some((self.id, self.fd.as_raw_fd(), EventSet::IN));
         }
 
@@ -763,6 +935,10 @@ impl Proxy for TsiStreamProxy {
             result,
         };
         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+    }
+
+    fn stream_listener_snapshot(&self) -> Option<StreamListenerSnapshot> {
+        self.listener_snapshot()
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) {
@@ -897,5 +1073,53 @@ impl Drop for TsiStreamProxy {
         if let Some(path) = &self.unixsock_path {
             _ = fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_listener_addr_round_trips_ipv4() {
+        let original: SockaddrStorage =
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 23456).into();
+        let snap = StreamListenerAddr::from_sockaddr(&original).unwrap();
+        let restored = snap.to_sockaddr();
+        let restored = restored.as_sockaddr_in().unwrap();
+
+        assert_eq!(restored.ip(), Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(restored.port(), 23456);
+    }
+
+    #[test]
+    fn stream_listener_addr_round_trips_ipv6() {
+        let original: SockaddrStorage =
+            SocketAddrV6::new(Ipv6Addr::LOCALHOST, 23457, 11, 22).into();
+        let snap = StreamListenerAddr::from_sockaddr(&original).unwrap();
+        let restored = snap.to_sockaddr();
+        let restored = restored.as_sockaddr_in6().unwrap();
+
+        assert_eq!(restored.ip(), Ipv6Addr::LOCALHOST);
+        assert_eq!(restored.port(), 23457);
+        assert_eq!(restored.flowinfo(), 11);
+        assert_eq!(restored.scope_id(), 22);
+    }
+
+    #[test]
+    fn stream_listener_addr_round_trips_unix_path() {
+        let path = PathBuf::from("/tmp/libkrun-listener-test.sock");
+        let unix = nix::sys::socket::UnixAddr::new(&path).unwrap();
+        let original = unsafe {
+            SockaddrStorage::from_raw(unix.as_ptr() as *const libc::sockaddr, Some(unix.len()))
+                .unwrap()
+        };
+        let snap = StreamListenerAddr::from_sockaddr(&original).unwrap();
+        let restored = snap.to_sockaddr();
+
+        assert_eq!(
+            restored.as_unix_addr().unwrap().path(),
+            Some(path.as_path())
+        );
     }
 }

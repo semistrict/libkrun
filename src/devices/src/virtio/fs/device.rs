@@ -13,14 +13,17 @@ use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RIN
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
-    VirtioShmRegion,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
 };
 use super::passthrough;
-use super::worker::FsWorker;
+#[cfg(target_os = "macos")]
+use super::worker::FsServerSnapshot;
+use super::worker::{FsWorker, FsWorkerStopResult};
 use super::ExportTable;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -48,8 +51,9 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: passthrough::Config,
     read_only: bool,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<FsWorkerStopResult>>,
     worker_stopfd: EventFd,
+    paused: Option<FsWorkerStopResult>,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -86,6 +90,7 @@ impl Fs {
             read_only,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
+            paused: None,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -218,7 +223,127 @@ impl VirtioDevice for Fs {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.paused = None;
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        if self.paused.is_some() {
+            return Ok(());
+        }
+        let worker = match self.worker_thread.take() {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let _ = self.worker_stopfd.write(1);
+        let stop = worker
+            .join()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("fs worker join: {e:?}")))?;
+        self.paused = Some(stop);
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        let stop = match self.paused.take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(m, i) => (m.clone(), i.clone()),
+            DeviceState::Inactive => {
+                return Err(DeviceSnapshotError::Invalid(
+                    "fs resume on inactive device".into(),
+                ))
+            }
+        };
+        let worker = FsWorker::from_parts(
+            stop.queues,
+            stop.queue_evts,
+            interrupt,
+            mem,
+            self.shm_region.clone(),
+            stop.server,
+            self.worker_stopfd
+                .try_clone()
+                .map_err(|e| DeviceSnapshotError::Invalid(format!("dup fs worker_stopfd: {e}")))?,
+            self.exit_code.clone(),
+            #[cfg(target_os = "macos")]
+            self.map_sender.clone(),
+        );
+        self.worker_thread = Some(worker.run());
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let stop = self
+            .paused
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("fs serialize before pause".into()))?;
+        let queues = stop.queues.iter().map(|q| q.to_state()).collect();
+        let body =
+            FsSnapshotBody {
+                acked_features: self.acked_features,
+                tag: self.config.tag.to_vec(),
+                num_request_queues: self.config.num_request_queues,
+                read_only: self.read_only,
+                #[cfg(target_os = "macos")]
+                server: Some(stop.server.snapshot_state().map_err(|e| {
+                    DeviceSnapshotError::Invalid(format!("fs server snapshot: {e}"))
+                })?),
+            };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        let stop = self
+            .paused
+            .as_mut()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("fs restore before pause".into()))?;
+        if snap.queues.len() != stop.queues.len() {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "fs: expected {} queues, got {}",
+                stop.queues.len(),
+                snap.queues.len()
+            )));
+        }
+        let body: FsSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        if body.tag.as_slice() != self.config.tag
+            || body.num_request_queues != self.config.num_request_queues
+            || body.read_only != self.read_only
+        {
+            return Err(DeviceSnapshotError::Invalid(
+                "fs configuration mismatch".into(),
+            ));
+        }
+        self.acked_features = body.acked_features;
+        for (queue, state) in stop.queues.iter_mut().zip(&snap.queues) {
+            queue.restore_state(state);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let server = body
+                .server
+                .as_ref()
+                .ok_or_else(|| DeviceSnapshotError::Invalid("fs server snapshot missing".into()))?;
+            stop.server
+                .restore_state(server)
+                .map_err(|e| DeviceSnapshotError::Invalid(format!("fs server restore: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FsSnapshotBody {
+    acked_features: u64,
+    tag: Vec<u8>,
+    num_request_queues: u32,
+    read_only: bool,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    server: Option<FsServerSnapshot>,
 }

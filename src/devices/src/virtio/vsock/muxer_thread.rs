@@ -1,20 +1,21 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx, ProxyMap};
+use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
-use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
+use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
+use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
-use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
-use rand::{rng, rngs::ThreadRng, Rng};
+use rand::{Rng, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -137,9 +138,42 @@ impl MuxerThread {
                 .write()
                 .unwrap()
                 .insert(new_id, Mutex::new(new_proxy));
+            debug!(
+                "created reverse proxy from acceptor: listener_id={} new_id={} local_port={} peer_port={}",
+                id, new_id, local_port, peer_port
+            );
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
+            let proxy_map = self.proxy_map.clone();
+            let interrupt = self.interrupt.clone();
+            thread::spawn(move || {
+                // A restored guest may drop the first host-to-guest OP_REQUEST while it processes
+                // the vsock transport reset event. Keep the accepted host connection alive and
+                // retry until the guest confirms the reverse proxy or the proxy disappears.
+                for _ in 0..3 {
+                    thread::sleep(Duration::from_millis(100));
+                    let retry = proxy_map
+                        .read()
+                        .unwrap()
+                        .get(&new_id)
+                        .map(|proxy| {
+                            let proxy = proxy.lock().unwrap();
+                            if proxy.status() == ProxyStatus::ReverseInit {
+                                proxy.push_op_request();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if retry {
+                        interrupt.signal_used_queue();
+                    } else {
+                        break;
+                    }
+                }
+            });
             should_signal = true;
         }
 
@@ -155,6 +189,10 @@ impl MuxerThread {
                 continue;
             }
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let mut proxy_map = self.proxy_map.write().unwrap();
+            if proxy_map.contains_key(&id) {
+                continue;
+            }
             let proxy = match UnixAcceptorProxy::new(id, path, *port) {
                 Ok(proxy) => proxy,
                 Err(e) => {
@@ -162,17 +200,15 @@ impl MuxerThread {
                     continue;
                 }
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
-            };
+            info!("created listening vsock proxy at {path:?} for guest port {port}");
+            let fd = proxy.as_raw_fd();
+            proxy_map.insert(id, Mutex::new(Box::new(proxy)));
+            self.update_polling(id, fd, EventSet::IN);
         }
     }
 
     fn work(mut self) {
+        info!("vsock muxer thread starting");
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];

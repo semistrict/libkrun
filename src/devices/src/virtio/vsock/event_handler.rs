@@ -110,6 +110,19 @@ impl Vsock {
             });
 
         event_manager
+            .register(
+                self.queue_events[EVQ_INDEX].as_raw_fd(),
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+                ),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register vsock evq with event manager: {e:?}");
+            });
+
+        event_manager
             .unregister(self.activate_evt.as_raw_fd())
             .unwrap_or_else(|e| {
                 error!("Failed to unregister vsock activate evt: {e:?}");

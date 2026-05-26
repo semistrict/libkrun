@@ -7,10 +7,49 @@
 
 use std::sync::Arc;
 
-use super::{ActivateResult, InterruptTransport, Queue};
+use serde::{Deserialize, Serialize};
+
+use super::{ActivateResult, InterruptTransport, Queue, QueueState};
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+
+/// Errors returned from device snapshot/restore.
+#[derive(Debug)]
+pub enum DeviceSnapshotError {
+    /// This device does not implement snapshot/restore in this libkrun version.
+    Unsupported(String),
+    /// Caller-visible reason to refuse a snapshot (e.g. vsock has open connections).
+    Refused(String),
+    /// Underlying serialization failure.
+    Codec(String),
+    /// State payload was invalid or inconsistent.
+    Invalid(String),
+}
+
+impl std::fmt::Display for DeviceSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceSnapshotError::Unsupported(d) => {
+                write!(f, "device {d} does not support snapshot")
+            }
+            DeviceSnapshotError::Refused(s) => write!(f, "{s}"),
+            DeviceSnapshotError::Codec(s) => write!(f, "device snapshot codec error: {s}"),
+            DeviceSnapshotError::Invalid(s) => write!(f, "device snapshot invalid: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DeviceSnapshotError {}
+
+/// Per-device snapshot blob. `queues` is queue cursor state (one per
+/// virtqueue, in queue index order). `payload` is device-specific
+/// bincode-encoded bytes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceSnapshot {
+    pub queues: Vec<QueueState>,
+    pub payload: Vec<u8>,
+}
 
 /// Configuration for a single virtqueue.
 /// This is used by devices to declare their queue requirements,
@@ -163,6 +202,46 @@ pub trait VirtioDevice: AsAny + Send {
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
+    }
+
+    // ---- Snapshot / restore ----
+    //
+    // Devices in the v1 snapshot scope (block, vsock, net) override these.
+    // Everything else uses the default `Unsupported` implementations so an
+    // attempt to snapshot a VM containing an out-of-scope device returns a
+    // clear error rather than silently producing a corrupt state.
+
+    /// Quiesce the device's worker(s). After this returns, no further DMA into
+    /// guest memory will occur until `resume` or `restore_state` is called.
+    /// Drain any in-flight requests first.
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        Err(DeviceSnapshotError::Unsupported(
+            self.device_name().to_string(),
+        ))
+    }
+
+    /// Reverse of `pause`.
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        Err(DeviceSnapshotError::Unsupported(
+            self.device_name().to_string(),
+        ))
+    }
+
+    /// Serialize the device's snapshot. Must be called while the device is paused.
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        Err(DeviceSnapshotError::Unsupported(
+            self.device_name().to_string(),
+        ))
+    }
+
+    /// Apply a previously-captured snapshot. Caller has already constructed the
+    /// device, attached its backend resources, and `activate`d it; this
+    /// rewinds the queue cursors and device-specific state to match the
+    /// snapshot.
+    fn restore_state(&mut self, _snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        Err(DeviceSnapshotError::Unsupported(
+            self.device_name().to_string(),
+        ))
     }
 }
 

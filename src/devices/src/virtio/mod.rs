@@ -48,10 +48,10 @@ pub use self::device::*;
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
-pub use self::mmio::*;
+pub use self::mmio::{MmioTransport, MmioTransportState, *};
 #[cfg(feature = "net")]
 pub use self::net::Net;
-pub use self::queue::{Descriptor, DescriptorChain, Queue};
+pub use self::queue::{Descriptor, DescriptorChain, Queue, QueueState};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]

@@ -10,6 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use serde::{Deserialize, Serialize};
 use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
@@ -22,6 +23,20 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
+
+/// Snapshot of an `MmioTransport`'s transport-side state. Queue state lives on
+/// the device after activation and is captured per-device.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MmioTransportState {
+    pub features_select: u32,
+    pub acked_features_select: u32,
+    pub queue_select: u32,
+    pub device_status: u32,
+    pub config_generation: u32,
+    pub shm_region_select: u32,
+    pub interrupt_status: u32,
+    pub irq_line: Option<u32>,
+}
 
 //required by the virtio mmio device register layout at offset 0 from base
 const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
@@ -236,6 +251,78 @@ impl MmioTransport {
     /// queue notifications with KVM.
     pub fn queue_evts(&self) -> &[Arc<EventFd>] {
         &self.queue_evts
+    }
+
+    /// Capture the transport-side state. Queue state lives on the device after
+    /// activation; collect it via the device's own `serialize_state`.
+    pub fn to_state(&self) -> MmioTransportState {
+        MmioTransportState {
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            shm_region_select: self.shm_region_select,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst) as u32,
+            irq_line: self.interrupt.irq_line(),
+        }
+    }
+
+    /// Restore the transport-side state. The device must have been
+    /// re-instantiated and activated by the caller before invoking this so
+    /// queue ownership matches the pre-snapshot state.
+    pub fn restore_state(&mut self, st: &MmioTransportState) {
+        self.features_select = st.features_select;
+        self.acked_features_select = st.acked_features_select;
+        self.queue_select = st.queue_select;
+        self.device_status = st.device_status;
+        self.config_generation = st.config_generation;
+        self.shm_region_select = st.shm_region_select;
+        self.interrupt
+            .status()
+            .store(st.interrupt_status as usize, Ordering::SeqCst);
+        // irq_line is set by the device manager from the FDT, not restored here.
+    }
+
+    pub fn replay_pending_interrupt(&self) {
+        if self.interrupt.status().load(Ordering::SeqCst) != 0 {
+            self.interrupt.event().write(1).unwrap();
+        }
+    }
+
+    pub fn restore_queues_and_activate(
+        &mut self,
+        st: &MmioTransportState,
+        queue_states: &[QueueState],
+    ) -> Result<(), String> {
+        self.restore_state(st);
+        if queue_states.len() != self.queue_config.len() {
+            return Err(format!(
+                "queue count mismatch: snapshot={} current={}",
+                queue_states.len(),
+                self.queue_config.len()
+            ));
+        }
+
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (queue, state) in queues.iter_mut().zip(queue_states) {
+            if queue.get_max_size() != state.max_size {
+                return Err(format!(
+                    "queue max_size mismatch: snapshot={} current={}",
+                    state.max_size,
+                    queue.get_max_size()
+                ));
+            }
+            queue.restore_state(state);
+        }
+        self.queues = Some(queues);
+
+        if (self.device_status & device_status::DRIVER_OK) != 0
+            && !self.locked_device().is_activated()
+        {
+            self.activate();
+        }
+        Ok(())
     }
 
     fn check_device_status(&self, set: u32, clr: u32) -> bool {
@@ -480,9 +567,25 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt
+                            let old = self
+                                .interrupt
                                 .status()
                                 .fetch_and(!(v as usize), Ordering::SeqCst);
+                            let new = old & !(v as usize);
+                            if new == 0 {
+                                if let Err(e) = self
+                                    .interrupt
+                                    .intc()
+                                    .lock()
+                                    .unwrap()
+                                    .clear_irq(self.interrupt.irq_line())
+                                {
+                                    warn!(
+                                        target: &self.interrupt.0.log_target,
+                                        "Failed to clear interrupt line: {e:?}"
+                                    );
+                                }
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),

@@ -207,6 +207,10 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// If set, build_microvm will restore from this snapshot directory instead
+    /// of doing a fresh boot. macOS arm64 only.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub snapshot_restore_path: Option<PathBuf>,
 }
 
 impl VmResources {
@@ -449,6 +453,8 @@ mod tests {
             virtio_consoles: Vec::new(),
             kernel_console: None,
             dhcp_client: false,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            snapshot_restore_path: None,
         }
     }
 

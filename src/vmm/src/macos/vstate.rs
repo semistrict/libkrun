@@ -200,6 +200,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    initial_pause: bool,
 }
 
 impl Vcpu {
@@ -293,6 +294,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            initial_pause: false,
         })
     }
 
@@ -313,6 +315,17 @@ impl Vcpu {
 
     pub fn set_boot_senders(&mut self, boot_senders: HashMap<u64, Sender<u64>>) {
         self.boot_senders = Some(boot_senders);
+    }
+
+    /// Pre-queue a Pause event so the vCPU thread immediately blocks at the
+    /// top of its first loop iteration, *before* running any guest code.
+    /// Used during snapshot restore to prevent a brief boot-code execution
+    /// window before restore state is applied.
+    pub fn queue_initial_pause(&mut self) {
+        self.initial_pause = true;
+        if let Some(sender) = &self.event_sender {
+            let _ = sender.send(VcpuEvent::Pause);
+        }
     }
 
     /// Configures an aarch64 specific vcpu.
@@ -447,7 +460,9 @@ impl Vcpu {
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
+        let entry_addr = if self.initial_pause {
+            self.boot_entry_addr
+        } else if let Some(boot_receiver) = &self.boot_receiver {
             boot_receiver.recv().unwrap()
         } else {
             self.boot_entry_addr
@@ -458,6 +473,17 @@ impl Vcpu {
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
 
         loop {
+            if let Err(e) = hvf_vcpu.complete_pending_emulation() {
+                error!("vCPU {hvf_vcpuid} pending emulation completion failed: {e:?}");
+                self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                break;
+            }
+            // Service any pending control events (Pause, RestoreState, RebaseTimer)
+            // before each HVF run step. process_control_events blocks while paused.
+            if !self.process_control_events(&mut hvf_vcpu) {
+                self.exit(FC_EXIT_CODE_OK);
+                break;
+            }
             match self.run_emulation(&mut hvf_vcpu) {
                 // Emulation ran successfully, continue.
                 Ok(VcpuEmulation::Handled) => (),
@@ -467,9 +493,12 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEvent) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, None)
                 }
-                Ok(VcpuEmulation::WaitForEventExpired) => (),
+                Ok(VcpuEmulation::WaitForEventExpired) => {
+                    self.vcpu_list.set_vtimer_irq(hvf_vcpuid);
+                }
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
-                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout))
+                    self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout));
+                    self.vcpu_list.set_vtimer_irq(hvf_vcpuid);
                 }
                 // The guest was rebooted or halted.
                 Ok(VcpuEmulation::Stopped) => {
@@ -481,6 +510,102 @@ impl Vcpu {
                     self.exit(FC_EXIT_CODE_GENERIC_ERROR);
                     break;
                 }
+            }
+        }
+    }
+
+    /// Drain pending control events. If a Pause was requested, block until a
+    /// matching Resume (servicing RestoreState/RebaseTimer in between).
+    /// Returns false if the channel was closed (vmm dropped), in which case
+    /// the caller should exit the run loop.
+    fn process_control_events(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
+        loop {
+            match self.event_receiver.try_recv() {
+                Ok(VcpuEvent::Pause) => {
+                    let response = match hvf_vcpu.save_state().and_then(|s| {
+                        bincode::serialize(&s).map_err(|_| hvf::Error::VcpuReadRegister)
+                    }) {
+                        Ok(payload) => VcpuResponse::Paused(payload),
+                        Err(e) => VcpuResponse::Error(format!("save_state: {e}")),
+                    };
+                    if self.response_sender.send(response).is_err() {
+                        return false;
+                    }
+                    // Block until we get Resume. While paused, also accept
+                    // RestoreState and RebaseTimer.
+                    loop {
+                        match self.event_receiver.recv() {
+                            Ok(VcpuEvent::Resume) => {
+                                let _ = self.response_sender.send(VcpuResponse::Resumed);
+                                break;
+                            }
+                            Ok(VcpuEvent::Pause) => {
+                                // Already paused — re-acknowledge with current state.
+                                let resp = match hvf_vcpu.save_state().and_then(|s| {
+                                    bincode::serialize(&s).map_err(|_| hvf::Error::VcpuReadRegister)
+                                }) {
+                                    Ok(p) => VcpuResponse::Paused(p),
+                                    Err(e) => VcpuResponse::Error(format!("save_state: {e}")),
+                                };
+                                let _ = self.response_sender.send(resp);
+                            }
+                            Ok(VcpuEvent::RestoreState(bytes)) => {
+                                let resp = match bincode::deserialize::<hvf::state::HvfVcpuState>(
+                                    &bytes,
+                                ) {
+                                    Ok(st) => match hvf_vcpu.restore_state(&st) {
+                                        Ok(()) => VcpuResponse::Restored,
+                                        Err(e) => VcpuResponse::Error(format!("restore: {e}")),
+                                    },
+                                    Err(e) => VcpuResponse::Error(format!("decode: {e}")),
+                                };
+                                let _ = self.response_sender.send(resp);
+                            }
+                            Ok(VcpuEvent::RebaseTimer(delta)) => {
+                                let resp = match hvf_vcpu.rebase_timer(delta) {
+                                    Ok(()) => {
+                                        if let Some(timeout) = hvf_vcpu.vtimer_wait_duration() {
+                                            let vcpu_list = self.vcpu_list.clone();
+                                            let vcpuid = hvf_vcpu.id();
+                                            std::thread::spawn(move || {
+                                                if !timeout.is_zero() {
+                                                    std::thread::sleep(timeout);
+                                                }
+                                                let _ = hvf::vcpu_set_vtimer_mask(vcpuid, true);
+                                                let _ = hvf::vcpu_set_pending_irq(
+                                                    vcpuid,
+                                                    hvf::InterruptType::Irq,
+                                                    false,
+                                                );
+                                                let _ = hvf::vcpu_set_pending_irq(
+                                                    vcpuid,
+                                                    hvf::InterruptType::Irq,
+                                                    true,
+                                                );
+                                                vcpu_list.set_vtimer_irq(vcpuid);
+                                            });
+                                        }
+                                        VcpuResponse::TimerRebased
+                                    }
+                                    Err(e) => VcpuResponse::Error(format!("rebase: {e}")),
+                                };
+                                let _ = self.response_sender.send(resp);
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                }
+                Ok(VcpuEvent::Resume) => {
+                    // Spurious resume — ack and continue.
+                    let _ = self.response_sender.send(VcpuResponse::Resumed);
+                }
+                Ok(VcpuEvent::RestoreState(_)) | Ok(VcpuEvent::RebaseTimer(_)) => {
+                    let _ = self
+                        .response_sender
+                        .send(VcpuResponse::Error("not paused".into()));
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
             }
         }
     }
@@ -525,27 +650,36 @@ impl Drop for Vcpu {
     }
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
-    /// Pause the Vcpu.
+    /// Pause the Vcpu. While paused, the vCPU thread waits on the event channel
+    /// rather than running HVF.
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Apply a captured HvfVcpuState (bincode-encoded) — only legal while paused.
+    RestoreState(Vec<u8>),
+    /// Add `delta_ticks` to CNTVOFF_EL2 — only legal while paused. Used to
+    /// rebase the guest's view of the virtual counter after a snapshot/restore.
+    RebaseTimer(u64),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
-    /// Vcpu is paused.
-    Paused,
+    /// Vcpu is paused. Payload is bincode-encoded HvfVcpuState.
+    Paused(Vec<u8>),
     /// Vcpu is resumed.
     Resumed,
+    /// RestoreState applied.
+    Restored,
+    /// RebaseTimer applied.
+    TimerRebased,
     /// Vcpu is stopped.
     Exited(u8),
+    /// A control event failed.
+    Error(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -586,6 +720,16 @@ impl VcpuHandle {
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
     }
+}
+
+/// Subset of microvm state the snapshot orchestrator needs, populated when
+/// the Vmm is built.
+pub struct SnapshotCtx {
+    pub vcpu_ids: Vec<u64>,
+    pub vcpu_list: Arc<devices::legacy::VcpuList>,
+    pub irqchip: devices::legacy::IrqChip,
+    pub gic: Option<Arc<std::sync::Mutex<devices::legacy::GicV3>>>,
+    pub nested_enabled: bool,
 }
 
 enum VcpuEmulation {

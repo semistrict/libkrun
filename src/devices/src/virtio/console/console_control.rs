@@ -134,6 +134,20 @@ impl ConsoleControl {
         &self.queue_evt
     }
 
+    pub fn to_state(&self) -> Vec<Vec<u8>> {
+        let queue = self.queue.lock().expect("Poisoned lock");
+        queue.iter().map(|payload| payload.to_vec()).collect()
+    }
+
+    pub fn restore_state(&self, state: &[Vec<u8>]) {
+        let mut queue = self.queue.lock().expect("Poisoned lock");
+        queue.clear();
+        queue.extend(state.iter().cloned().map(Payload::Bytes));
+        if !queue.is_empty() {
+            let _ = self.queue_evt.write(1);
+        }
+    }
+
     fn push_msg(&self, msg: VirtioConsoleControl) {
         let mut queue = self.queue.lock().expect("Poisoned lock");
         queue.push_back(Payload::ConsoleControl(msg));

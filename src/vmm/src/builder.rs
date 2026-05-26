@@ -568,14 +568,32 @@ pub fn build_microvm(
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
-    )?;
+    #[allow(unused_mut)]
+    let (mut guest_memory, arch_memory_info, mut _shm_manager, payload_config) =
+        create_guest_memory(
+            vm_resources
+                .vm_config()
+                .mem_size_mib
+                .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+            vm_resources,
+            &payload,
+        )?;
+
+    // Snapshot restore mode (macOS arm64): replace the freshly initialized
+    // RAM with the captured pages.img contents before HVF maps guest memory.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(snap_path) = &vm_resources.snapshot_restore_path {
+        use crate::macos::snapshot::{
+            container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img, SectionId,
+        };
+        let reader = SnapshotReader::open(snap_path)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        let meta: MetaSection = reader
+            .get_bincode(SectionId::Meta, 0)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
+        guest_memory = restore_pages_img(snap_path, &meta.ram)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+    }
 
     let vcpu_config = vm_resources.vcpu_config();
 
@@ -800,7 +818,7 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -893,7 +911,10 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let gic = match HvfGicV3::new(
+                vm_resources.vm_config().vcpu_count.unwrap() as u64,
+                vcpu_list.clone(),
+            ) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -949,6 +970,22 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let snapshot_ctx = {
+        let mut ids: Vec<u64> = Vec::new();
+        for v in &vcpus {
+            ids.push(v.cpu_index() as u64);
+        }
+        let gic = None;
+        Some(crate::macos::vstate::SnapshotCtx {
+            vcpu_ids: ids,
+            vcpu_list: vcpu_list.clone(),
+            irqchip: intc.clone(),
+            gic,
+            nested_enabled: vm_resources.nested_enabled,
+        })
+    };
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
@@ -961,6 +998,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        snapshot_ctx,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.
@@ -968,7 +1007,10 @@ pub fn build_microvm(
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(all(target_os = "macos", target_arch = "aarch64"))
+    ))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
     {
@@ -1101,6 +1143,21 @@ pub fn build_microvm(
     )
     .map_err(StartMicrovmError::Internal)?;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(snap_path) = &vm_resources.snapshot_restore_path {
+        use crate::macos::snapshot::{
+            container::SnapshotReader, orchestrator::MetaSection, ram::load_pages_img_into,
+            SectionId,
+        };
+        let reader = SnapshotReader::open(snap_path)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        let meta: MetaSection = reader
+            .get_bincode(SectionId::Meta, 0)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
+        load_pages_img_into(&vmm.guest_memory, snap_path, &meta.ram)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img reload: {e}")))?;
+    }
+
     #[cfg(feature = "tee")]
     {
         match tee {
@@ -1135,8 +1192,30 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    // Restore mode: pre-queue Pause on every vCPU so the vCPU threads park at
+    // the top of their first loop iteration without first running any guest
+    // instructions before restore_from applies the captured register state.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if vm_resources.snapshot_restore_path.is_some() {
+        for v in &mut vcpus {
+            v.queue_initial_pause();
+        }
+    }
+
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+
+    // If we're restoring from a snapshot, apply the captured vCPU/device/GIC
+    // state now. The vCPUs were pre-paused above, so restore_from can inject
+    // state before any guest instruction executes.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(snap_path) = vm_resources.snapshot_restore_path.clone() {
+        vmm.restore_from(&snap_path).map_err(|e| {
+            StartMicrovmError::Internal(crate::Error::VcpuResume).tap(|_| {
+                error!("snapshot restore failed: {e}");
+            })
+        })?;
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1148,6 +1227,16 @@ pub fn build_microvm(
 
     Ok(vmm)
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+trait Tap: Sized {
+    fn tap(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<T> Tap for T {}
 
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
@@ -2336,7 +2425,10 @@ fn attach_unixsock_vsock_device(
     Ok(())
 }
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(
+    not(feature = "tee"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,

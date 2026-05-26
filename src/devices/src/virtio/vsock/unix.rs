@@ -549,7 +549,9 @@ impl Proxy for UnixProxy {
         };
 
         if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
-            warn!("error sending shutdown to socket: {e}");
+            if e != Errno::ENOTCONN {
+                warn!("error sending shutdown to socket: {e}");
+            }
         }
     }
 

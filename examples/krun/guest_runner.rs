@@ -11,6 +11,7 @@ const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const O_CLOEXEC: c_int = 0o2000000;
 const O_NONBLOCK: c_int = 0o4000;
+const O_RDONLY: c_int = 0;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
@@ -18,9 +19,12 @@ const F_SETFL: c_int = 4;
 const FD_CLOEXEC: c_int = 1;
 const SIGPIPE: c_int = 13;
 const SIG_IGN: usize = 1;
+const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
 const WNOHANG: c_int = 1;
+const FRAME_OUTPUT: u8 = b'O';
+const FRAME_STATUS: u8 = b'S';
 
 #[repr(C)]
 struct Sockaddr {
@@ -58,6 +62,7 @@ unsafe extern "C" {
         mountflags: c_ulong,
         data: *const c_void,
     ) -> c_int;
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn signal(signum: c_int, handler: usize) -> usize;
@@ -138,6 +143,16 @@ fn write_all(fd: c_int, mut buf: &[u8]) {
         }
         buf = &buf[n as usize..];
     }
+}
+
+fn write_u32_be(fd: c_int, value: u32) {
+    write_all(fd, &value.to_be_bytes());
+}
+
+fn write_frame(fd: c_int, frame_type: u8, payload: &[u8]) {
+    write_all(fd, &[frame_type]);
+    write_u32_be(fd, payload.len() as u32);
+    write_all(fd, payload);
 }
 
 fn read_exact(fd: c_int, mut buf: &mut [u8]) {
@@ -233,6 +248,11 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
     if pid == 0 {
         unsafe {
             close(pipefd[0]);
+            let dev_null = open(c"/dev/null".as_ptr(), O_RDONLY | O_CLOEXEC);
+            if dev_null >= 0 {
+                dup2(dev_null, STDIN_FILENO);
+                close(dev_null);
+            }
             dup2(pipefd[1], STDOUT_FILENO);
             dup2(pipefd[1], STDERR_FILENO);
             close(pipefd[1]);
@@ -268,7 +288,7 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
         } else if n == 0 {
             break;
         } else {
-            write_all(out_fd, &buf[..n as usize]);
+            write_frame(out_fd, FRAME_OUTPUT, &buf[..n as usize]);
         }
 
         if !child_exited {
@@ -281,7 +301,7 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
             loop {
                 let n = unsafe { read(pipefd[0], buf.as_mut_ptr() as *mut c_void, buf.len()) };
                 if n > 0 {
-                    write_all(out_fd, &buf[..n as usize]);
+                    write_frame(out_fd, FRAME_OUTPUT, &buf[..n as usize]);
                     continue;
                 }
                 if n < 0 && errno() == EINTR {
@@ -369,8 +389,7 @@ fn main() {
         let argv = read_argv(fd);
         let status = run_command(argv, fd);
         free_argv(argv);
-        let trailer = format!("\0__KRUN_EXIT_STATUS__={status}\n");
-        write_all(fd, trailer.as_bytes());
+        write_frame(fd, FRAME_STATUS, &status.to_be_bytes());
         unsafe {
             close(fd);
         }

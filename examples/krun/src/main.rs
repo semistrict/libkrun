@@ -20,13 +20,15 @@ const UBUNTU_IMAGE: &str = "ubuntu:26.04";
 const ROOTFS_NAME: &str = "ubuntu-26.04";
 const HOME_TAG: &str = "krun-home";
 const RUNNER_PORT: u32 = 10240;
-const SNAPSHOT_DIR_NAME: &str = "krun-snapshot-v17";
-const SNAPSHOT_METADATA: &str = "ubuntu-snapshot-v17-detached-console-output\n";
+const SNAPSHOT_DIR_NAME: &str = "krun-snapshot-v18";
+const SNAPSHOT_METADATA: &str = "ubuntu-snapshot-v18-streaming-output\n";
 const RUNNER_PATH: &str = "/usr/local/bin/krun-command-runner";
 const VSOCK_SOCKET: &str = "run/krun-command-runner.sock";
-const EXIT_STATUS_MARKER: &str = "\0__KRUN_EXIT_STATUS__=";
 const DISABLE_SNAPSHOT_RESTORE_ENV: &str = "KRUN_DISABLE_SNAPSHOT_RESTORE";
 const ENOENT: i32 = 2;
+const FRAME_OUTPUT: u8 = b'O';
+const FRAME_STATUS: u8 = b'S';
+const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 fn main() -> Result<()> {
     let command = parse_command_args()?;
@@ -410,30 +412,7 @@ fn spawn_command_client(
                 )
             })?;
             write_command_vector(&mut stream, &command).context("send command")?;
-
-            let mut buf = Vec::new();
-            stream
-                .read_to_end(&mut buf)
-                .context("read command output")?;
-
-            let marker = EXIT_STATUS_MARKER.as_bytes();
-            let marker_pos = buf
-                .windows(marker.len())
-                .rposition(|window| window == marker)
-                .with_context(|| {
-                    let preview = String::from_utf8_lossy(&buf[..buf.len().min(400)]);
-                    format!("runner closed without exit trailer; output preview: {preview:?}")
-                })?;
-            let status_text = std::str::from_utf8(&buf[marker_pos + marker.len()..])
-                .context("runner exit status was not utf-8")?
-                .trim_end();
-            let exit_status = status_text
-                .parse()
-                .with_context(|| format!("invalid runner exit status {status_text:?}"))?;
-            Ok(CommandResult {
-                exit_status,
-                output: buf[..marker_pos].to_vec(),
-            })
+            read_runner_frames(&mut stream)
         })();
         let _ = done.send(result.map_err(|e| format!("{e:#}")));
     });
@@ -441,7 +420,6 @@ fn spawn_command_client(
 
 struct CommandResult {
     exit_status: i32,
-    output: Vec<u8>,
 }
 
 fn arm_dirty_tracking(ctx: u32) -> Result<()> {
@@ -482,6 +460,60 @@ fn write_command_vector(stream: &mut UnixStream, command: &[String]) -> Result<(
 
 fn write_u32(stream: &mut UnixStream, value: u32) -> Result<()> {
     stream.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn read_u32(stream: &mut UnixStream) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf)?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+fn read_runner_frames(stream: &mut UnixStream) -> Result<CommandResult> {
+    loop {
+        let mut frame_type = [0u8; 1];
+        stream
+            .read_exact(&mut frame_type)
+            .context("runner closed before exit status")?;
+        let len = read_u32(stream).context("read runner frame length")?;
+        if len > MAX_FRAME_SIZE {
+            bail!("runner frame too large: {len}");
+        }
+
+        match frame_type[0] {
+            FRAME_OUTPUT => write_stdout_frame(stream, len)?,
+            FRAME_STATUS => {
+                if len != 4 {
+                    bail!("bad runner status frame length: {len}");
+                }
+                let mut status = [0u8; 4];
+                stream
+                    .read_exact(&mut status)
+                    .context("read runner exit status")?;
+                return Ok(CommandResult {
+                    exit_status: i32::from_be_bytes(status),
+                });
+            }
+            other => bail!("unknown runner frame type: {other}"),
+        }
+    }
+}
+
+fn write_stdout_frame(stream: &mut UnixStream, len: u32) -> Result<()> {
+    let mut remaining = len as usize;
+    let mut buf = [0u8; 8192];
+    let mut stdout = std::io::stdout().lock();
+    while remaining > 0 {
+        let chunk_len = remaining.min(buf.len());
+        stream
+            .read_exact(&mut buf[..chunk_len])
+            .context("read runner output frame")?;
+        stdout
+            .write_all(&buf[..chunk_len])
+            .context("write command output")?;
+        remaining -= chunk_len;
+    }
+    stdout.flush().context("flush command output")?;
     Ok(())
 }
 
@@ -555,7 +587,6 @@ fn spawn_snapshot_after_command(
             );
         }
         restore_terminal(&terminal_state);
-        write_command_output_or_exit(&command_result.output);
         std::process::exit(command_result.exit_status);
     });
 }
@@ -590,17 +621,6 @@ fn console_log_excerpt(path: &Path) -> Option<String> {
         None
     } else {
         Some(excerpt)
-    }
-}
-
-fn write_command_output_or_exit(output: &[u8]) {
-    if let Err(e) = std::io::stdout().write_all(output) {
-        eprintln!("write command output failed: {e}");
-        std::process::exit(1);
-    }
-    if let Err(e) = std::io::stdout().flush() {
-        eprintln!("flush command output failed: {e}");
-        std::process::exit(1);
     }
 }
 

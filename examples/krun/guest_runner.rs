@@ -9,22 +9,31 @@ const SOCK_STREAM: c_int = 1;
 const VMADDR_CID_ANY: u32 = 0xffff_ffff;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
+const EIO: c_int = 5;
 const O_CLOEXEC: c_int = 0o2000000;
 const O_NONBLOCK: c_int = 0o4000;
-const O_RDONLY: c_int = 0;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const FD_CLOEXEC: c_int = 1;
+const POLLIN: i16 = 0x0001;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
 const SIGPIPE: c_int = 13;
+const SIGWINCH: c_int = 28;
 const SIG_IGN: usize = 1;
 const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
+const TIOCSCTTY: c_ulong = 0x540e;
+const TIOCSWINSZ: c_ulong = 0x5414;
 const WNOHANG: c_int = 1;
+const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 const FRAME_OUTPUT: u8 = b'O';
 const FRAME_STATUS: u8 = b'S';
+const FRAME_INPUT: u8 = b'I';
+const FRAME_RESIZE: u8 = b'W';
 
 #[repr(C)]
 struct Sockaddr {
@@ -42,6 +51,21 @@ struct SockaddrVm {
     svm_zero: [u8; 3],
 }
 
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
 unsafe extern "C" {
     fn accept(fd: c_int, addr: *mut Sockaddr, len: *mut c_uint) -> c_int;
     fn bind(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
@@ -52,6 +76,8 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fork() -> c_int;
     fn free(ptr: *mut c_void);
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn malloc(size: usize) -> *mut c_void;
     fn mkdir(path: *const c_char, mode: c_uint) -> c_int;
@@ -62,11 +88,18 @@ unsafe extern "C" {
         mountflags: c_ulong,
         data: *const c_void,
     ) -> c_int;
-    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-    fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
+    fn openpty(
+        amaster: *mut c_int,
+        aslave: *mut c_int,
+        name: *mut c_char,
+        termp: *const c_void,
+        winp: *const Winsize,
+    ) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn socket(domain: c_int, typ: c_int, protocol: c_int) -> c_int;
+    fn setsid() -> c_int;
     fn strtoul(nptr: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong;
     fn usleep(usec: c_uint) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
@@ -178,7 +211,13 @@ fn read_u32(fd: c_int) -> u32 {
     u32::from_be_bytes(buf)
 }
 
-fn read_argv(fd: c_int) -> *mut *mut c_char {
+struct CommandRequest {
+    argv: *mut *mut c_char,
+    rows: u16,
+    cols: u16,
+}
+
+fn read_command_request(fd: c_int) -> CommandRequest {
     let argc = read_u32(fd);
     if argc == 0 || argc > 4096 {
         die("bad argc");
@@ -207,7 +246,14 @@ fn read_argv(fd: c_int) -> *mut *mut c_char {
         }
     }
 
-    argv
+    let rows = clamp_u16(read_u32(fd));
+    let cols = clamp_u16(read_u32(fd));
+
+    CommandRequest { argv, rows, cols }
+}
+
+fn clamp_u16(value: u32) -> u16 {
+    value.min(u16::MAX as u32) as u16
 }
 
 fn free_argv(argv: *mut *mut c_char) {
@@ -233,12 +279,70 @@ fn set_cloexec(fd: c_int) {
     }
 }
 
-fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
+fn set_nonblocking(fd: c_int) {
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+}
+
+fn winsize(rows: u16, cols: u16) -> Winsize {
+    Winsize {
+        ws_row: if rows == 0 { 24 } else { rows },
+        ws_col: if cols == 0 { 80 } else { cols },
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
+fn set_pty_size(master: c_int, rows: u16, cols: u16, child_pid: c_int) {
+    let ws = winsize(rows, cols);
+    unsafe {
+        ioctl(master, TIOCSWINSZ, &ws);
+        if child_pid > 0 {
+            kill(-child_pid, SIGWINCH);
+        }
+    }
+}
+
+fn write_all_retry(fd: c_int, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        let n = unsafe { write(fd, buf.as_ptr() as *const c_void, buf.len()) };
+        if n < 0 {
+            match errno() {
+                EINTR => continue,
+                EAGAIN => {
+                    unsafe {
+                        usleep(10000);
+                    }
+                    continue;
+                }
+                _ => return,
+            }
+        }
+        buf = &buf[n as usize..];
+    }
+}
+
+fn run_command(request: &CommandRequest, out_fd: c_int) -> c_int {
     set_cloexec(out_fd);
 
-    let mut pipefd = [0 as c_int; 2];
-    if unsafe { pipe2(pipefd.as_mut_ptr(), O_CLOEXEC) } < 0 {
-        die("pipe2");
+    let mut master = -1;
+    let mut slave = -1;
+    let ws = winsize(request.rows, request.cols);
+    if unsafe {
+        openpty(
+            &mut master,
+            &mut slave,
+            ptr::null_mut(),
+            ptr::null(),
+            &ws,
+        )
+    } < 0
+    {
+        die("openpty");
     }
 
     let pid = unsafe { fork() };
@@ -247,48 +351,55 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
     }
     if pid == 0 {
         unsafe {
-            close(pipefd[0]);
-            let dev_null = open(c"/dev/null".as_ptr(), O_RDONLY | O_CLOEXEC);
-            if dev_null >= 0 {
-                dup2(dev_null, STDIN_FILENO);
-                close(dev_null);
+            close(master);
+            setsid();
+            ioctl(slave, TIOCSCTTY, 0);
+            dup2(slave, STDIN_FILENO);
+            dup2(slave, STDOUT_FILENO);
+            dup2(slave, STDERR_FILENO);
+            if slave > STDERR_FILENO {
+                close(slave);
             }
-            dup2(pipefd[1], STDOUT_FILENO);
-            dup2(pipefd[1], STDERR_FILENO);
-            close(pipefd[1]);
-            execvp(*argv, argv as *const *const c_char);
-            write_exec_error(*argv);
+            execvp(*request.argv, request.argv as *const *const c_char);
+            write_exec_error(*request.argv);
             _exit(127);
         }
     }
 
     unsafe {
-        close(pipefd[1]);
+        close(slave);
     }
-    let flags = unsafe { fcntl(pipefd[0], F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
-        }
-    }
+    set_nonblocking(master);
 
     let mut buf = [0u8; 8192];
     let mut status = 0;
     let mut child_exited = false;
     loop {
-        let n = unsafe { read(pipefd[0], buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n < 0 {
-            let err = errno();
-            if err == EINTR {
-                continue;
+        let mut fds = [
+            PollFd {
+                fd: master,
+                events: POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: out_fd,
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let poll_ret = unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, 100) };
+        if poll_ret < 0 && errno() == EINTR {
+            continue;
+        }
+        if poll_ret > 0 {
+            if fds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                drain_pty_output(master, out_fd, &mut buf);
             }
-            if err != EAGAIN {
+            if fds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0
+                && !read_host_frame(out_fd, master, pid, &mut buf)
+            {
                 break;
             }
-        } else if n == 0 {
-            break;
-        } else {
-            write_frame(out_fd, FRAME_OUTPUT, &buf[..n as usize]);
         }
 
         if !child_exited {
@@ -298,26 +409,13 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
             }
         }
         if child_exited {
-            loop {
-                let n = unsafe { read(pipefd[0], buf.as_mut_ptr() as *mut c_void, buf.len()) };
-                if n > 0 {
-                    write_frame(out_fd, FRAME_OUTPUT, &buf[..n as usize]);
-                    continue;
-                }
-                if n < 0 && errno() == EINTR {
-                    continue;
-                }
-                break;
-            }
+            drain_pty_output(master, out_fd, &mut buf);
             break;
-        }
-        unsafe {
-            usleep(10000);
         }
     }
 
     unsafe {
-        close(pipefd[0]);
+        close(master);
     }
     if !child_exited {
         unsafe {
@@ -330,6 +428,72 @@ fn run_command(argv: *mut *mut c_char, out_fd: c_int) -> c_int {
     } else {
         128 + (status & 0x7f)
     }
+}
+
+fn drain_pty_output(master: c_int, out_fd: c_int, buf: &mut [u8]) {
+    loop {
+        let n = unsafe { read(master, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n > 0 {
+            write_frame(out_fd, FRAME_OUTPUT, &buf[..n as usize]);
+            continue;
+        }
+        if n < 0 {
+            match errno() {
+                EINTR => continue,
+                EAGAIN | EIO => break,
+                _ => break,
+            }
+        }
+        break;
+    }
+}
+
+fn read_host_frame(fd: c_int, pty_master: c_int, child_pid: c_int, buf: &mut [u8]) -> bool {
+    let mut frame_type = [0u8; 1];
+    let n = unsafe { read(fd, frame_type.as_mut_ptr() as *mut c_void, 1) };
+    if n == 0 {
+        return false;
+    }
+    if n < 0 {
+        if errno() == EINTR || errno() == EAGAIN {
+            return true;
+        }
+        return false;
+    }
+
+    let len = read_u32(fd);
+    if len > MAX_FRAME_SIZE {
+        die("host frame too large");
+    }
+
+    match frame_type[0] {
+        FRAME_INPUT => {
+            let mut remaining = len as usize;
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len());
+                read_exact(fd, &mut buf[..chunk]);
+                write_all_retry(pty_master, &buf[..chunk]);
+                remaining -= chunk;
+            }
+        }
+        FRAME_RESIZE => {
+            if len != 8 {
+                die("bad resize frame");
+            }
+            let rows = clamp_u16(read_u32(fd));
+            let cols = clamp_u16(read_u32(fd));
+            set_pty_size(pty_master, rows, cols, child_pid);
+        }
+        _ => {
+            let mut remaining = len as usize;
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len());
+                read_exact(fd, &mut buf[..chunk]);
+                remaining -= chunk;
+            }
+        }
+    }
+    true
 }
 
 fn write_exec_error(command: *const c_char) {
@@ -386,9 +550,9 @@ fn main() {
             }
             die("accept(vsock)");
         }
-        let argv = read_argv(fd);
-        let status = run_command(argv, fd);
-        free_argv(argv);
+        let request = read_command_request(fd);
+        let status = run_command(&request, fd);
+        free_argv(request.argv);
         write_frame(fd, FRAME_STATUS, &status.to_be_bytes());
         unsafe {
             close(fd);

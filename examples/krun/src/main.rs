@@ -1,16 +1,16 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,14 +20,17 @@ const UBUNTU_IMAGE: &str = "ubuntu:26.04";
 const ROOTFS_NAME: &str = "ubuntu-26.04";
 const HOME_TAG: &str = "krun-home";
 const RUNNER_PORT: u32 = 10240;
-const SNAPSHOT_DIR_NAME: &str = "krun-snapshot-v18";
-const SNAPSHOT_METADATA: &str = "ubuntu-snapshot-v18-streaming-output\n";
+const SNAPSHOT_DIR_NAME: &str = "krun-snapshot-v19";
+const SNAPSHOT_METADATA: &str = "ubuntu-snapshot-v19-interactive-pty\n";
 const RUNNER_PATH: &str = "/usr/local/bin/krun-command-runner";
 const VSOCK_SOCKET: &str = "run/krun-command-runner.sock";
 const DISABLE_SNAPSHOT_RESTORE_ENV: &str = "KRUN_DISABLE_SNAPSHOT_RESTORE";
 const ENOENT: i32 = 2;
+const CTRL_D: u8 = 4;
 const FRAME_OUTPUT: u8 = b'O';
 const FRAME_STATUS: u8 = b'S';
+const FRAME_INPUT: u8 = b'I';
+const FRAME_RESIZE: u8 = b'W';
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 fn main() -> Result<()> {
@@ -126,6 +129,7 @@ fn main() -> Result<()> {
             have_snapshot,
             socket.clone(),
             console_output.clone(),
+            terminal_state.clone(),
             command,
             run_rx,
             done_tx,
@@ -381,6 +385,8 @@ unsafe fn configure_runner(ctx: u32, home: &Path, cwd: &Path) -> Result<()> {
     ];
     let envp = [
         c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_ptr(),
+        c"TERM=xterm-256color".as_ptr(),
+        c"LANG=C.UTF-8".as_ptr(),
         ptr::null(),
     ];
     call_i32(
@@ -394,16 +400,25 @@ fn spawn_command_client(
     have_snapshot: bool,
     socket: PathBuf,
     console_output: PathBuf,
+    terminal_state: Option<String>,
     command: Vec<String>,
     start: mpsc::Receiver<()>,
     done: mpsc::Sender<Result<CommandResult, String>>,
 ) {
     thread::spawn(move || {
+        let stop_input = Arc::new(AtomicBool::new(false));
+        let mut raw_terminal = false;
         let result = (|| -> Result<CommandResult> {
             start.recv().context("wait for VM start")?;
             if have_snapshot {
                 arm_dirty_tracking(ctx)?;
             }
+            let stdin_is_terminal = std::io::stdin().is_terminal();
+            raw_terminal = stdin_is_terminal && terminal_state.is_some();
+            if raw_terminal {
+                set_terminal_raw().context("set host terminal raw mode")?;
+            }
+
             let mut stream = connect_unix(&socket, Duration::from_secs(30)).with_context(|| {
                 format!(
                     "connect {}{}",
@@ -411,9 +426,26 @@ fn spawn_command_client(
                     console_log_hint(&console_output)
                 )
             })?;
-            write_command_vector(&mut stream, &command).context("send command")?;
+            let size = terminal_size();
+            write_command_request(&mut stream, &command, size).context("send command")?;
+
+            let writer = Arc::new(Mutex::new(
+                stream.try_clone().context("clone command stream")?,
+            ));
+            let _stdin_thread =
+                spawn_stdin_forward(writer.clone(), stop_input.clone(), stdin_is_terminal);
+            let _resize_thread = if stdin_is_terminal {
+                Some(spawn_resize_forward(writer, stop_input.clone(), size))
+            } else {
+                None
+            };
+
             read_runner_frames(&mut stream)
         })();
+        stop_input.store(true, Ordering::SeqCst);
+        if raw_terminal {
+            restore_terminal(&terminal_state);
+        }
         let _ = done.send(result.map_err(|e| format!("{e:#}")));
     });
 }
@@ -436,7 +468,17 @@ fn arm_dirty_tracking(ctx: u32) -> Result<()> {
     }
 }
 
-fn write_command_vector(stream: &mut UnixStream, command: &[String]) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TerminalSize {
+    rows: u32,
+    cols: u32,
+}
+
+fn write_command_request(
+    stream: &mut UnixStream,
+    command: &[String],
+    size: TerminalSize,
+) -> Result<()> {
     write_u32(
         stream,
         command
@@ -455,6 +497,8 @@ fn write_command_vector(stream: &mut UnixStream, command: &[String]) -> Result<(
         )?;
         stream.write_all(bytes)?;
     }
+    write_u32(stream, size.rows)?;
+    write_u32(stream, size.cols)?;
     Ok(())
 }
 
@@ -467,6 +511,77 @@ fn read_u32(stream: &mut UnixStream) -> Result<u32> {
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf)?;
     Ok(u32::from_be_bytes(buf))
+}
+
+fn write_frame(stream: &mut UnixStream, frame_type: u8, payload: &[u8]) -> Result<()> {
+    stream.write_all(&[frame_type])?;
+    write_u32(stream, payload.len().try_into().context("frame too large")?)?;
+    stream.write_all(payload)?;
+    Ok(())
+}
+
+fn write_locked_frame(
+    writer: &Arc<Mutex<UnixStream>>,
+    frame_type: u8,
+    payload: &[u8],
+) -> Result<()> {
+    let mut stream = writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("stream lock poisoned"))?;
+    write_frame(&mut stream, frame_type, payload)
+}
+
+fn write_resize_frame(writer: &Arc<Mutex<UnixStream>>, size: TerminalSize) -> Result<()> {
+    let mut payload = [0u8; 8];
+    payload[..4].copy_from_slice(&size.rows.to_be_bytes());
+    payload[4..].copy_from_slice(&size.cols.to_be_bytes());
+    write_locked_frame(writer, FRAME_RESIZE, &payload)
+}
+
+fn spawn_stdin_forward(
+    writer: Arc<Mutex<UnixStream>>,
+    stop: Arc<AtomicBool>,
+    stdin_is_terminal: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 8192];
+        while !stop.load(Ordering::SeqCst) {
+            match stdin.read(&mut buf) {
+                Ok(0) if stdin_is_terminal => continue,
+                Ok(0) => {
+                    let _ = write_locked_frame(&writer, FRAME_INPUT, &[CTRL_D]);
+                    break;
+                }
+                Ok(n) => {
+                    if write_locked_frame(&writer, FRAME_INPUT, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn spawn_resize_forward(
+    writer: Arc<Mutex<UnixStream>>,
+    stop: Arc<AtomicBool>,
+    mut last_size: TerminalSize,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
+            let size = terminal_size();
+            if size != last_size {
+                if write_resize_frame(&writer, size).is_err() {
+                    break;
+                }
+                last_size = size;
+            }
+        }
+    })
 }
 
 fn read_runner_frames(stream: &mut UnixStream) -> Result<CommandResult> {
@@ -497,6 +612,34 @@ fn read_runner_frames(stream: &mut UnixStream) -> Result<CommandResult> {
             other => bail!("unknown runner frame type: {other}"),
         }
     }
+}
+
+fn terminal_size() -> TerminalSize {
+    let output = Command::new("stty")
+        .args(["-f", "/dev/tty", "size"])
+        .output();
+    let Ok(output) = output else {
+        return TerminalSize { rows: 24, cols: 80 };
+    };
+    if !output.status.success() {
+        return TerminalSize { rows: 24, cols: 80 };
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    let rows = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(24);
+    let cols = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(80);
+    TerminalSize { rows, cols }
+}
+
+fn set_terminal_raw() -> Result<()> {
+    run(Command::new("stty").args(["-f", "/dev/tty", "raw", "-echo", "min", "0", "time", "1"]))
+        .context("stty raw")
 }
 
 fn write_stdout_frame(stream: &mut UnixStream, len: u32) -> Result<()> {

@@ -26,6 +26,7 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+use crate::vmm_config::pmem::{PmemBuilder, PmemDeviceConfig};
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
@@ -171,6 +172,8 @@ pub struct VmResources {
     /// The network devices builder.
     #[cfg(feature = "net")]
     pub net: NetBuilder,
+    /// File-backed pmem regions.
+    pub pmem: PmemBuilder,
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
@@ -347,6 +350,10 @@ impl VmResources {
     #[cfg(feature = "blk")]
     pub fn add_block_device(&mut self, config: BlockDeviceConfig) -> Result<BlockConfigError> {
         self.block.insert(config)
+    }
+
+    pub fn add_pmem_device(&mut self, config: PmemDeviceConfig) {
+        self.pmem.insert(config)
     }
 
     /// Sets a vsock device to be attached when the VM starts.

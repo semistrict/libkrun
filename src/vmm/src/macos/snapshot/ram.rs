@@ -39,9 +39,13 @@ pub struct RamLayout {
     pub regions: Vec<RamRegion>,
 }
 
-pub fn write_full_pages_img(mem: &GuestMemoryMmap, dir: &Path) -> Result<RamLayout> {
+pub fn write_full_pages_img(
+    mem: &GuestMemoryMmap,
+    ram_ranges: &[(u64, u64)],
+    dir: &Path,
+) -> Result<RamLayout> {
     crate::timing_event("snapshot.ram.write_full.begin");
-    let layout = layout_from_memory(mem);
+    let layout = layout_from_ranges(ram_ranges);
     let path = pages_img_path(dir);
     let file = OpenOptions::new()
         .write(true)
@@ -58,7 +62,10 @@ pub fn write_full_pages_img(mem: &GuestMemoryMmap, dir: &Path) -> Result<RamLayo
     crate::timing_event("snapshot.ram.write_full.sized");
 
     let mut buf = vec![0u8; 1024 * 1024];
-    for region in mem.iter() {
+    for region in mem
+        .iter()
+        .filter(|region| is_ram_region(ram_ranges, region.start_addr().raw_value(), region.len()))
+    {
         let Some(base_offset) = guest_addr_to_file_offset(&layout, region.start_addr().raw_value())
         else {
             continue;
@@ -124,12 +131,13 @@ fn punch_hole(_file: &File, _offset: u64, _len: u64) -> std::io::Result<()> {
 
 pub fn clone_and_patch_dirty_pages_img(
     mem: &GuestMemoryMmap,
+    ram_ranges: &[(u64, u64)],
     previous_dir: &Path,
     stage_dir: &Path,
     dirty_blocks: &[DirtyBlock],
 ) -> Result<RamLayout> {
     crate::timing_event("snapshot.ram.clone_patch.begin");
-    let layout = layout_from_memory(mem);
+    let layout = layout_from_ranges(ram_ranges);
     let previous_pages = pages_img_path(previous_dir);
     let stage_pages = pages_img_path(stage_dir);
     crate::timing_event("snapshot.ram.clone_pages.begin");
@@ -252,22 +260,26 @@ fn clone_pages_img(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dst).map(|_| ())
 }
 
-fn layout_from_memory(mem: &GuestMemoryMmap) -> RamLayout {
+fn layout_from_ranges(ranges: &[(u64, u64)]) -> RamLayout {
     let mut layout = RamLayout {
         regions: Vec::new(),
     };
     let mut cursor: u64 = 0;
-    for region in mem.iter() {
-        let start = region.start_addr().raw_value();
-        let size = region.len();
+    for (start, size) in ranges {
         layout.regions.push(RamRegion {
-            guest_addr: start,
-            size,
+            guest_addr: *start,
+            size: *size,
             file_offset: cursor,
         });
-        cursor += size;
+        cursor += *size;
     }
     layout
+}
+
+fn is_ram_region(ranges: &[(u64, u64)], guest_addr: u64, size: u64) -> bool {
+    ranges
+        .iter()
+        .any(|(range_addr, range_size)| *range_addr == guest_addr && *range_size == size)
 }
 
 fn guest_addr_to_file_offset(layout: &RamLayout, guest_addr: u64) -> Option<u64> {

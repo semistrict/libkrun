@@ -56,6 +56,7 @@ use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLIN
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+use vmm::vmm_config::pmem::PmemDeviceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -160,6 +161,7 @@ struct ContextConfig {
     data_block_cfg: Option<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
+    pmem_cfgs: Vec<PmemDeviceConfig>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
@@ -289,6 +291,10 @@ impl ContextConfig {
         } else {
             self.block_cfgs.clone()
         }
+    }
+
+    fn add_pmem_cfg(&mut self, pmem_cfg: PmemDeviceConfig) {
+        self.pmem_cfgs.push(pmem_cfg);
     }
 
     #[cfg(feature = "net")]
@@ -836,6 +842,38 @@ pub unsafe extern "C" fn krun_add_disk3(
                 sync_mode,
             };
             cfg.add_block_cfg(block_device_config);
+        }
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_add_pmem(
+    ctx_id: u32,
+    c_pmem_id: *const c_char,
+    c_file_path: *const c_char,
+    read_only: bool,
+) -> i32 {
+    let file_path = match CStr::from_ptr(c_file_path).to_str() {
+        Ok(path) => path,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let pmem_id = match CStr::from_ptr(c_pmem_id).to_str() {
+        Ok(id) => id,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().add_pmem_cfg(PmemDeviceConfig {
+                id: pmem_id.to_string(),
+                path: file_path.to_string(),
+                read_only,
+            });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
     }
@@ -2694,6 +2732,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
     vmm::timing_event("start_enter.block.configured");
+    for pmem_cfg in ctx_cfg.pmem_cfgs.clone() {
+        ctx_cfg.vmr.add_pmem_device(pmem_cfg);
+    }
+    vmm::timing_event("start_enter.pmem.configured");
 
     /*
      * Before krun_start_enter() is called in an encrypted context, the TEE

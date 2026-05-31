@@ -173,6 +173,22 @@ int32_t krun_set_data_disk(uint32_t ctx_id, const char *disk_path);
  */
 int32_t krun_add_disk(uint32_t ctx_id, const char *block_id, const char *disk_path, bool read_only);
 
+/**
+ * Adds a raw file as a virtio-pmem region. The file is mapped into guest
+ * physical memory and exposed through a virtio-pmem device, allowing Linux DAX
+ * access while preserving flush ordering through the virtio-pmem flush queue.
+ *
+ * Arguments:
+ *  "ctx_id"    - the configuration context ID.
+ *  "pmem_id"   - a null-terminated string identifying the pmem device.
+ *  "file_path" - a null-terminated string representing the backing file.
+ *  "read_only" - whether the file should be exposed read-only.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_pmem(uint32_t ctx_id, const char *pmem_id, const char *file_path, bool read_only);
+
 /* Supported disk image formats */
 #define KRUN_DISK_FORMAT_RAW 0
 #define KRUN_DISK_FORMAT_QCOW2 1

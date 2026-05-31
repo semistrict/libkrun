@@ -21,7 +21,7 @@ use crossbeam_channel::RecvTimeoutError;
 use devices::legacy::{GicV3, GicV3State, IrqChip, VcpuList, VcpuListState};
 use devices::virtio::{DeviceSnapshot, MmioTransport, MmioTransportState};
 use serde::{Deserialize, Serialize};
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::GuestMemoryMmap;
 
 use super::container::{SectionId, SnapshotWriter};
 use super::ram::{clone_and_patch_dirty_pages_img, write_full_pages_img, RamLayout};
@@ -60,6 +60,7 @@ pub struct VirtioMmioSection {
 /// so the orchestrator stays decoupled from the rest of the Vmm internals.
 pub struct CaptureInputs<'a> {
     pub guest_memory: &'a GuestMemoryMmap,
+    pub ram_ranges: &'a [(u64, u64)],
     pub vcpu_handles: &'a [crate::vstate::VcpuHandle],
     pub vcpu_ids: &'a [u64],
     pub vcpu_list: &'a Arc<VcpuList>,
@@ -129,7 +130,7 @@ pub fn arm_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
     };
     drop(vcpu_states);
 
-    let result = enable_dirty_tracking(inputs.guest_memory);
+    let result = enable_dirty_tracking(inputs);
     let resume = resume_vcpus(inputs.vcpu_handles);
     result?;
     resume?;
@@ -230,9 +231,15 @@ where
         ));
         crate::timing_event("snapshot.capture_paused.ram.begin");
         let ram = if dir.join(super::PAGES_IMG).exists() {
-            clone_and_patch_dirty_pages_img(inputs.guest_memory, dir, &stage_dir, &dirty_blocks)?
+            clone_and_patch_dirty_pages_img(
+                inputs.guest_memory,
+                inputs.ram_ranges,
+                dir,
+                &stage_dir,
+                &dirty_blocks,
+            )?
         } else {
-            write_full_pages_img(inputs.guest_memory, &stage_dir)?
+            write_full_pages_img(inputs.guest_memory, inputs.ram_ranges, &stage_dir)?
         };
         crate::timing_event("snapshot.capture_paused.ram.done");
 
@@ -240,10 +247,10 @@ where
         crate::timing_event("snapshot.capture_paused.vmstate.begin");
         let mut total_ram: u64 = 0;
         let mut ram_base: u64 = u64::MAX;
-        for region in inputs.guest_memory.iter() {
-            total_ram += region.len();
-            if region.start_addr().0 < ram_base {
-                ram_base = region.start_addr().0;
+        for (addr, size) in inputs.ram_ranges {
+            total_ram += *size;
+            if *addr < ram_base {
+                ram_base = *addr;
             }
         }
 
@@ -281,7 +288,7 @@ where
         publish_snapshot_dir(&stage_dir, dir)?;
         crate::timing_event("snapshot.capture_paused.publish.done");
         crate::timing_event("snapshot.capture_paused.dirty_tracking.begin");
-        enable_dirty_tracking(inputs.guest_memory)?;
+        enable_dirty_tracking(inputs)?;
         crate::timing_event("snapshot.capture_paused.dirty_tracking.done");
         Ok(())
     })();
@@ -305,12 +312,8 @@ fn resume_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-fn enable_dirty_tracking(mem: &GuestMemoryMmap) -> Result<()> {
-    let ranges = mem
-        .iter()
-        .map(|region| (region.start_addr().raw_value(), region.len()))
-        .collect::<Vec<_>>();
-    hvf::enable_dirty_tracking(&ranges)
+fn enable_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
+    hvf::enable_dirty_tracking(inputs.ram_ranges)
         .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
 }
 
@@ -575,7 +578,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
 
     crate::timing_event("snapshot.restore.dirty_tracking.begin");
-    enable_dirty_tracking(inputs.guest_memory)?;
+    enable_dirty_tracking(inputs)?;
     crate::timing_event("snapshot.restore.dirty_tracking.done");
 
     info!("snapshot restore: device state restored, resuming vcpus");

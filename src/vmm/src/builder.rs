@@ -29,6 +29,7 @@ use crate::resources::{
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
+use crate::vmm_config::pmem::{build_pmem_regions, PmemRegionConfig};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
@@ -571,7 +572,7 @@ pub fn build_microvm(
     crate::timing_event("build_microvm.payload.selected");
 
     #[allow(unused_mut)]
-    let (mut guest_memory, arch_memory_info, mut _shm_manager, payload_config) =
+    let (mut guest_memory, arch_memory_info, mut _shm_manager, payload_config, pmem_regions) =
         create_guest_memory(
             vm_resources
                 .vm_config()
@@ -603,6 +604,12 @@ pub fn build_microvm(
         guest_memory = restore_pages_img(snap_path, &meta.ram)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
         crate::timing_event("build_microvm.snapshot.ram.mapped");
+        for region in build_pmem_regions_for_guest(vm_resources, &arch_memory_info)?.0 {
+            guest_memory = guest_memory
+                .insert_region(Arc::new(region))
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        }
+        crate::timing_event("build_microvm.snapshot.pmem.mapped");
     }
 
     let vcpu_config = vm_resources.vcpu_config();
@@ -1005,6 +1012,7 @@ pub fn build_microvm(
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
+        ram_ranges: payload_config.ram_ranges.clone(),
         kernel_cmdline,
         vcpus_handles: Vec::new(),
         exit_evt,
@@ -1128,6 +1136,8 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
     crate::timing_event("build_microvm.block.attached");
+    attach_pmem_devices(&mut vmm, event_manager, &pmem_regions, intc.clone())?;
+    crate::timing_event("build_microvm.pmem.attached");
 
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
@@ -1682,6 +1692,7 @@ pub struct PayloadConfig {
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
     written_ranges: Vec<(u64, u64)>,
+    ram_ranges: Vec<(u64, u64)>,
 }
 
 pub fn create_guest_memory(
@@ -1689,7 +1700,13 @@ pub fn create_guest_memory(
     vm_resources: &VmResources,
     payload: &Payload,
 ) -> std::result::Result<
-    (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+    (
+        GuestMemoryMmap,
+        ArchMemoryInfo,
+        ShmManager,
+        PayloadConfig,
+        Vec<PmemRegionConfig>,
+    ),
     StartMicrovmError,
 > {
     let mem_size = mem_size << 20;
@@ -1769,7 +1786,12 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = if use_vhost_user {
+    let ram_ranges = arch_mem_regions
+        .iter()
+        .map(|(addr, size)| (addr.raw_value(), *size as u64))
+        .collect::<Vec<_>>();
+
+    let mut guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
         {
             debug!(
@@ -1826,6 +1848,13 @@ pub fn create_guest_memory(
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
+    let (pmem_mappings, pmem_regions) = build_pmem_regions_for_guest(vm_resources, &arch_mem_info)?;
+    for region in pmem_mappings {
+        guest_mem = guest_mem
+            .insert_region(Arc::new(region))
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+    }
+
     let (guest_mem, entry_addr, initrd_config, cmdline, mut written_ranges) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
@@ -1849,9 +1878,31 @@ pub fn create_guest_memory(
         initrd_config,
         kernel_cmdline: cmdline.clone(),
         written_ranges,
+        ram_ranges,
     };
 
-    Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+    Ok((
+        guest_mem,
+        arch_mem_info,
+        shm_manager,
+        payload_config,
+        pmem_regions,
+    ))
+}
+
+fn build_pmem_regions_for_guest(
+    vm_resources: &VmResources,
+    arch_mem_info: &ArchMemoryInfo,
+) -> std::result::Result<
+    (Vec<vm_memory::mmap::GuestRegionMmap>, Vec<PmemRegionConfig>),
+    StartMicrovmError,
+> {
+    build_pmem_regions(
+        vm_resources.pmem.list(),
+        arch_mem_info.shm_start_addr,
+        arch_mem_info.page_size,
+    )
+    .map_err(StartMicrovmError::GuestMemoryMmap)
 }
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -2554,6 +2605,34 @@ fn attach_block_devices(
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+    }
+
+    Ok(())
+}
+
+fn attach_pmem_devices(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    pmem_regions: &[PmemRegionConfig],
+    intc: IrqChip,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    for region in pmem_regions {
+        let pmem = Arc::new(Mutex::new(
+            devices::virtio::Pmem::new(
+                region.id.clone(),
+                std::path::Path::new(&region.path),
+                region.guest_addr,
+                region.size,
+            )
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pmem: {e}")))?,
+        ));
+        event_manager
+            .add_subscriber(pmem.clone())
+            .map_err(RegisterEvent)?;
+        let id = String::from(pmem.lock().unwrap().id());
+        attach_mmio_device(vmm, id, intc.clone(), pmem).map_err(RegisterBlockDevice)?;
     }
 
     Ok(())

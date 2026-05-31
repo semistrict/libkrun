@@ -200,6 +200,7 @@ pub struct Vmm {
     // Guest VM core resources.
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
+    ram_ranges: Vec<(u64, u64)>,
 
     kernel_cmdline: KernelCmdline,
 
@@ -420,6 +421,7 @@ impl Vmm {
             .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
         let inputs = crate::macos::snapshot::CaptureInputs {
             guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
             vcpu_handles: &self.vcpus_handles,
             vcpu_ids: &ctx.vcpu_ids,
             vcpu_list: &ctx.vcpu_list,
@@ -446,6 +448,7 @@ impl Vmm {
             .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
         let inputs = crate::macos::snapshot::CaptureInputs {
             guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
             vcpu_handles: &self.vcpus_handles,
             vcpu_ids: &ctx.vcpu_ids,
             vcpu_list: &ctx.vcpu_list,
@@ -471,6 +474,7 @@ impl Vmm {
             .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
         let inputs = crate::macos::snapshot::CaptureInputs {
             guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
             vcpu_handles: &self.vcpus_handles,
             vcpu_ids: &ctx.vcpu_ids,
             vcpu_list: &ctx.vcpu_list,
@@ -491,6 +495,11 @@ impl Vmm {
         let ranges = self
             .guest_memory
             .iter()
+            .filter(|region| {
+                self.ram_ranges.iter().any(|(addr, size)| {
+                    region.start_addr().raw_value() == *addr && region.len() == *size
+                })
+            })
             .map(|region| (region.start_addr().raw_value(), region.len()))
             .collect::<Vec<_>>();
         hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())?;
@@ -511,6 +520,7 @@ impl Vmm {
             crate::macos::snapshot::SnapshotReader::open(path).map_err(|e| e.to_string())?;
         let inputs = crate::macos::snapshot::CaptureInputs {
             guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
             vcpu_handles: &self.vcpus_handles,
             vcpu_ids: &ctx.vcpu_ids,
             vcpu_list: &ctx.vcpu_list,

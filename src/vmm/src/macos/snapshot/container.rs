@@ -28,7 +28,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::{vmstate_path, Result, SnapshotError};
+use super::{snapshot_sync_enabled, vmstate_path, Result, SnapshotError};
 
 const MAGIC: [u8; 8] = *b"LKRNSS01";
 const VERSION: u32 = 1;
@@ -208,7 +208,12 @@ impl SnapshotWriter {
         for (_, _, bytes) in &self.sections {
             file.write_all(bytes)?;
         }
-        file.sync_all()?;
+        if snapshot_sync_enabled() {
+            file.sync_all()?;
+            crate::timing_event("snapshot.vmstate.synced");
+        } else {
+            crate::timing_event("snapshot.vmstate.sync.skipped");
+        }
         Ok(())
     }
 }

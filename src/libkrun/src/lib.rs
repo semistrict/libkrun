@@ -90,12 +90,11 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 // Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
 
-static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe {
-        std::env::var_os("KRUNFW_PATH")
-            .and_then(|path| libloading::Library::new(path).ok())
-            .or_else(|| libloading::Library::new(KRUNFW_NAME).ok())
-    });
+static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
+    std::env::var_os("KRUNFW_PATH")
+        .and_then(|path| libloading::Library::new(path).ok())
+        .or_else(|| libloading::Library::new(KRUNFW_NAME).ok())
+});
 
 pub struct KrunfwBindings {
     get_kernel: libloading::Symbol<
@@ -2644,6 +2643,7 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+    vmm::timing_event("start_enter.entry");
     #[cfg(target_os = "linux")]
     {
         let prname = match env::var("HOSTNAME") {
@@ -2663,11 +2663,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+    vmm::timing_event("start_enter.event_manager.created");
 
     let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+    vmm::timing_event("start_enter.ctx.loaded");
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
@@ -2691,6 +2693,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     }
+    vmm::timing_event("start_enter.block.configured");
 
     /*
      * Before krun_start_enter() is called in an encrypted context, the TEE
@@ -2725,6 +2728,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
         return -libc::EINVAL;
     }
+    vmm::timing_event("start_enter.kernel_cmdline.configured");
 
     #[cfg(feature = "net")]
     {
@@ -2782,6 +2786,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             }
         }
     }
+    vmm::timing_event("start_enter.vsock.configured");
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
         ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
@@ -2793,6 +2798,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Some(console_output) = ctx_cfg.console_output {
         ctx_cfg.vmr.set_console_output(console_output);
     }
+    vmm::timing_event("start_enter.resources.finalized");
 
     if let Some(gid) = ctx_cfg.vmm_gid {
         if unsafe { libc::setgid(gid) } != 0 {
@@ -2814,6 +2820,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     {
         ctx_cfg.vmr.snapshot_restore_path = ctx_cfg.snapshot_restore_path.clone();
     }
+    vmm::timing_event("start_enter.build_microvm.begin");
 
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
@@ -2827,11 +2834,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+    vmm::timing_event("start_enter.build_microvm.done");
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         RUNNING_VMMS.lock().unwrap().insert(ctx_id, _vmm.clone());
     }
+    vmm::timing_event("start_enter.running_vmm.registered");
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
@@ -2846,6 +2855,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    vmm::timing_event("start_enter.event_loop.begin");
     loop {
         match event_manager.run() {
             Ok(_) => {}
@@ -2915,6 +2925,56 @@ pub unsafe extern "C" fn krun_snapshot(ctx_id: u32, c_path: *const c_char) -> i3
     }
 }
 
+/// Mac+arm64 only. Capture a snapshot and copy one host file into the snapshot
+/// directory while the VM is still paused. `c_copy_dst_name` must be a relative
+/// filename inside the snapshot directory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_with_file_copy(
+    ctx_id: u32,
+    c_path: *const c_char,
+    c_copy_src: *const c_char,
+    c_copy_dst_name: *const c_char,
+) -> i32 {
+    if c_path.is_null() || c_copy_src.is_null() || c_copy_dst_name.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match CStr::from_ptr(c_path).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return -libc::EINVAL,
+    };
+    let copy_src = match CStr::from_ptr(c_copy_src).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return -libc::EINVAL,
+    };
+    let copy_dst_name = match CStr::from_ptr(c_copy_dst_name).to_str() {
+        Ok(s) => PathBuf::from(s),
+        Err(_) => return -libc::EINVAL,
+    };
+    if copy_dst_name.is_absolute() || copy_dst_name.components().count() != 1 {
+        return -libc::EINVAL;
+    }
+    let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(v) => v,
+        None => return -libc::ENOENT,
+    };
+    let result = vmm
+        .lock()
+        .unwrap()
+        .snapshot_with_file_copy(&path, &copy_src, &copy_dst_name);
+    match result {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("krun_snapshot_with_file_copy failed: {e}");
+            if e.contains("device refused") || e.contains("connections") {
+                -libc::EPERM
+            } else {
+                -libc::EIO
+            }
+        }
+    }
+}
+
 /// Mac+arm64 only. Arm dirty RAM tracking for a running VM. This is intended
 /// to be called after a restored guest reaches a stable command boundary and
 /// before the command whose effects should be captured incrementally.
@@ -2945,6 +3005,17 @@ pub extern "C" fn krun_arm_dirty_tracking(_ctx_id: u32) -> i32 {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[no_mangle]
 pub unsafe extern "C" fn krun_snapshot(_ctx_id: u32, _c_path: *const c_char) -> i32 {
+    -libc::ENOSYS
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_snapshot_with_file_copy(
+    _ctx_id: u32,
+    _c_path: *const c_char,
+    _c_copy_src: *const c_char,
+    _c_copy_dst_name: *const c_char,
+) -> i32 {
     -libc::ENOSYS
 }
 

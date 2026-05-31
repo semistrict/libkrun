@@ -38,8 +38,12 @@ use macos::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -427,8 +431,38 @@ impl Vmm {
         crate::macos::snapshot::capture(inputs, path).map_err(|e| e.to_string())
     }
 
-    /// Pause the restored VM briefly and arm write-protect dirty tracking for
-    /// subsequent incremental snapshot capture.
+    /// Capture a snapshot and copy one host file into the snapshot directory
+    /// while vCPUs and devices are still paused.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot_with_file_copy(
+        &mut self,
+        path: &std::path::Path,
+        copy_src: &std::path::Path,
+        copy_dst_name: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
+            let dst = stage_dir.join(copy_dst_name);
+            clone_or_copy_file(copy_src, &dst)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Arm write-protect dirty tracking for subsequent incremental snapshot capture.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn arm_dirty_tracking(&mut self) -> std::result::Result<(), String> {
         let ctx = self
@@ -488,6 +522,123 @@ impl Vmm {
         crate::macos::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
     }
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_src = CString::new(src.as_os_str().as_bytes())?;
+    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
+    let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct TimingState {
+    file: std::fs::File,
+    state_file: std::fs::File,
+    base_unix_nanos: u128,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static TIMING_LOG: OnceLock<Option<Mutex<TimingState>>> = OnceLock::new();
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn timing_event(label: &str) {
+    let Some(lock) = TIMING_LOG
+        .get_or_init(|| {
+            let path = std::env::var_os("KRUN_TIMINGS_LOG")?;
+            let state_path = std::env::var_os("KRUN_TIMINGS_STATE")?;
+            let base_unix_nanos = std::env::var("KRUN_TIMINGS_BASE_UNIX_NANOS")
+                .ok()?
+                .parse()
+                .ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            let state_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(state_path)
+                .ok()?;
+            Some(Mutex::new(TimingState {
+                file,
+                state_file,
+                base_unix_nanos,
+            }))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+
+    let Ok(mut state) = lock.lock() else {
+        return;
+    };
+    let now = unix_nanos();
+    if lock_file(&state.state_file).is_err() {
+        return;
+    }
+    let elapsed = now.saturating_sub(state.base_unix_nanos);
+    let base_unix_nanos = state.base_unix_nanos;
+    let delta =
+        replace_timing_state(&mut state.state_file, base_unix_nanos, now).unwrap_or_default();
+    let line = format!(
+        "{:>10.3}ms +{:>9.3}ms libkrun.{label}\n",
+        elapsed as f64 / 1_000_000.0,
+        delta as f64 / 1_000_000.0
+    );
+    let _ = state.file.write_all(line.as_bytes());
+    let _ = unlock_file(&state.state_file);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replace_timing_state(file: &mut std::fs::File, base: u128, now: u128) -> std::io::Result<u128> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    let previous = raw.trim().parse::<u128>().unwrap_or(base);
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{now}")?;
+    Ok(now.saturating_sub(previous))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unlock_file(file: &std::fs::File) -> std::io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn timing_event(_label: &str) {}
 
 impl Subscriber for Vmm {
     /// Handle a read event (EPOLLIN).

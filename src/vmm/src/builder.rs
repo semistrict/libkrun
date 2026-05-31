@@ -566,7 +566,9 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    crate::timing_event("build_microvm.begin");
     let payload = choose_payload(vm_resources)?;
+    crate::timing_event("build_microvm.payload.selected");
 
     #[allow(unused_mut)]
     let (mut guest_memory, arch_memory_info, mut _shm_manager, payload_config) =
@@ -578,6 +580,7 @@ pub fn build_microvm(
             vm_resources,
             &payload,
         )?;
+    crate::timing_event("build_microvm.guest_memory.created");
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let mut initial_dirty_ranges = payload_config.written_ranges.clone();
@@ -589,16 +592,21 @@ pub fn build_microvm(
         use crate::macos::snapshot::{
             container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img, SectionId,
         };
+        crate::timing_event("build_microvm.snapshot.reader.open.begin");
         let reader = SnapshotReader::open(snap_path)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.reader.open.done");
         let meta: MetaSection = reader
             .get_bincode(SectionId::Meta, 0)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.meta.loaded");
         guest_memory = restore_pages_img(snap_path, &meta.ram)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.ram.mapped");
     }
 
     let vcpu_config = vm_resources.vcpu_config();
+    crate::timing_event("build_microvm.vcpu_config.ready");
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -633,6 +641,7 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    crate::timing_event("build_microvm.vm.created");
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -788,6 +797,7 @@ pub fn build_microvm(
     let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
+    crate::timing_event("build_microvm.legacy_prepared");
 
     #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
@@ -814,6 +824,7 @@ pub fn build_microvm(
         &mut (arch::MMIO_MEM_START.clone()),
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
+    crate::timing_event("build_microvm.mmio_manager.created");
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
@@ -934,6 +945,7 @@ pub fn build_microvm(
             vm_resources.nested_enabled,
         )
         .map_err(StartMicrovmError::Internal)?;
+        crate::timing_event("build_microvm.vcpus.created");
 
         attach_legacy_devices(
             &vm,
@@ -944,6 +956,7 @@ pub fn build_microvm(
             event_manager,
             _shutdown_efd,
         )?;
+        crate::timing_event("build_microvm.legacy_devices.attached");
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
@@ -1004,6 +1017,7 @@ pub fn build_microvm(
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         snapshot_ctx,
     };
+    crate::timing_event("build_microvm.vmm.struct.created");
 
     // Set raw mode for FDs that are connected to legacy serial devices.
     for serial_tty in serial_ttys {
@@ -1037,6 +1051,7 @@ pub fn build_microvm(
         #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
         {
             attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+            crate::timing_event("build_microvm.rng.attached");
         }
     }
     let mut console_id = 0;
@@ -1050,6 +1065,7 @@ pub fn build_microvm(
             console_id,
         )?;
         console_id += 1;
+        crate::timing_event("build_microvm.implicit_console.attached");
     }
 
     for console_cfg in vm_resources.virtio_consoles.iter() {
@@ -1108,11 +1124,14 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+    crate::timing_event("build_microvm.fs.attached");
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
+    crate::timing_event("build_microvm.block.attached");
 
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+        crate::timing_event("build_microvm.vsock.attached");
         let tsi_flags = vm_resources.vsock.tsi_flags();
         if tsi_flags.contains(TsiFlags::HIJACK_INET) {
             vmm.kernel_cmdline.insert_str("tsi_hijack")?;
@@ -1124,6 +1143,7 @@ pub fn build_microvm(
 
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
+    crate::timing_event("build_microvm.net.attached");
     #[cfg(feature = "net")]
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
@@ -1152,12 +1172,14 @@ pub fn build_microvm(
                 &vm_resources.smbios_oem_strings,
             )
             .map_err(StartMicrovmError::Internal)?;
+        crate::timing_event("build_microvm.system.configured");
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             initial_dirty_ranges.extend(system_written_ranges);
             vmm.arm_dirty_tracking_pre_vcpu_start(&initial_dirty_ranges)
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("dirty tracking: {e}")))?;
+            crate::timing_event("build_microvm.dirty_tracking.armed");
         }
 
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -1206,21 +1228,26 @@ pub fn build_microvm(
         for v in &mut vcpus {
             v.queue_initial_pause();
         }
+        crate::timing_event("build_microvm.restore.initial_pause_queued");
     }
 
+    crate::timing_event("build_microvm.start_vcpus.begin");
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+    crate::timing_event("build_microvm.start_vcpus.done");
 
     // If we're restoring from a snapshot, apply the captured vCPU/device/GIC
     // state now. The vCPUs were pre-paused above, so restore_from can inject
     // state before any guest instruction executes.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(snap_path) = vm_resources.snapshot_restore_path.clone() {
+        crate::timing_event("build_microvm.restore_from.begin");
         vmm.restore_from(&snap_path).map_err(|e| {
             StartMicrovmError::Internal(crate::Error::VcpuResume).tap(|_| {
                 error!("snapshot restore failed: {e}");
             })
         })?;
+        crate::timing_event("build_microvm.restore_from.done");
     }
 
     // Clippy thinks we don't need Arc<Mutex<...
@@ -1230,6 +1257,7 @@ pub fn build_microvm(
     event_manager
         .add_subscriber(vmm.clone())
         .map_err(StartMicrovmError::RegisterEvent)?;
+    crate::timing_event("build_microvm.event_manager.subscribed");
 
     Ok(vmm)
 }

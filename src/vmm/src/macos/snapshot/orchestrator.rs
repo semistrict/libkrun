@@ -1,6 +1,4 @@
-// Snapshot/restore orchestrator (capture-side wired up; restore-side
-// rehydration helper is provided but the `build_microvm_for_restore`
-// integration into the boot builder is a separate change).
+// Snapshot/restore orchestrator for the HVF backend.
 //
 // Capture flow:
 //   1. Send Pause to every vCPU. Force-exit via hv_vcpus_exit so the vCPU
@@ -9,7 +7,7 @@
 //   3. Walk virtio MMIO transports: pause() each underlying device, then
 //      serialize_state(). Collect MmioTransportState too.
 //   4. Capture GICv3 state (distributor + per-vCPU pending IRQ bitmaps).
-//   5. Write pages.img from guest memory.
+//   5. Write or clone-and-patch pages.img from guest memory.
 //   6. Assemble vmstate.bin (META + per-vcpu + GICDIST + GICVCPU + per-virtio).
 //   7. Atomic publish: write into a staging directory, rename to <path>.
 //   8. Resume devices, then vCPUs.
@@ -26,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 use super::container::{SectionId, SnapshotWriter};
-use super::ram::{clone_and_patch_dirty_pages_img, write_sparse_pages_img, RamLayout};
+use super::ram::{clone_and_patch_dirty_pages_img, write_full_pages_img, RamLayout};
 use super::{Result, SnapshotError};
 
 const VCPU_PAUSE_TIMEOUT_MS: u64 = 2000;
@@ -80,6 +78,20 @@ fn cntvct_el0() -> u64 {
 
 /// Capture a complete snapshot into a staging directory, then publish it to `dir`.
 pub fn capture(inputs: CaptureInputs<'_>, dir: &Path) -> Result<()> {
+    capture_with_paused_hook(inputs, dir, |_| Ok(()))
+}
+
+/// Capture a complete snapshot into a staging directory, run `paused_hook`
+/// while vCPUs and devices are still paused, then publish it to `dir`.
+pub fn capture_with_paused_hook<F>(
+    inputs: CaptureInputs<'_>,
+    dir: &Path,
+    paused_hook: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    crate::timing_event("snapshot.capture.begin");
     // 1. Quiesce: pause all vCPUs and collect their state.
     let vcpu_states = match pause_vcpus(inputs.vcpu_handles, inputs.vcpu_ids) {
         Ok(states) => states,
@@ -88,17 +100,22 @@ pub fn capture(inputs: CaptureInputs<'_>, dir: &Path) -> Result<()> {
             return Err(e);
         }
     };
+    crate::timing_event("snapshot.capture.vcpus.paused");
 
-    let result = capture_paused(&inputs, dir, &vcpu_states);
+    let result = capture_paused(&inputs, dir, &vcpu_states, paused_hook);
+    crate::timing_event("snapshot.capture.paused_work.done");
 
     // Always attempt to resume every device and vCPU before returning. A failed
     // snapshot must not strand the caller's running VM in a paused state.
     let device_resume = resume_devices(&inputs);
+    crate::timing_event("snapshot.capture.devices.resumed");
     let vcpu_resume = resume_vcpus(inputs.vcpu_handles);
+    crate::timing_event("snapshot.capture.vcpus.resumed");
 
     result?;
     device_resume?;
     vcpu_resume?;
+    crate::timing_event("snapshot.capture.complete");
     Ok(())
 }
 
@@ -119,13 +136,25 @@ pub fn arm_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>]) -> Result<()> {
+fn capture_paused<F>(
+    inputs: &CaptureInputs<'_>,
+    dir: &Path,
+    vcpu_states: &[Vec<u8>],
+    paused_hook: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    crate::timing_event("snapshot.capture_paused.begin");
     // 2. Capture transport-side state for EVERY virtio device, then attempt
     // to pause + serialize the device-specific payload. Devices that don't
     // implement snapshot reject the operation; otherwise they could continue
     // touching guest memory while RAM is being copied.
     let mut virtio_sections = Vec::new();
-    for (base, transport_arc) in inputs.virtio_transports {
+    for (index, (base, transport_arc)) in inputs.virtio_transports.iter().enumerate() {
+        crate::timing_event(&format!(
+            "snapshot.capture_paused.virtio.begin index={index} base=0x{base:x}"
+        ));
         let transport = transport_arc.lock().unwrap();
         let device_type = transport.locked_device().device_type();
         let device_arc = transport.device();
@@ -164,9 +193,13 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
             transport: transport_state,
             device: device_snap,
         });
+        crate::timing_event(&format!(
+            "snapshot.capture_paused.virtio.done index={index} base=0x{base:x}"
+        ));
     }
 
     // 3. Capture GIC state.
+    crate::timing_event("snapshot.capture_paused.gic.begin");
     let hvf_gic_state = match inputs.irqchip {
         Some(irqchip) => irqchip
             .lock()
@@ -177,6 +210,7 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
     };
     let gic_state = inputs.gic.map(|g| g.lock().unwrap().to_state());
     let vcpu_list_state = inputs.vcpu_list.to_state();
+    crate::timing_event("snapshot.capture_paused.gic.done");
 
     // 4. Write RAM.
     let stage_dir = staging_dir(dir);
@@ -184,17 +218,26 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
         std::fs::remove_dir_all(&stage_dir)?;
     }
     std::fs::create_dir_all(&stage_dir)?;
+    crate::timing_event("snapshot.capture_paused.stage.ready");
 
     let result = (|| {
+        crate::timing_event("snapshot.capture_paused.dirty_blocks.begin");
         let dirty_blocks = hvf::take_dirty_blocks_and_reprotect()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("dirty RAM: {e}"))))?;
+        crate::timing_event(&format!(
+            "snapshot.capture_paused.dirty_blocks.done count={}",
+            dirty_blocks.len()
+        ));
+        crate::timing_event("snapshot.capture_paused.ram.begin");
         let ram = if dir.join(super::PAGES_IMG).exists() {
             clone_and_patch_dirty_pages_img(inputs.guest_memory, dir, &stage_dir, &dirty_blocks)?
         } else {
-            write_sparse_pages_img(inputs.guest_memory, &stage_dir, &dirty_blocks)?
+            write_full_pages_img(inputs.guest_memory, &stage_dir)?
         };
+        crate::timing_event("snapshot.capture_paused.ram.done");
 
         // 5. Assemble vmstate.bin.
+        crate::timing_event("snapshot.capture_paused.vmstate.begin");
         let mut total_ram: u64 = 0;
         let mut ram_base: u64 = u64::MAX;
         for region in inputs.guest_memory.iter() {
@@ -230,8 +273,16 @@ fn capture_paused(inputs: &CaptureInputs<'_>, dir: &Path, vcpu_states: &[Vec<u8>
         }
 
         writer.write_to_dir(&stage_dir)?;
+        crate::timing_event("snapshot.capture_paused.vmstate.done");
+        crate::timing_event("snapshot.capture_paused.paused_hook.begin");
+        paused_hook(&stage_dir)?;
+        crate::timing_event("snapshot.capture_paused.paused_hook.done");
+        crate::timing_event("snapshot.capture_paused.publish.begin");
         publish_snapshot_dir(&stage_dir, dir)?;
+        crate::timing_event("snapshot.capture_paused.publish.done");
+        crate::timing_event("snapshot.capture_paused.dirty_tracking.begin");
         enable_dirty_tracking(inputs.guest_memory)?;
+        crate::timing_event("snapshot.capture_paused.dirty_tracking.done");
         Ok(())
     })();
 
@@ -359,7 +410,9 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     use crate::vstate::{VcpuEvent, VcpuResponse};
 
     info!("snapshot restore: starting");
+    crate::timing_event("snapshot.restore.begin");
     let meta: MetaSection = reader.get_bincode(SectionId::Meta, 0)?;
+    crate::timing_event("snapshot.restore.meta.loaded");
     info!(
         "snapshot restore: meta loaded — vcpu_count={}, ram={} bytes, virtio_devs={}",
         meta.vcpu_count,
@@ -378,6 +431,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
             "nested_enabled differs between snapshot and current ctx".into(),
         ));
     }
+    crate::timing_event("snapshot.restore.config.checked");
 
     // vCPUs were pre-paused by the builder (queue_initial_pause), so they're
     // already blocked at the top of their first loop iteration. Drain their
@@ -404,9 +458,11 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 ))));
             }
         }
+        crate::timing_event(&format!("snapshot.restore.vcpu.initial_paused index={i}"));
     }
 
     // Restore GIC state.
+    crate::timing_event("snapshot.restore.irqchip.begin");
     if let Some(irqchip) = inputs.irqchip {
         if let Ok(st) = reader.get_raw(SectionId::HvfGic, 0) {
             irqchip
@@ -416,6 +472,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 .map_err(|e| SnapshotError::DeviceRefused(format!("irqchip restore: {e:?}")))?;
         }
     }
+    crate::timing_event("snapshot.restore.irqchip.done");
     if let Some(gic) = inputs.gic {
         if let Ok(st) = reader.get_bincode::<GicV3State>(SectionId::GicDist, 0) {
             gic.lock().unwrap().restore_state(&st);
@@ -424,11 +481,13 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     if let Ok(st) = reader.get_bincode::<VcpuListState>(SectionId::GicVcpu, 0) {
         inputs.vcpu_list.restore_state(&st);
     }
+    crate::timing_event("snapshot.restore.gic.done");
 
     // Push HvfVcpuState into each vcpu after the global GIC state is restored:
     // the per-vCPU CPU-interface and ICH registers are owned by the vCPU
     // thread and must be the final GIC state written for that vCPU.
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
+        crate::timing_event(&format!("snapshot.restore.vcpu.state.begin index={i}"));
         let bytes = reader.get_raw(SectionId::Vcpu, i as u32)?.to_vec();
         h.send_event(VcpuEvent::RestoreState(bytes)).map_err(|e| {
             SnapshotError::Io(std::io::Error::other(format!("send RestoreState: {e:?}")))
@@ -449,11 +508,13 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 ))));
             }
         }
+        crate::timing_event(&format!("snapshot.restore.vcpu.state.done index={i}"));
     }
 
     // Restore virtio devices — match by MMIO base, not by index, so out-of-scope
     // devices in the current ctx (e.g. virtio-balloon) don't shift the mapping.
     for i in 0..meta.virtio_bases.len() {
+        crate::timing_event(&format!("snapshot.restore.virtio.begin index={i}"));
         let section: VirtioMmioSection = reader.get_bincode(SectionId::VirtioMmio, i as u32)?;
         let transport_arc = inputs
             .virtio_transports
@@ -507,38 +568,26 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
             })?;
         }
         transport_arc.lock().unwrap().replay_pending_interrupt();
+        crate::timing_event(&format!(
+            "snapshot.restore.virtio.done index={i} base=0x{:x}",
+            section.mmio_base
+        ));
     }
 
-    let timer_delta = cntvct_el0().wrapping_sub(meta.capture_mach_time);
-    for (i, h) in inputs.vcpu_handles.iter().enumerate() {
-        h.send_event(VcpuEvent::RebaseTimer(timer_delta))
-            .map_err(|e| {
-                SnapshotError::Io(std::io::Error::other(format!("send RebaseTimer: {e:?}")))
-            })?;
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::TimerRebased) => {}
-            Ok(VcpuResponse::Error(s)) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: timer rebase: {s}"
-                ))));
-            }
-            other => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: unexpected {other:?}"
-                ))));
-            }
-        }
-    }
+    crate::timing_event("snapshot.restore.dirty_tracking.begin");
+    enable_dirty_tracking(inputs.guest_memory)?;
+    crate::timing_event("snapshot.restore.dirty_tracking.done");
 
     info!("snapshot restore: device state restored, resuming vcpus");
+    crate::timing_event("snapshot.restore.resume_vcpus.begin");
     resume_vcpus(inputs.vcpu_handles)?;
+    crate::timing_event("snapshot.restore.resume_vcpus.done");
     for (_, transport) in inputs.virtio_transports {
         transport.lock().unwrap().replay_pending_interrupt();
     }
+    crate::timing_event("snapshot.restore.interrupts.replayed");
     info!("snapshot restore: complete");
+    crate::timing_event("snapshot.restore.complete");
 
     Ok(())
 }

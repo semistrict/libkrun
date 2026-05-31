@@ -564,6 +564,13 @@ impl Queue {
             .used_ring
             .checked_add(offset)
             .ok_or(Error::AddressOverflow)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let _ = hvf::mark_dirty_ranges(&[
+                (addr.raw_value(), VIRTQ_USED_ELEMENT_SIZE),
+                (self.used_ring.raw_value() + 2, 2),
+            ]);
+        }
         mem.write_obj(VirtqUsedElem::new(head_index.into(), len), addr)
             .map_err(Error::GuestMemory)?;
 

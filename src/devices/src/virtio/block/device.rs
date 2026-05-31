@@ -531,11 +531,9 @@ impl VirtioDevice for Block {
                 { self.config.capacity }
             )));
         }
-        if body.disk_image_id != self.disk_image_id {
-            return Err(DeviceSnapshotError::Invalid(
-                "block disk_image_id mismatch (different backing file?)".into(),
-            ));
-        }
+        // Snapshot users may restore memory together with a point-in-time copy
+        // of the backing disk. That can change the host path/device identity
+        // while preserving the guest-visible block geometry checked above.
         self.acked_features = body.acked_features;
         dq.queue.restore_state(&snap.queues[0]);
         Ok(())

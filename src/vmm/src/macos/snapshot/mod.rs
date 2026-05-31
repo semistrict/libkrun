@@ -9,7 +9,7 @@ pub mod orchestrator;
 pub mod ram;
 
 pub use container::{SectionId, SnapshotReader};
-pub use orchestrator::{capture, restore, CaptureInputs};
+pub use orchestrator::{capture, capture_with_paused_hook, restore, CaptureInputs};
 
 use std::fmt;
 use std::io;
@@ -71,4 +71,13 @@ pub fn vmstate_path(dir: &std::path::Path) -> PathBuf {
 
 pub fn pages_img_path(dir: &std::path::Path) -> PathBuf {
     dir.join(PAGES_IMG)
+}
+
+pub(super) fn snapshot_sync_enabled() -> bool {
+    std::env::var("KRUN_SNAPSHOT_SYNC")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }

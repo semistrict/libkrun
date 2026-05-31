@@ -6,16 +6,16 @@ use std::thread;
 use std::time::Duration;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{MuxerRx, ProxyMap, push_packet};
+use super::muxer::{push_packet, MuxerRx, ProxyMap};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
-use crate::virtio::InterruptTransport;
 use crate::virtio::vsock::defs;
 use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
+use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
-use rand::{Rng, rng, rngs::ThreadRng};
+use rand::{rng, rngs::ThreadRng, Rng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 

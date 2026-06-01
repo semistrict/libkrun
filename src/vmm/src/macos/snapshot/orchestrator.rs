@@ -608,6 +608,32 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         crate::timing_event(&format!("snapshot.restore.vcpu.state.done index={i}"));
     }
 
+    let timer_delta = cntvct_el0().wrapping_sub(meta.capture_mach_time);
+    for (i, h) in inputs.vcpu_handles.iter().enumerate() {
+        crate::timing_event(&format!("snapshot.restore.vcpu.timer.begin index={i}"));
+        h.send_event(VcpuEvent::RebaseTimer(timer_delta))
+            .map_err(|e| {
+                SnapshotError::Io(std::io::Error::other(format!("send RebaseTimer: {e:?}")))
+            })?;
+        match h
+            .response_receiver()
+            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
+        {
+            Ok(VcpuResponse::TimerRebased) => {}
+            Ok(VcpuResponse::Error(s)) => {
+                return Err(SnapshotError::Io(std::io::Error::other(format!(
+                    "vcpu {i}: timer rebase: {s}"
+                ))));
+            }
+            other => {
+                return Err(SnapshotError::Io(std::io::Error::other(format!(
+                    "vcpu {i}: unexpected timer rebase response {other:?}"
+                ))));
+            }
+        }
+        crate::timing_event(&format!("snapshot.restore.vcpu.timer.done index={i}"));
+    }
+
     crate::timing_event("snapshot.restore.dirty_tracking.begin");
     enable_dirty_tracking(inputs)?;
     crate::timing_event("snapshot.restore.dirty_tracking.done");

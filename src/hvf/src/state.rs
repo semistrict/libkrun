@@ -524,10 +524,16 @@ impl HvfVcpu<'_> {
         Ok(())
     }
 
-    /// Restore-side timer kick after host time elapsed while the VM was not
-    /// running. The saved vtimer offset already makes CNTVCT_EL0 advance by
-    /// wall time on restore, so do not offset it again here.
-    pub fn rebase_timer(&self, _delta_ticks: u64) -> Result<(), Error> {
+    /// Restore-side timer rebase after host time elapsed while the VM was not
+    /// running. HVF exposes CNTVCT_EL0 to the guest as host counter minus the
+    /// virtual timer offset, so add the elapsed host ticks to the saved offset
+    /// to keep guest virtual time continuous across snapshot downtime.
+    pub fn rebase_timer(&self, delta_ticks: u64) -> Result<(), Error> {
+        let mut offset: u64 = 0;
+        unsafe {
+            let _ = hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _);
+            let _ = hv_vcpu_set_vtimer_offset(self.vcpuid, offset.wrapping_add(delta_ticks));
+        }
         if let (Ok(cval), Ok(ctl)) = (
             Self::raw_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16),
             Self::raw_get_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16),

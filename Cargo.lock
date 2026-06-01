@@ -713,6 +713,7 @@ dependencies = [
 name = "krun-hvf"
 version = "0.1.0-1.18.0"
 dependencies = [
+ "cc",
  "crossbeam-channel",
  "krun-arch",
  "libloading",

@@ -12,6 +12,15 @@ use crate::{vcpu_set_vtimer_mask, Error, HvfVcpu};
 const TMR_CTL_ENABLE: u64 = 1 << 0;
 const TMR_CTL_ISTATUS: u64 = 1 << 2;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+extern "C" {
+    fn krun_hv_vcpu_set_simd_fp_reg_from_bytes(
+        vcpu: hv_vcpu_t,
+        reg: hv_simd_fp_reg_t,
+        value_bytes: *const u8,
+    ) -> hv_return_t;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HvfVcpuState {
     /// X0..X30 (HVF numbers 0..30), then PC (HVF reg 31), then CPSR.
@@ -368,6 +377,12 @@ impl HvfVcpu<'_> {
     }
 
     fn raw_set_fp(vcpuid: hv_vcpu_t, reg: hv_simd_fp_reg_t, value: u128) -> Result<(), Error> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let ret = {
+            let bytes = value.to_le_bytes();
+            unsafe { krun_hv_vcpu_set_simd_fp_reg_from_bytes(vcpuid, reg, bytes.as_ptr()) }
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let ret = unsafe { hv_vcpu_set_simd_fp_reg(vcpuid, reg, value) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuSetRegister)
@@ -451,12 +466,6 @@ impl HvfVcpu<'_> {
             Self::raw_set_reg(id, hv_reg_t_HV_REG_X0 + i as hv_reg_t, v)?;
         }
         Self::raw_set_reg(id, hv_reg_t_HV_REG_PC, st.pc)?;
-        Self::raw_set_reg(id, hv_reg_t_HV_REG_FPCR, st.fpcr)?;
-        Self::raw_set_reg(id, hv_reg_t_HV_REG_FPSR, st.fpsr)?;
-
-        for (i, &v) in st.fp.iter().enumerate() {
-            Self::raw_set_fp(id, i as hv_simd_fp_reg_t, v)?;
-        }
 
         for &(reg, val) in &st.sysregs {
             if is_el2_control_reg(reg) {
@@ -470,6 +479,13 @@ impl HvfVcpu<'_> {
         }
 
         Self::raw_set_reg(id, hv_reg_t_HV_REG_CPSR, st.cpsr)?;
+        Self::raw_set_reg(id, hv_reg_t_HV_REG_FPCR, st.fpcr)?;
+        Self::raw_set_reg(id, hv_reg_t_HV_REG_FPSR, st.fpsr)?;
+
+        for (i, &v) in st.fp.iter().enumerate() {
+            Self::raw_set_fp(id, i as hv_simd_fp_reg_t, v)?;
+        }
+
         for &(reg, val) in &st.gic_redist_regs {
             Self::restore_gic_redist_reg(id, reg, val);
         }

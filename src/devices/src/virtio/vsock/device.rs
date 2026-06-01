@@ -355,12 +355,15 @@ impl VirtioDevice for Vsock {
 
     fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
         self.muxer.resume();
-        let raise_irq = self.process_transport_reset_event() || self.muxer.has_pending_rx();
-        if raise_irq {
-            let _ = self.process_stream_rx();
+        let mut raise_irq = self.process_transport_reset_event();
+        raise_irq |= self.process_stream_tx();
+        if self.muxer.has_pending_rx() {
+            raise_irq |= self.process_stream_rx();
         }
         if let DeviceState::Activated(_, ref interrupt) = self.device_state {
-            interrupt.signal_used_queue();
+            if raise_irq {
+                interrupt.signal_used_queue();
+            }
         }
         Ok(())
     }

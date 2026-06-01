@@ -68,7 +68,7 @@ impl Vsock {
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
         }
-        false
+        self.process_transport_reset_event()
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {

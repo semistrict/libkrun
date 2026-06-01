@@ -2884,6 +2884,26 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
     vmm::timing_event("start_enter.running_vmm.registered");
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if ctx_cfg.snapshot_restore_path.is_some() {
+        match event_manager.run_with_timeout(0) {
+            Ok(count) => {
+                vmm::timing_event(&format!(
+                    "start_enter.restore.event_manager_primed count={count}"
+                ));
+            }
+            Err(e) => {
+                error!("Error priming EventManager before snapshot restore resume: {e:?}");
+                return -libc::EINVAL;
+            }
+        }
+        if let Err(e) = _vmm.lock().unwrap().resume_after_restore() {
+            error!("snapshot restore resume failed: {e}");
+            return -libc::EINVAL;
+        }
+        vmm::timing_event("start_enter.restore.resumed");
+    }
+
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();

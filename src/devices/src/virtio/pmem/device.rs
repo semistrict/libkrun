@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::defs;
 use super::defs::uapi;
@@ -117,6 +117,10 @@ impl Pmem {
             };
 
             if let Some(addr) = resp_addr {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let _ = hvf::mark_dirty_ranges(&[(addr.raw_value(), resp_len as u64)]);
+                }
                 if let Err(e) = mem.write_obj(ret.to_le(), addr) {
                     error!("pmem: failed to write response: {e:?}");
                     self.queues.as_mut().unwrap()[REQ_INDEX]

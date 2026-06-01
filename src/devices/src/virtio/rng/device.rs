@@ -1,6 +1,6 @@
 use rand::{rngs::OsRng, TryRngCore};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
@@ -66,6 +66,10 @@ impl Rng {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let _ = hvf::mark_dirty_ranges(&[(desc.addr.raw_value(), desc.len as u64)]);
                 }
                 if let Err(e) = mem.write_slice(&rand_bytes[..], desc.addr) {
                     error!("Failed to write slice: {e:?}");

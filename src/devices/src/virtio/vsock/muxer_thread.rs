@@ -3,12 +3,11 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx, ProxyMap};
+use super::muxer::{push_packet, MuxerRx, PauseState, ProxyMap};
 use super::muxer_rxq::MuxerRxQ;
-use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate};
+use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::vsock::defs;
@@ -24,6 +23,7 @@ pub struct MuxerThread {
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
+    pause_state: Arc<PauseState>,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
@@ -38,6 +38,7 @@ impl MuxerThread {
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
+        pause_state: Arc<PauseState>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
@@ -49,6 +50,7 @@ impl MuxerThread {
             epoll,
             rxq,
             proxy_map,
+            pause_state,
             mem,
             queue,
             interrupt,
@@ -145,35 +147,6 @@ impl MuxerThread {
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
-            let proxy_map = self.proxy_map.clone();
-            let interrupt = self.interrupt.clone();
-            thread::spawn(move || {
-                // A restored guest may drop the first host-to-guest OP_REQUEST while it processes
-                // the vsock transport reset event. Keep the accepted host connection alive and
-                // retry until the guest confirms the reverse proxy or the proxy disappears.
-                for _ in 0..3 {
-                    thread::sleep(Duration::from_millis(100));
-                    let retry = proxy_map
-                        .read()
-                        .unwrap()
-                        .get(&new_id)
-                        .map(|proxy| {
-                            let proxy = proxy.lock().unwrap();
-                            if proxy.status() == ProxyStatus::ReverseInit {
-                                proxy.push_op_request();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if retry {
-                        interrupt.signal_used_queue();
-                    } else {
-                        break;
-                    }
-                }
-            });
             should_signal = true;
         }
 
@@ -219,6 +192,7 @@ impl MuxerThread {
             {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
+                        let _pause_guard = self.pause_state.enter();
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();

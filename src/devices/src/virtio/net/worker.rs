@@ -17,7 +17,7 @@ use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 /// Queue cursors + backend handed back to the device when the worker stops.
 pub struct NetWorkerStopResult {
@@ -465,6 +465,10 @@ impl NetWorker {
             }
 
             let len = std::cmp::min(frame_slice.len(), descriptor.len as usize);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let _ = hvf::mark_dirty_ranges(&[(descriptor.addr.raw_value(), len as u64)]);
+            }
             match self.mem.write_slice(&frame_slice[..len], descriptor.addr) {
                 Ok(()) => {
                     frame_slice = &frame_slice[len..];

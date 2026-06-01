@@ -531,6 +531,15 @@ impl Vmm {
         };
         crate::macos::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
     }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn resume_after_restore(&mut self) -> std::result::Result<(), String> {
+        crate::timing_event("snapshot.restore.resume_vcpus.begin");
+        crate::macos::snapshot::orchestrator::resume_vcpus(&self.vcpus_handles)
+            .map_err(|e| e.to_string())?;
+        crate::timing_event("snapshot.restore.resume_vcpus.done");
+        Ok(())
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

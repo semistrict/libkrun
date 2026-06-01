@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex, RwLock,
+};
 
 use super::super::Queue as VirtQueue;
 use super::defs;
@@ -26,6 +29,51 @@ use crate::virtio::InterruptTransport;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 pub type ProxyMap = Arc<RwLock<HashMap<u64, Mutex<Box<dyn Proxy>>>>>;
+
+#[derive(Default)]
+pub(crate) struct PauseState {
+    paused: AtomicBool,
+    active: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl PauseState {
+    pub(crate) fn enter(&self) -> PauseGuard<'_> {
+        let mut active = self.active.lock().unwrap();
+        while self.paused.load(Ordering::SeqCst) {
+            active = self.idle.wait(active).unwrap();
+        }
+        *active += 1;
+        PauseGuard { state: self }
+    }
+
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        let mut active = self.active.lock().unwrap();
+        while *active != 0 {
+            active = self.idle.wait(active).unwrap();
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.idle.notify_all();
+    }
+}
+
+pub(crate) struct PauseGuard<'a> {
+    state: &'a PauseState,
+}
+
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = self.state.active.lock().unwrap();
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.state.idle.notify_all();
+        }
+    }
+}
 
 /// A muxer RX queue item.
 #[derive(Debug)]
@@ -105,6 +153,7 @@ pub struct VsockMuxer {
     epoll: Epoll,
     interrupt: Option<InterruptTransport>,
     proxy_map: ProxyMap,
+    pause_state: Arc<PauseState>,
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
@@ -126,6 +175,7 @@ impl VsockMuxer {
             epoll: Epoll::new().unwrap(),
             interrupt: None,
             proxy_map: Arc::new(RwLock::new(HashMap::new())),
+            pause_state: Arc::new(PauseState::default()),
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
@@ -156,6 +206,7 @@ impl VsockMuxer {
             self.epoll.clone(),
             self.rxq.clone(),
             self.proxy_map.clone(),
+            self.pause_state.clone(),
             mem,
             queue,
             interrupt.clone(),
@@ -167,6 +218,14 @@ impl VsockMuxer {
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
+    }
+
+    pub(crate) fn pause(&self) {
+        self.pause_state.pause();
+    }
+
+    pub(crate) fn resume(&self) {
+        self.pause_state.resume();
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {

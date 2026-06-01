@@ -108,6 +108,10 @@ mod defs {
         /// The device supports DGRAM.
         pub const VIRTIO_VSOCK_F_DGRAM: u32 = 3;
 
+        /// Virtio-vsock event IDs.
+        /// Defined in `/include/uapi/linux/virtio_vsock.h`.
+        pub const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
+
         /// Virtio vsock device ID.
         /// Defined in `include/uapi/linux/virtio_ids.h`.
         pub const VIRTIO_ID_VSOCK: u32 = 19;
@@ -129,9 +133,6 @@ mod defs {
         pub const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
         /// Flow control credit update request.
         pub const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
-        /// Transport reset event.
-        pub const VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: u32 = 0;
-
         /// Vsock packet flags.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///

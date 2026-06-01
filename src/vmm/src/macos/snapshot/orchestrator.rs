@@ -19,9 +19,9 @@ use log::info;
 
 use crossbeam_channel::RecvTimeoutError;
 use devices::legacy::{GicV3, GicV3State, IrqChip, VcpuList, VcpuListState};
-use devices::virtio::{DeviceSnapshot, MmioTransport, MmioTransportState};
+use devices::virtio::{Descriptor, DeviceSnapshot, MmioTransport, MmioTransportState, QueueState};
 use serde::{Deserialize, Serialize};
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::container::{SectionId, SnapshotWriter};
 use super::ram::{clone_and_patch_dirty_pages_img, write_full_pages_img, RamLayout};
@@ -223,8 +223,14 @@ where
 
     let result = (|| {
         crate::timing_event("snapshot.capture_paused.dirty_blocks.begin");
-        let dirty_blocks = hvf::take_dirty_blocks_and_reprotect()
+        let mut dirty_blocks = hvf::take_dirty_blocks_and_reprotect()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("dirty RAM: {e}"))))?;
+        add_virtio_dma_dirty_blocks(
+            inputs.guest_memory,
+            inputs.ram_ranges,
+            &virtio_sections,
+            &mut dirty_blocks,
+        );
         crate::timing_event(&format!(
             "snapshot.capture_paused.dirty_blocks.done count={}",
             dirty_blocks.len()
@@ -317,6 +323,94 @@ fn enable_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
         .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
 }
 
+fn add_virtio_dma_dirty_blocks(
+    mem: &GuestMemoryMmap,
+    ram_ranges: &[(u64, u64)],
+    virtio_sections: &[VirtioMmioSection],
+    dirty_blocks: &mut Vec<hvf::DirtyBlock>,
+) {
+    let mut ranges = Vec::new();
+    for section in virtio_sections {
+        let Some(device) = &section.device else {
+            continue;
+        };
+        for queue in &device.queues {
+            collect_queue_dma_ranges(mem, queue, &mut ranges);
+        }
+    }
+
+    for (addr, size) in ranges {
+        add_dirty_range(ram_ranges, dirty_blocks, addr, size);
+    }
+    dirty_blocks.sort_by_key(|block| block.guest_addr);
+    dirty_blocks.dedup_by_key(|block| block.guest_addr);
+    crate::timing_event(&format!(
+        "snapshot.capture_paused.virtio_dma_dirty.done count={}",
+        dirty_blocks.len()
+    ));
+}
+
+fn collect_queue_dma_ranges(
+    mem: &GuestMemoryMmap,
+    queue: &QueueState,
+    ranges: &mut Vec<(u64, u64)>,
+) {
+    if !queue.ready || queue.size == 0 {
+        return;
+    }
+
+    let queue_size = u64::from(queue.size);
+    ranges.push((queue.desc_table, queue_size * 16));
+    ranges.push((queue.avail_ring, 4 + queue_size * 2 + 2));
+    ranges.push((queue.used_ring, 4 + queue_size * 8 + 2));
+
+    for index in 0..queue.size {
+        let Some(desc_addr) = queue.desc_table.checked_add(u64::from(index) * 16) else {
+            continue;
+        };
+        let Ok(desc) = mem.read_obj::<Descriptor>(GuestAddress(desc_addr)) else {
+            continue;
+        };
+        if desc.len != 0 {
+            ranges.push((desc.addr, u64::from(desc.len)));
+        }
+    }
+}
+
+fn add_dirty_range(
+    ram_ranges: &[(u64, u64)],
+    dirty_blocks: &mut Vec<hvf::DirtyBlock>,
+    addr: u64,
+    size: u64,
+) {
+    let Some(end) = addr.checked_add(size.saturating_sub(1)) else {
+        return;
+    };
+    for (ram_addr, ram_size) in ram_ranges {
+        let ram_end = ram_addr.saturating_add(*ram_size);
+        let start = addr.max(*ram_addr);
+        let end = end.min(ram_end.saturating_sub(1));
+        if start > end {
+            continue;
+        }
+
+        let first =
+            ((start - *ram_addr) / hvf::DIRTY_BLOCK_SIZE) * hvf::DIRTY_BLOCK_SIZE + *ram_addr;
+        let last = ((end - *ram_addr) / hvf::DIRTY_BLOCK_SIZE) * hvf::DIRTY_BLOCK_SIZE + *ram_addr;
+        let mut block_addr = first;
+        while block_addr <= last {
+            dirty_blocks.push(hvf::DirtyBlock {
+                guest_addr: block_addr,
+                size: hvf::DIRTY_BLOCK_SIZE.min(ram_end - block_addr),
+            });
+            let Some(next) = block_addr.checked_add(hvf::DIRTY_BLOCK_SIZE) else {
+                break;
+            };
+            block_addr = next;
+        }
+    }
+}
+
 fn staging_dir(dir: &Path) -> PathBuf {
     let name = dir
         .file_name()
@@ -378,7 +472,7 @@ fn pause_vcpus(handles: &[crate::vstate::VcpuHandle], vcpu_ids: &[u64]) -> Resul
     Ok(out)
 }
 
-fn resume_vcpus(handles: &[crate::vstate::VcpuHandle]) -> Result<()> {
+pub fn resume_vcpus(handles: &[crate::vstate::VcpuHandle]) -> Result<()> {
     use crate::vstate::{VcpuEvent, VcpuResponse};
     for h in handles {
         h.send_event(VcpuEvent::Resume)
@@ -514,6 +608,10 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         crate::timing_event(&format!("snapshot.restore.vcpu.state.done index={i}"));
     }
 
+    crate::timing_event("snapshot.restore.dirty_tracking.begin");
+    enable_dirty_tracking(inputs)?;
+    crate::timing_event("snapshot.restore.dirty_tracking.done");
+
     // Restore virtio devices — match by MMIO base, not by index, so out-of-scope
     // devices in the current ctx (e.g. virtio-balloon) don't shift the mapping.
     for i in 0..meta.virtio_bases.len() {
@@ -577,14 +675,6 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         ));
     }
 
-    crate::timing_event("snapshot.restore.dirty_tracking.begin");
-    enable_dirty_tracking(inputs)?;
-    crate::timing_event("snapshot.restore.dirty_tracking.done");
-
-    info!("snapshot restore: device state restored, resuming vcpus");
-    crate::timing_event("snapshot.restore.resume_vcpus.begin");
-    resume_vcpus(inputs.vcpu_handles)?;
-    crate::timing_event("snapshot.restore.resume_vcpus.done");
     for (_, transport) in inputs.virtio_transports {
         transport.lock().unwrap().replay_pending_interrupt();
     }

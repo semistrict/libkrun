@@ -369,8 +369,7 @@ impl VirtioDevice for Vsock {
     }
 
     fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
-        let transport_reset = matches!(self.device_state, DeviceState::Activated(_, _))
-            && !self.write_transport_reset_event()?;
+        let transport_reset = matches!(self.device_state, DeviceState::Activated(_, _));
         let mut queues = Vec::new();
         for q in [&self.queue_rx, &self.queue_tx, &self.queue_ev] {
             let q = q

@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::fmt::{self, Debug, Display};
 use std::num::Wrapping;
@@ -14,6 +15,21 @@ use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
     VolatileMemoryError,
 };
+
+/// Snapshot representation of a virtio Queue.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueState {
+    pub max_size: u16,
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
 
 /// Size of used ring header: flags (u16) + idx (u16)
 pub(crate) const VIRTQ_USED_RING_HEADER_SIZE: u64 = 4;
@@ -368,6 +384,36 @@ impl Queue {
         }
     }
 
+    /// Snapshot the queue's configuration + cursor state.
+    pub fn to_state(&self) -> QueueState {
+        QueueState {
+            max_size: self.max_size,
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    /// Restore a queue from a snapshot. `max_size` must match the device's
+    /// programmed value — verified by caller.
+    pub fn restore_state(&mut self, st: &QueueState) {
+        self.size = st.size;
+        self.ready = st.ready;
+        self.desc_table = GuestAddress(st.desc_table);
+        self.avail_ring = GuestAddress(st.avail_ring);
+        self.used_ring = GuestAddress(st.used_ring);
+        self.next_avail = Wrapping(st.next_avail);
+        self.next_used = Wrapping(st.next_used);
+        self.event_idx_enabled = st.event_idx_enabled;
+        self.num_added = Wrapping(st.num_added);
+    }
+
     pub fn get_max_size(&self) -> u16 {
         self.max_size
     }
@@ -518,6 +564,13 @@ impl Queue {
             .used_ring
             .checked_add(offset)
             .ok_or(Error::AddressOverflow)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let _ = hvf::mark_dirty_ranges(&[
+                (addr.raw_value(), VIRTQ_USED_ELEMENT_SIZE),
+                (self.used_ring.raw_value() + 2, 2),
+            ]);
+        }
         mem.write_obj(VirtqUsedElem::new(head_index.into(), len), addr)
             .map_err(Error::GuestMemory)?;
 

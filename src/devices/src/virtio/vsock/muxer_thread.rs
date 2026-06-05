@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx, ProxyMap};
+use super::muxer::{push_packet, MuxerRx, PauseState, ProxyMap};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
@@ -23,6 +23,7 @@ pub struct MuxerThread {
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
+    pause_state: Arc<PauseState>,
     mem: GuestMemoryMmap,
     queue: Arc<Mutex<VirtQueue>>,
     interrupt: InterruptTransport,
@@ -37,6 +38,7 @@ impl MuxerThread {
         epoll: Epoll,
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
+        pause_state: Arc<PauseState>,
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
@@ -48,6 +50,7 @@ impl MuxerThread {
             epoll,
             rxq,
             proxy_map,
+            pause_state,
             mem,
             queue,
             interrupt,
@@ -137,6 +140,10 @@ impl MuxerThread {
                 .write()
                 .unwrap()
                 .insert(new_id, Mutex::new(new_proxy));
+            debug!(
+                "created reverse proxy from acceptor: listener_id={} new_id={} local_port={} peer_port={}",
+                id, new_id, local_port, peer_port
+            );
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
@@ -155,6 +162,10 @@ impl MuxerThread {
                 continue;
             }
             let id = ((*port as u64) << 32) | (defs::TSI_PROXY_PORT as u64);
+            let mut proxy_map = self.proxy_map.write().unwrap();
+            if proxy_map.contains_key(&id) {
+                continue;
+            }
             let proxy = match UnixAcceptorProxy::new(id, path, *port) {
                 Ok(proxy) => proxy,
                 Err(e) => {
@@ -162,17 +173,15 @@ impl MuxerThread {
                     continue;
                 }
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(id, Mutex::new(Box::new(proxy)));
-            if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
-                self.update_polling(id, proxy.lock().unwrap().as_raw_fd(), EventSet::IN);
-            };
+            info!("created listening vsock proxy at {path:?} for guest port {port}");
+            let fd = proxy.as_raw_fd();
+            proxy_map.insert(id, Mutex::new(Box::new(proxy)));
+            self.update_polling(id, fd, EventSet::IN);
         }
     }
 
     fn work(mut self) {
+        info!("vsock muxer thread starting");
         let mut thread_rng = rng();
         self.create_lisening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
@@ -183,6 +192,7 @@ impl MuxerThread {
             {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
+                        let _pause_guard = self.pause_state.enter();
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();

@@ -33,3 +33,6 @@ pub mod vsock;
 /// Wrapper for configuring the network devices attached to the microVM.
 #[cfg(feature = "net")]
 pub mod net;
+
+/// Wrapper for configuring file-backed persistent memory regions.
+pub mod pmem;

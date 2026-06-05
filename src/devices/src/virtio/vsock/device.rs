@@ -11,17 +11,20 @@ use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    Queue as VirtQueue, QueueConfig, VirtioDevice,
 };
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
+use super::tsi_stream::StreamListenerSnapshot;
 use super::TsiFlags;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+
+use serde::{Deserialize, Serialize};
 
 pub(crate) const RXQ_INDEX: usize = 0;
 pub(crate) const TXQ_INDEX: usize = 1;
@@ -40,12 +43,14 @@ pub struct Vsock {
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
+    pub(crate) queue_ev: Option<Arc<Mutex<VirtQueue>>>,
     // Queue events are stored separately for event handling.
     pub(crate) queue_events: Vec<Arc<EventFd>>,
     pub(crate) avail_features: u64,
     pub(crate) acked_features: u64,
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+    pending_transport_reset: bool,
 }
 
 impl Vsock {
@@ -61,12 +66,14 @@ impl Vsock {
             muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
             queue_rx: None,
             queue_tx: None,
+            queue_ev: None,
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
             activate_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            pending_transport_reset: false,
         })
     }
 
@@ -155,7 +162,6 @@ impl Vsock {
                     continue;
                 }
             };
-
             if pkt.type_() == uapi::VSOCK_TYPE_DGRAM {
                 debug!("process_stream_tx() is DGRAM");
                 if self.muxer.send_dgram_pkt(&pkt).is_err() {
@@ -177,6 +183,71 @@ impl Vsock {
         }
 
         have_used
+    }
+
+    fn write_transport_reset_event(&self) -> Result<bool, DeviceSnapshotError> {
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => return Ok(false),
+        };
+        let Some(queue_ev) = self.queue_ev.as_ref() else {
+            return Ok(false);
+        };
+
+        let mut queue_ev = queue_ev.lock().unwrap();
+        let Some(head) = queue_ev.pop(mem) else {
+            return Ok(false);
+        };
+
+        if !head.is_write_only() || head.len < 4 {
+            warn!(
+                "vsock event queue descriptor is not writable or too small: index={} len={}",
+                head.index, head.len
+            );
+            if let Err(e) = queue_ev.add_used(mem, head.index, 0) {
+                error!("failed to add malformed vsock event descriptor to used ring: {e:?}");
+            }
+            return Ok(true);
+        }
+
+        let event = uapi::VIRTIO_VSOCK_EVENT_TRANSPORT_RESET.to_le_bytes();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let _ = hvf::mark_dirty_ranges(&[(head.addr.raw_value(), event.len() as u64)]);
+        }
+        if let Err(e) = mem.write_slice(&event, head.addr) {
+            queue_ev.undo_pop();
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock transport reset event write: {e:?}"
+            )));
+        }
+        if let Err(e) = queue_ev.add_used(mem, head.index, event.len() as u32) {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock transport reset event used ring: {e:?}"
+            )));
+        }
+
+        info!("vsock.restore.transport_reset_event");
+        Ok(true)
+    }
+
+    pub(crate) fn process_transport_reset_event(&mut self) -> bool {
+        if !self.pending_transport_reset {
+            return false;
+        }
+
+        match self.write_transport_reset_event() {
+            Ok(wrote) => {
+                if wrote {
+                    self.pending_transport_reset = false;
+                }
+                wrote
+            }
+            Err(e) => {
+                error!("failed to write pending vsock transport reset event: {e:?}");
+                false
+            }
+        }
     }
 }
 
@@ -255,13 +326,13 @@ impl VirtioDevice for Vsock {
 
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
-        // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
+        let ev_queue = queues_vec.pop().unwrap();
         let tx_queue = queues_vec.pop().unwrap();
         let rx_queue = queues_vec.pop().unwrap();
 
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
+        self.queue_ev = Some(Arc::new(Mutex::new(ev_queue)));
         self.muxer.activate(
             mem.clone(),
             self.queue_rx.clone().unwrap(),
@@ -276,4 +347,99 @@ impl VirtioDevice for Vsock {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        self.muxer.pause();
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        self.muxer.resume();
+        let mut raise_irq = self.process_transport_reset_event();
+        raise_irq |= self.process_stream_tx();
+        if self.muxer.has_pending_rx() {
+            raise_irq |= self.process_stream_rx();
+        }
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            if raise_irq {
+                interrupt.signal_used_queue();
+            }
+        }
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let transport_reset = matches!(self.device_state, DeviceState::Activated(_, _));
+        let mut queues = Vec::new();
+        for q in [&self.queue_rx, &self.queue_tx, &self.queue_ev] {
+            let q = q
+                .as_ref()
+                .ok_or_else(|| DeviceSnapshotError::Invalid("vsock not activated".into()))?;
+            queues.push(q.lock().unwrap().to_state());
+        }
+
+        let body = VsockSnapshotBody {
+            cid: self.cid,
+            acked_features: self.acked_features,
+            stream_listeners: self.muxer.stream_listener_snapshots(),
+            pending_rx: Vec::new(),
+            transport_reset,
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        if snap.queues.len() != 3 {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock: expected 3 queues, got {}",
+                snap.queues.len()
+            )));
+        }
+        let body: VsockSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        if body.cid != self.cid {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "vsock cid mismatch: snapshot={} current={}",
+                body.cid, self.cid
+            )));
+        }
+        self.acked_features = body.acked_features;
+        if let Some(q) = &self.queue_rx {
+            q.lock().unwrap().restore_state(&snap.queues[0]);
+        }
+        if let Some(q) = &self.queue_tx {
+            q.lock().unwrap().restore_state(&snap.queues[1]);
+        }
+        if let Some(q) = &self.queue_ev {
+            q.lock().unwrap().restore_state(&snap.queues[2]);
+        }
+        self.muxer
+            .restore_unix_acceptors()
+            .map_err(DeviceSnapshotError::Invalid)?;
+        self.muxer
+            .restore_stream_listeners(&body.stream_listeners)
+            .map_err(DeviceSnapshotError::Invalid)?;
+        self.pending_transport_reset = body.transport_reset || !body.pending_rx.is_empty();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VsockSnapshotBody {
+    cid: u64,
+    acked_features: u64,
+    #[serde(default)]
+    stream_listeners: Vec<StreamListenerSnapshot>,
+    #[serde(default)]
+    pending_rx: Vec<LegacyStreamReset>,
+    #[serde(default)]
+    transport_reset: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyStreamReset {
+    local_port: u32,
+    peer_port: u32,
 }

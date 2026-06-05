@@ -29,6 +29,7 @@ use crate::resources::{
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
+use crate::vmm_config::pmem::{build_pmem_regions, PmemRegionConfig};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
@@ -566,18 +567,53 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    crate::timing_event("build_microvm.begin");
     let payload = choose_payload(vm_resources)?;
+    crate::timing_event("build_microvm.payload.selected");
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
-    )?;
+    #[allow(unused_mut)]
+    let (mut guest_memory, arch_memory_info, mut _shm_manager, payload_config, pmem_regions) =
+        create_guest_memory(
+            vm_resources
+                .vm_config()
+                .mem_size_mib
+                .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+            vm_resources,
+            &payload,
+        )?;
+    crate::timing_event("build_microvm.guest_memory.created");
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut initial_dirty_ranges = payload_config.written_ranges.clone();
+
+    // Snapshot restore mode (macOS arm64): replace the freshly initialized
+    // RAM with the captured pages.img contents before HVF maps guest memory.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(snap_path) = &vm_resources.snapshot_restore_path {
+        use crate::macos::snapshot::{
+            container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img, SectionId,
+        };
+        crate::timing_event("build_microvm.snapshot.reader.open.begin");
+        let reader = SnapshotReader::open(snap_path)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.reader.open.done");
+        let meta: MetaSection = reader
+            .get_bincode(SectionId::Meta, 0)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.meta.loaded");
+        guest_memory = restore_pages_img(snap_path, &meta.ram)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.ram.mapped");
+        for region in build_pmem_regions_for_guest(vm_resources, &arch_memory_info)?.0 {
+            guest_memory = guest_memory
+                .insert_region(Arc::new(region))
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        }
+        crate::timing_event("build_microvm.snapshot.pmem.mapped");
+    }
 
     let vcpu_config = vm_resources.vcpu_config();
+    crate::timing_event("build_microvm.vcpu_config.ready");
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
@@ -612,6 +648,7 @@ pub fn build_microvm(
     #[cfg(not(feature = "tee"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    crate::timing_event("build_microvm.vm.created");
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -767,6 +804,7 @@ pub fn build_microvm(
     let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK)
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
+    crate::timing_event("build_microvm.legacy_prepared");
 
     #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
@@ -793,6 +831,7 @@ pub fn build_microvm(
         &mut (arch::MMIO_MEM_START.clone()),
         (arch::IRQ_BASE, arch::IRQ_MAX),
     );
+    crate::timing_event("build_microvm.mmio_manager.created");
 
     #[cfg(target_os = "macos")]
     let vcpu_list = {
@@ -800,7 +839,7 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
-    let vcpus;
+    let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
@@ -893,7 +932,10 @@ pub fn build_microvm(
         intc = {
             // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
             // userspace implementation.
-            let gic = match HvfGicV3::new(vm_resources.vm_config().vcpu_count.unwrap() as u64) {
+            let gic = match HvfGicV3::new(
+                vm_resources.vm_config().vcpu_count.unwrap() as u64,
+                vcpu_list.clone(),
+            ) {
                 Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
                 Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
             };
@@ -910,6 +952,7 @@ pub fn build_microvm(
             vm_resources.nested_enabled,
         )
         .map_err(StartMicrovmError::Internal)?;
+        crate::timing_event("build_microvm.vcpus.created");
 
         attach_legacy_devices(
             &vm,
@@ -920,6 +963,7 @@ pub fn build_microvm(
             event_manager,
             _shutdown_efd,
         )?;
+        crate::timing_event("build_microvm.legacy_devices.attached");
     }
 
     #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
@@ -949,9 +993,26 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let snapshot_ctx = {
+        let mut ids: Vec<u64> = Vec::new();
+        for v in &vcpus {
+            ids.push(v.cpu_index() as u64);
+        }
+        let gic = None;
+        Some(crate::macos::vstate::SnapshotCtx {
+            vcpu_ids: ids,
+            vcpu_list: vcpu_list.clone(),
+            irqchip: intc.clone(),
+            gic,
+            nested_enabled: vm_resources.nested_enabled,
+        })
+    };
+
     let mut vmm = Vmm {
         guest_memory,
         arch_memory_info,
+        ram_ranges: payload_config.ram_ranges.clone(),
         kernel_cmdline,
         vcpus_handles: Vec::new(),
         exit_evt,
@@ -961,14 +1022,20 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        snapshot_ctx,
     };
+    crate::timing_event("build_microvm.vmm.struct.created");
 
     // Set raw mode for FDs that are connected to legacy serial devices.
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(
+        not(feature = "tee"),
+        not(all(target_os = "macos", target_arch = "aarch64"))
+    ))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
     {
@@ -992,6 +1059,7 @@ pub fn build_microvm(
         #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
         {
             attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+            crate::timing_event("build_microvm.rng.attached");
         }
     }
     let mut console_id = 0;
@@ -1005,6 +1073,7 @@ pub fn build_microvm(
             console_id,
         )?;
         console_id += 1;
+        crate::timing_event("build_microvm.implicit_console.attached");
     }
 
     for console_cfg in vm_resources.virtio_consoles.iter() {
@@ -1063,11 +1132,16 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+    crate::timing_event("build_microvm.fs.attached");
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
+    crate::timing_event("build_microvm.block.attached");
+    attach_pmem_devices(&mut vmm, event_manager, &pmem_regions, intc.clone())?;
+    crate::timing_event("build_microvm.pmem.attached");
 
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+        crate::timing_event("build_microvm.vsock.attached");
         let tsi_flags = vm_resources.vsock.tsi_flags();
         if tsi_flags.contains(TsiFlags::HIJACK_INET) {
             vmm.kernel_cmdline.insert_str("tsi_hijack")?;
@@ -1079,6 +1153,7 @@ pub fn build_microvm(
 
     #[cfg(feature = "net")]
     attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
+    crate::timing_event("build_microvm.net.attached");
     #[cfg(feature = "net")]
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
@@ -1093,13 +1168,33 @@ pub fn build_microvm(
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let restoring_snapshot = vm_resources.snapshot_restore_path.is_some();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let restoring_snapshot = false;
+
+    if !restoring_snapshot {
+        let system_written_ranges = vmm
+            .configure_system(
+                vcpus.as_slice(),
+                &intc,
+                &payload_config.initrd_config,
+                &vm_resources.smbios_oem_strings,
+            )
+            .map_err(StartMicrovmError::Internal)?;
+        crate::timing_event("build_microvm.system.configured");
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            initial_dirty_ranges.extend(system_written_ranges);
+            vmm.arm_dirty_tracking_pre_vcpu_start(&initial_dirty_ranges)
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("dirty tracking: {e}")))?;
+            crate::timing_event("build_microvm.dirty_tracking.armed");
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = system_written_ranges;
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1135,8 +1230,35 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    // Restore mode: pre-queue Pause on every vCPU so the vCPU threads park at
+    // the top of their first loop iteration without first running any guest
+    // instructions before restore_from applies the captured register state.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if vm_resources.snapshot_restore_path.is_some() {
+        for v in &mut vcpus {
+            v.queue_initial_pause();
+        }
+        crate::timing_event("build_microvm.restore.initial_pause_queued");
+    }
+
+    crate::timing_event("build_microvm.start_vcpus.begin");
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
+    crate::timing_event("build_microvm.start_vcpus.done");
+
+    // If we're restoring from a snapshot, apply the captured vCPU/device/GIC
+    // state now. The vCPUs were pre-paused above, so restore_from can inject
+    // state before any guest instruction executes.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(snap_path) = vm_resources.snapshot_restore_path.clone() {
+        crate::timing_event("build_microvm.restore_from.begin");
+        vmm.restore_from(&snap_path).map_err(|e| {
+            StartMicrovmError::Internal(crate::Error::VcpuResume).tap(|_| {
+                error!("snapshot restore failed: {e}");
+            })
+        })?;
+        crate::timing_event("build_microvm.restore_from.done");
+    }
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
@@ -1145,15 +1267,35 @@ pub fn build_microvm(
     event_manager
         .add_subscriber(vmm.clone())
         .map_err(StartMicrovmError::RegisterEvent)?;
+    crate::timing_event("build_microvm.event_manager.subscribed");
 
     Ok(vmm)
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+trait Tap: Sized {
+    fn tap(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<T> Tap for T {}
 
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
     external_kernel: &ExternalKernel,
-) -> std::result::Result<(GuestAddress, Option<InitrdConfig>, Option<String>), StartMicrovmError> {
+) -> std::result::Result<
+    (
+        GuestAddress,
+        Option<InitrdConfig>,
+        Option<String>,
+        Vec<(u64, u64)>,
+    ),
+    StartMicrovmError,
+> {
+    let mut written_ranges = Vec::new();
     let entry_addr = match external_kernel.format {
         // Raw images are treated as bundled kernels on x86_64
         #[cfg(target_arch = "x86_64")]
@@ -1163,6 +1305,7 @@ fn load_external_kernel(
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::RawOpenKernel)?;
             guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
+            record_memory_write(&mut written_ranges, 0x8000_0000, data.len());
             GuestAddress(0x8000_0000)
         }
         #[cfg(target_arch = "x86_64")]
@@ -1193,6 +1336,7 @@ fn load_external_kernel(
                 guest_mem
                     .write(&kernel_data, GuestAddress(0x8000_0000))
                     .unwrap();
+                record_memory_write(&mut written_ranges, 0x8000_0000, kernel_data.len());
                 GuestAddress(0x8000_0000)
             } else {
                 return Err(StartMicrovmError::PeGzInvalid);
@@ -1284,6 +1428,7 @@ fn load_external_kernel(
         guest_mem
             .write(&data, GuestAddress(arch_mem_info.initrd_addr))
             .unwrap();
+        record_memory_write(&mut written_ranges, arch_mem_info.initrd_addr, data.len());
         Some(InitrdConfig {
             address: GuestAddress(arch_mem_info.initrd_addr),
             size: data.len(),
@@ -1292,7 +1437,12 @@ fn load_external_kernel(
         None
     };
 
-    Ok((entry_addr, initrd_config, external_kernel.cmdline.clone()))
+    Ok((
+        entry_addr,
+        initrd_config,
+        external_kernel.cmdline.clone(),
+        written_ranges,
+    ))
 }
 
 fn load_payload(
@@ -1306,12 +1456,14 @@ fn load_payload(
         GuestAddress,
         Option<InitrdConfig>,
         Option<String>,
+        Vec<(u64, u64)>,
     ),
     StartMicrovmError,
 > {
     match payload {
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         Payload::KernelCopy => {
+            let mut written_ranges = Vec::new();
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
                     (
@@ -1335,7 +1487,14 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
-            Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
+            record_memory_write(&mut written_ranges, kernel_guest_addr, kernel_size);
+            Ok((
+                guest_mem,
+                GuestAddress(kernel_entry_addr),
+                None,
+                None,
+                written_ranges,
+            ))
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
         Payload::KernelMmap => {
@@ -1437,17 +1596,25 @@ fn load_payload(
                 GuestAddress(kernel_entry_addr),
                 None,
                 None,
+                Vec::new(),
             ))
         }
         Payload::ExternalKernel(external_kernel) => {
-            let (entry_addr, initrd_config, cmdline) =
+            let (entry_addr, initrd_config, cmdline, written_ranges) =
                 load_external_kernel(&guest_mem, _arch_mem_info, external_kernel)?;
-            Ok((guest_mem, entry_addr, initrd_config, cmdline))
+            Ok((
+                guest_mem,
+                entry_addr,
+                initrd_config,
+                cmdline,
+                written_ranges,
+            ))
         }
         #[cfg(test)]
-        Payload::Empty => Ok((guest_mem, GuestAddress(0), None, None)),
+        Payload::Empty => Ok((guest_mem, GuestAddress(0), None, None, Vec::new())),
         #[cfg(feature = "tee")]
         Payload::Tee => {
+            let mut written_ranges = Vec::new();
             let (kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
                     (
@@ -1463,6 +1630,7 @@ fn load_payload(
             guest_mem
                 .write(kernel_data, GuestAddress(kernel_guest_addr))
                 .unwrap();
+            record_memory_write(&mut written_ranges, kernel_guest_addr, kernel_size);
 
             let (qboot_host_addr, qboot_size) =
                 if let Some(qboot_bundle) = &_vm_resources.qboot_bundle {
@@ -1475,6 +1643,7 @@ fn load_payload(
             guest_mem
                 .write(qboot_data, GuestAddress(arch::FIRMWARE_START))
                 .unwrap();
+            record_memory_write(&mut written_ranges, arch::FIRMWARE_START, qboot_size);
 
             let (initrd_host_addr, initrd_size) =
                 if let Some(initrd_bundle) = &_vm_resources.initrd_bundle {
@@ -1487,6 +1656,7 @@ fn load_payload(
             guest_mem
                 .write(initrd_data, GuestAddress(_arch_mem_info.initrd_addr))
                 .unwrap();
+            record_memory_write(&mut written_ranges, _arch_mem_info.initrd_addr, initrd_size);
 
             let initrd_config = InitrdConfig {
                 address: GuestAddress(_arch_mem_info.initrd_addr),
@@ -1498,9 +1668,22 @@ fn load_payload(
                 GuestAddress(arch::RESET_VECTOR),
                 Some(initrd_config),
                 None,
+                written_ranges,
             ))
         }
-        Payload::Firmware => Ok((guest_mem, GuestAddress(arch::RESET_VECTOR), None, None)),
+        Payload::Firmware => Ok((
+            guest_mem,
+            GuestAddress(arch::RESET_VECTOR),
+            None,
+            None,
+            Vec::new(),
+        )),
+    }
+}
+
+fn record_memory_write(written_ranges: &mut Vec<(u64, u64)>, guest_addr: u64, size: usize) {
+    if size != 0 {
+        written_ranges.push((guest_addr, size as u64));
     }
 }
 
@@ -1508,6 +1691,8 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+    written_ranges: Vec<(u64, u64)>,
+    ram_ranges: Vec<(u64, u64)>,
 }
 
 pub fn create_guest_memory(
@@ -1515,7 +1700,13 @@ pub fn create_guest_memory(
     vm_resources: &VmResources,
     payload: &Payload,
 ) -> std::result::Result<
-    (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+    (
+        GuestMemoryMmap,
+        ArchMemoryInfo,
+        ShmManager,
+        PayloadConfig,
+        Vec<PmemRegionConfig>,
+    ),
     StartMicrovmError,
 > {
     let mem_size = mem_size << 20;
@@ -1595,7 +1786,12 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = if use_vhost_user {
+    let ram_ranges = arch_mem_regions
+        .iter()
+        .map(|(addr, size)| (addr.raw_value(), *size as u64))
+        .collect::<Vec<_>>();
+
+    let mut guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
         {
             debug!(
@@ -1652,7 +1848,14 @@ pub fn create_guest_memory(
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
-    let (guest_mem, entry_addr, initrd_config, cmdline) =
+    let (pmem_mappings, pmem_regions) = build_pmem_regions_for_guest(vm_resources, &arch_mem_info)?;
+    for region in pmem_mappings {
+        guest_mem = guest_mem
+            .insert_region(Arc::new(region))
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+    }
+
+    let (guest_mem, entry_addr, initrd_config, cmdline, mut written_ranges) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
     // Only write firmware if data exists AND this isn't an ExternalKernel payload
@@ -1662,6 +1865,11 @@ pub fn create_guest_memory(
             guest_mem
                 .write(firmware_data, GuestAddress(arch_mem_info.firmware_addr))
                 .map_err(StartMicrovmError::FirmwareInvalidAddress)?;
+            record_memory_write(
+                &mut written_ranges,
+                arch_mem_info.firmware_addr,
+                firmware_data.len(),
+            );
         }
     }
 
@@ -1669,9 +1877,32 @@ pub fn create_guest_memory(
         entry_addr,
         initrd_config,
         kernel_cmdline: cmdline.clone(),
+        written_ranges,
+        ram_ranges,
     };
 
-    Ok((guest_mem, arch_mem_info, shm_manager, payload_config))
+    Ok((
+        guest_mem,
+        arch_mem_info,
+        shm_manager,
+        payload_config,
+        pmem_regions,
+    ))
+}
+
+fn build_pmem_regions_for_guest(
+    vm_resources: &VmResources,
+    arch_mem_info: &ArchMemoryInfo,
+) -> std::result::Result<
+    (Vec<vm_memory::mmap::GuestRegionMmap>, Vec<PmemRegionConfig>),
+    StartMicrovmError,
+> {
+    build_pmem_regions(
+        vm_resources.pmem.list(),
+        arch_mem_info.shm_start_addr,
+        arch_mem_info.page_size,
+    )
+    .map_err(StartMicrovmError::GuestMemoryMmap)
 }
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -2336,7 +2567,10 @@ fn attach_unixsock_vsock_device(
     Ok(())
 }
 
-#[cfg(not(feature = "tee"))]
+#[cfg(all(
+    not(feature = "tee"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2371,6 +2605,34 @@ fn attach_block_devices(
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_mmio_device(vmm, id, intc.clone(), block.clone()).map_err(RegisterBlockDevice)?;
+    }
+
+    Ok(())
+}
+
+fn attach_pmem_devices(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    pmem_regions: &[PmemRegionConfig],
+    intc: IrqChip,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    for region in pmem_regions {
+        let pmem = Arc::new(Mutex::new(
+            devices::virtio::Pmem::new(
+                region.id.clone(),
+                std::path::Path::new(&region.path),
+                region.guest_addr,
+                region.size,
+            )
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pmem: {e}")))?,
+        ));
+        event_manager
+            .add_subscriber(pmem.clone())
+            .map_err(RegisterEvent)?;
+        let id = String::from(pmem.lock().unwrap().id());
+        attach_mmio_device(vmm, id, intc.clone(), pmem).map_err(RegisterBlockDevice)?;
     }
 
     Ok(())

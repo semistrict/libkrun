@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
-use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Address, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::PortInput;
@@ -18,14 +18,14 @@ pub(crate) fn process_rx(
     port_id: u32,
     stopfd: utils::eventfd::EventFd,
     stop: Arc<AtomicBool>,
-) {
+) -> Queue {
     let mem = &mem;
     let mut eof = false;
 
     let mut input = input.lock().unwrap();
     loop {
         let Some(head) = pop_head_blocking(&mut queue, mem, &interrupt, &stop) else {
-            return;
+            return queue;
         };
 
         let head_index = head.index;
@@ -56,7 +56,7 @@ pub(crate) fn process_rx(
             interrupt.signal_used_queue();
             log::trace!("signaling EOF on port {port_id}");
             control.port_open(port_id, false);
-            return;
+            return queue;
         } else if bytes_read == 0 {
             queue.undo_pop();
             interrupt.signal_used_queue();
@@ -64,7 +64,7 @@ pub(crate) fn process_rx(
         }
 
         if stop.load(Ordering::Acquire) {
-            return;
+            return queue;
         }
     }
 }
@@ -101,6 +101,10 @@ fn read_to_desc(
     desc.mem
         .try_access(desc.len as usize, desc.addr, |_, len, addr, region| {
             let mut target = region.get_slice(addr, len).unwrap();
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let _ = hvf::mark_dirty_ranges(&[(desc.addr.raw_value(), len as u64)]);
+            }
             match input.read_volatile(&mut target) {
                 Ok(n) => {
                     if n == 0 {

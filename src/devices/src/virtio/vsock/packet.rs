@@ -189,7 +189,9 @@ pub struct TsiReleaseReq {
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
 pub struct VsockPacket {
     hdr: *mut u8,
+    hdr_addr: GuestAddress,
     buf: Option<*mut u8>,
+    buf_addr: Option<GuestAddress>,
     buf_size: usize,
     owned_buf: Option<Vec<u8>>,
 }
@@ -223,7 +225,9 @@ impl VsockPacket {
         let mut pkt = Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
+            hdr_addr: head.addr,
             buf: None,
+            buf_addr: None,
             buf_size: 0,
             owned_buf: None,
         };
@@ -252,6 +256,7 @@ impl VsockPacket {
                 .checked_add(VSOCK_PKT_HDR_SIZE as u64)
                 .ok_or(VsockError::GuestMemoryBounds)?;
             pkt.buf_size = head_data_size;
+            pkt.buf_addr = Some(buf_addr);
             pkt.buf = Some(
                 get_host_address(head.mem, buf_addr, pkt.buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
@@ -273,6 +278,7 @@ impl VsockPacket {
                 return Err(VsockError::BufDescTooSmall);
             }
             pkt.buf_size = buf_desc.len as usize;
+            pkt.buf_addr = Some(buf_desc.addr);
             pkt.buf = Some(
                 get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
@@ -349,7 +355,9 @@ impl VsockPacket {
         let mut pkt = Self {
             hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
+            hdr_addr: head.addr,
             buf: None,
+            buf_addr: None,
             buf_size: 0,
             owned_buf: None,
         };
@@ -363,6 +371,7 @@ impl VsockPacket {
                 .ok_or(VsockError::GuestMemoryBounds)?;
 
             pkt.buf_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
+            pkt.buf_addr = Some(buf_addr);
             pkt.buf = Some(
                 get_host_address(head.mem, buf_addr, pkt.buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
@@ -371,6 +380,7 @@ impl VsockPacket {
             let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
 
             pkt.buf_size = buf_desc.len as usize;
+            pkt.buf_addr = Some(buf_desc.addr);
             pkt.buf = Some(
                 get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
@@ -378,6 +388,23 @@ impl VsockPacket {
         }
 
         Ok(pkt)
+    }
+
+    fn mark_hdr_dirty(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let _ =
+                hvf::mark_dirty_ranges(&[(self.hdr_addr.raw_value(), VSOCK_PKT_HDR_SIZE as u64)]);
+        }
+    }
+
+    fn mark_buf_dirty(&self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(addr) = self.buf_addr {
+                let _ = hvf::mark_dirty_ranges(&[(addr.raw_value(), self.buf_size as u64)]);
+            }
+        }
     }
 
     /// Provides in-place, byte-slice, access to the vsock packet header.
@@ -389,6 +416,7 @@ impl VsockPacket {
 
     /// Provides in-place, byte-slice, mutable access to the vsock packet header.
     pub fn hdr_mut(&mut self) -> &mut [u8] {
+        self.mark_hdr_dirty();
         // This is safe since bound checks have already been performed when creating the packet
         // from the virtq descriptor.
         unsafe { std::slice::from_raw_parts_mut(self.hdr, VSOCK_PKT_HDR_SIZE) }
@@ -421,6 +449,7 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
+        self.mark_buf_dirty();
         if let Some(ref mut owned) = self.owned_buf {
             Some(owned.as_mut_slice())
         } else {

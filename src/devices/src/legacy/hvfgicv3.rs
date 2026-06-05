@@ -1,20 +1,35 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::c_void;
 use std::io;
 use std::sync::LazyLock;
 
 use crate::bus::BusDevice;
 use crate::legacy::gic::GICDevice;
 use crate::legacy::irqchip::IrqChipT;
+use crate::legacy::VcpuList;
 use crate::Error as DeviceError;
 
-use hvf::bindings::{hv_gic_config_t, hv_ipa_t, hv_return_t, HV_SUCCESS};
+use hvf::bindings::{hv_gic_config_t, hv_gic_state_t, hv_ipa_t, hv_return_t, HV_SUCCESS};
 use hvf::Error;
+use std::sync::Arc;
 use utils::eventfd::EventFd;
 
 // Device trees specific constants
 const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
+
+extern "C" {
+    fn os_release(object: *const c_void);
+}
+
+struct HvfGicStateObject(hv_gic_state_t);
+
+impl Drop for HvfGicStateObject {
+    fn drop(&mut self) {
+        unsafe { os_release(self.0.cast::<c_void>()) };
+    }
+}
 
 pub struct HvfGicBindings {
     hv_gic_create:
@@ -29,6 +44,17 @@ pub struct HvfGicBindings {
     hv_gic_get_redistributor_size:
         libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
     hv_gic_set_spi: libloading::Symbol<'static, unsafe extern "C" fn(u32, bool) -> hv_return_t>,
+    hv_gic_state_create: libloading::Symbol<'static, unsafe extern "C" fn() -> hv_gic_state_t>,
+    hv_gic_state_get_size: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_gic_state_t, *mut usize) -> hv_return_t,
+    >,
+    hv_gic_state_get_data: libloading::Symbol<
+        'static,
+        unsafe extern "C" fn(hv_gic_state_t, *mut c_void) -> hv_return_t,
+    >,
+    hv_gic_set_state:
+        libloading::Symbol<'static, unsafe extern "C" fn(*const c_void, usize) -> hv_return_t>,
 }
 
 pub struct HvfGicV3 {
@@ -39,6 +65,8 @@ pub struct HvfGicV3 {
 
     /// Number of CPUs handled by the device
     vcpu_count: u64,
+
+    vcpu_list: Arc<VcpuList>,
 }
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -49,7 +77,7 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfGicV3 {
-    pub fn new(vcpu_count: u64) -> Result<Self, Error> {
+    pub fn new(vcpu_count: u64, vcpu_list: Arc<VcpuList>) -> Result<Self, Error> {
         let bindings = unsafe {
             HvfGicBindings {
                 hv_gic_create: HVF.get(b"hv_gic_create").map_err(Error::FindSymbol)?,
@@ -69,6 +97,14 @@ impl HvfGicV3 {
                     .get(b"hv_gic_get_redistributor_size")
                     .map_err(Error::FindSymbol)?,
                 hv_gic_set_spi: HVF.get(b"hv_gic_set_spi").map_err(Error::FindSymbol)?,
+                hv_gic_state_create: HVF.get(b"hv_gic_state_create").map_err(Error::FindSymbol)?,
+                hv_gic_state_get_size: HVF
+                    .get(b"hv_gic_state_get_size")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_state_get_data: HVF
+                    .get(b"hv_gic_state_get_data")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_set_state: HVF.get(b"hv_gic_set_state").map_err(Error::FindSymbol)?,
             }
         };
 
@@ -114,7 +150,49 @@ impl HvfGicV3 {
             bindings,
             properties: [dist_addr, dist_size, redists_addr, redists_size],
             vcpu_count,
+            vcpu_list,
         })
+    }
+
+    fn hvf_snapshot_state(&self) -> Result<Vec<u8>, DeviceError> {
+        let state = unsafe { (self.bindings.hv_gic_state_create)() };
+        if state.is_null() {
+            return Err(DeviceError::FailedSignalingUsedQueue(io::Error::other(
+                "HVF returned null GIC state",
+            )));
+        }
+        let state = HvfGicStateObject(state);
+
+        let mut size = 0usize;
+        let ret = unsafe { (self.bindings.hv_gic_state_get_size)(state.0, &mut size) };
+        if ret != HV_SUCCESS {
+            return Err(DeviceError::FailedSignalingUsedQueue(io::Error::other(
+                "HVF returned error when sizing GIC state",
+            )));
+        }
+
+        let mut data = vec![0u8; size];
+        let ret = unsafe {
+            (self.bindings.hv_gic_state_get_data)(state.0, data.as_mut_ptr().cast::<c_void>())
+        };
+        if ret != HV_SUCCESS {
+            return Err(DeviceError::FailedSignalingUsedQueue(io::Error::other(
+                "HVF returned error when reading GIC state",
+            )));
+        }
+
+        Ok(data)
+    }
+
+    fn hvf_restore_state(&self, data: &[u8]) -> Result<(), DeviceError> {
+        let ret =
+            unsafe { (self.bindings.hv_gic_set_state)(data.as_ptr().cast::<c_void>(), data.len()) };
+        if ret != HV_SUCCESS {
+            return Err(DeviceError::FailedSignalingUsedQueue(io::Error::other(
+                "HVF returned error when restoring GIC state",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -139,6 +217,7 @@ impl IrqChipT for HvfGicV3 {
                     std::io::Error::other("HVF returned error when setting SPI"),
                 ))
             } else {
+                self.vcpu_list.wake_all();
                 Ok(())
             }
         } else {
@@ -147,6 +226,32 @@ impl IrqChipT for HvfGicV3 {
                 "IRQ not line configured",
             )))
         }
+    }
+
+    fn clear_irq(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        if let Some(irq_line) = irq_line {
+            let ret = unsafe { (self.bindings.hv_gic_set_spi)(irq_line, false) };
+            if ret != HV_SUCCESS {
+                Err(DeviceError::FailedSignalingUsedQueue(
+                    std::io::Error::other("HVF returned error when clearing SPI"),
+                ))
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IRQ not line configured",
+            )))
+        }
+    }
+
+    fn snapshot_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.hvf_snapshot_state().map(Some)
+    }
+
+    fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.hvf_restore_state(data)
     }
 }
 

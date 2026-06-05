@@ -5,6 +5,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::muxer::MuxerRx;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::tsi_stream::StreamListenerSnapshot;
 use nix::sys::socket::AddressFamily;
 use utils::epoll::EventSet;
 
@@ -92,6 +93,9 @@ pub trait Proxy: Send + AsRawFd {
     fn process_op_response(&mut self, pkt: &VsockPacket) -> ProxyUpdate;
     fn enqueue_accept(&mut self) {}
     fn push_accept_rsp(&self, _result: i32) {}
+    fn stream_listener_snapshot(&self) -> Option<StreamListenerSnapshot> {
+        None
+    }
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;

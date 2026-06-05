@@ -1,4 +1,5 @@
 use crossbeam_channel::Sender;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -31,21 +32,19 @@ impl PerCPUInterruptControllerState {
             "[GICv3] SET_IRQ_COMMON vcpuid={}, irq_line={}",
             self.vcpuid, irq
         );
-        self.pending_irqs.push_back(irq);
-
-        match self.status {
-            VcpuStatus::Waiting => {
-                self.wfe_sender
-                    .as_mut()
-                    .unwrap()
-                    .send(self.vcpuid as u32)
-                    .unwrap();
-                self.status = VcpuStatus::Running;
-            }
-            VcpuStatus::Running => {
-                vcpu_request_exit(self.vcpuid).unwrap();
-            }
+        if self.pending_irqs.contains(&irq) {
+            return;
         }
+        self.pending_irqs.push_back(irq);
+        self.wake();
+    }
+
+    fn wake(&mut self) {
+        if let Some(sender) = self.wfe_sender.as_mut() {
+            let _ = sender.send(self.vcpuid as u32);
+        }
+        self.status = VcpuStatus::Running;
+        vcpu_request_exit(self.vcpuid).unwrap();
     }
 
     fn should_wait(&mut self) -> bool {
@@ -106,10 +105,56 @@ impl VcpuList {
             .set_irq_common(irq);
     }
 
+    pub fn wake_vcpu(&self, vcpuid: u64) {
+        assert!(vcpuid < self.cpu_count);
+        self.vcpus[vcpuid as usize].lock().unwrap().wake();
+    }
+
+    pub fn wake_all(&self) {
+        for vcpuid in 0..self.cpu_count {
+            self.wake_vcpu(vcpuid);
+        }
+    }
+
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
     }
+
+    /// Snapshot per-vCPU pending IRQ queues. Status/wfe_sender are runtime-only.
+    pub fn to_state(&self) -> VcpuListState {
+        let mut per_vcpu = Vec::with_capacity(self.cpu_count as usize);
+        for v in &self.vcpus {
+            let v = v.lock().unwrap();
+            per_vcpu.push(PerVcpuGicState {
+                pending_irqs: v.pending_irqs.iter().copied().collect(),
+            });
+        }
+        VcpuListState { per_vcpu }
+    }
+
+    pub fn restore_state(&self, st: &VcpuListState) {
+        assert_eq!(st.per_vcpu.len(), self.cpu_count as usize);
+        for (i, s) in st.per_vcpu.iter().enumerate() {
+            let mut v = self.vcpus[i].lock().unwrap();
+            v.pending_irqs = s
+                .pending_irqs
+                .iter()
+                .copied()
+                .filter(|irq| *irq != VTIMER_IRQ)
+                .collect();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PerVcpuGicState {
+    pub pending_irqs: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VcpuListState {
+    pub per_vcpu: Vec<PerVcpuGicState>,
 }
 
 impl Vcpus for VcpuList {
@@ -150,12 +195,13 @@ impl Vcpus for VcpuList {
         }
 
         match reg {
-            SYSREG_ICC_IAR1_EL1 => Some(
-                self.vcpus[vcpuid as usize]
+            SYSREG_ICC_IAR1_EL1 => {
+                let irq = self.vcpus[vcpuid as usize]
                     .lock()
                     .unwrap()
-                    .get_pending_irq() as u64,
-            ),
+                    .get_pending_irq();
+                Some(irq as u64)
+            }
             SYSREG_ICC_PMR_EL1 => Some(0),
             SYSREG_ICC_CTLR_EL1 => Some(
                 (1 << ICC_CTLR_EL1_RSS_SHIFT)

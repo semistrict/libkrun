@@ -16,17 +16,78 @@ use vm_memory::GuestMemoryMmap;
 use super::super::{FsError, Queue};
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+#[cfg(target_os = "macos")]
+use super::passthrough::PassthroughFsSnapshot;
 use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
-enum FsServer {
+pub(crate) enum FsServer {
     ReadWrite(Server<PassthroughFs>),
     ReadOnly(Server<PassthroughFsRo>),
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FsServerSnapshot {
+    ReadWrite {
+        options_bits: u64,
+        passthrough: PassthroughFsSnapshot,
+    },
+    ReadOnly {
+        options_bits: u64,
+        passthrough: PassthroughFsSnapshot,
+    },
+}
+
 impl FsServer {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn snapshot_state(&self) -> io::Result<FsServerSnapshot> {
+        match self {
+            FsServer::ReadWrite(s) => Ok(FsServerSnapshot::ReadWrite {
+                options_bits: s.options_bits(),
+                passthrough: s.fs().snapshot_state()?,
+            }),
+            FsServer::ReadOnly(s) => Ok(FsServerSnapshot::ReadOnly {
+                options_bits: s.options_bits(),
+                passthrough: s.fs().snapshot_state()?,
+            }),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restore_state(&self, snap: &FsServerSnapshot) -> io::Result<()> {
+        match (self, snap) {
+            (
+                FsServer::ReadWrite(s),
+                FsServerSnapshot::ReadWrite {
+                    options_bits,
+                    passthrough,
+                },
+            ) => {
+                s.fs().restore_state(passthrough)?;
+                s.restore_options_bits(*options_bits);
+                Ok(())
+            }
+            (
+                FsServer::ReadOnly(s),
+                FsServerSnapshot::ReadOnly {
+                    options_bits,
+                    passthrough,
+                },
+            ) => {
+                s.fs().restore_state(passthrough)?;
+                s.restore_options_bits(*options_bits);
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "virtio-fs server mode mismatch",
+            )),
+        }
+    }
+
     fn handle_message(
         &self,
         r: Reader,
@@ -69,6 +130,12 @@ pub struct FsWorker {
     map_sender: Option<Sender<WorkerMessage>>,
 }
 
+pub struct FsWorkerStopResult {
+    pub queues: Vec<Queue>,
+    pub queue_evts: Vec<Arc<EventFd>>,
+    pub server: FsServer,
+}
+
 impl FsWorker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -102,14 +169,40 @@ impl FsWorker {
         })
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        queues: Vec<Queue>,
+        queue_evts: Vec<Arc<EventFd>>,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        shm_region: Option<VirtioShmRegion>,
+        server: FsServer,
+        stop_fd: EventFd,
+        exit_code: Arc<AtomicI32>,
+        #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+    ) -> Self {
+        Self {
+            queues,
+            queue_evts,
+            interrupt,
+            mem,
+            shm_region,
+            server,
+            stop_fd,
+            exit_code,
+            #[cfg(target_os = "macos")]
+            map_sender,
+        }
+    }
+
+    pub fn run(self) -> thread::JoinHandle<FsWorkerStopResult> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> FsWorkerStopResult {
         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
@@ -149,7 +242,11 @@ impl FsWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return FsWorkerStopResult {
+                                    queues: self.queues,
+                                    queue_evts: self.queue_evts,
+                                    server: self.server,
+                                };
                             }
                             _ => {
                                 log::warn!(

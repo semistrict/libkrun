@@ -359,6 +359,10 @@ impl<'a> Writer<'a> {
                     .addr
                     .checked_sub(region.start_addr().raw_value())
                     .unwrap();
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let _ = hvf::mark_dirty_ranges(&[(desc.addr.raw_value(), desc.len as u64)]);
+                }
                 region
                     .deref()
                     .get_slice(offset.raw_value() as usize, desc.len as usize)

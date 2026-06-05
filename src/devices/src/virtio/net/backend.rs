@@ -13,6 +13,8 @@ pub enum ConnectError {
     TunSetIff(io::Error),
     TunSetVnetHdrSz(io::Error),
     TunSetOffload(io::Error),
+    /// Generic I/O error from worker plumbing.
+    Io(io::Error),
 }
 
 #[allow(dead_code)]

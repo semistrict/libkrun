@@ -16,7 +16,15 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+
+/// Queue cursors + backend handed back to the device when the worker stops.
+pub struct NetWorkerStopResult {
+    pub rx_q: DeviceQueue,
+    pub tx_q: DeviceQueue,
+    pub backend: Box<dyn NetBackend + Send>,
+}
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -25,6 +33,7 @@ pub struct NetWorker {
 
     mem: GuestMemoryMmap,
     backend: Box<dyn NetBackend + Send>,
+    stop_fd: EventFd,
 
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
@@ -70,6 +79,18 @@ impl NetWorker {
             }
         };
 
+        Self::from_parts(rx_q, tx_q, interrupt, mem, backend)
+    }
+
+    /// Construct a worker from an existing backend handle. Used on resume.
+    pub fn from_parts(
+        rx_q: DeviceQueue,
+        tx_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        backend: Box<dyn NetBackend + Send>,
+    ) -> Result<Self, ConnectError> {
+        let stop_fd = EventFd::new(EFD_NONBLOCK).map_err(ConnectError::Io)?;
         Ok(Self {
             rx_q,
             tx_q,
@@ -77,6 +98,7 @@ impl NetWorker {
             mem,
             backend,
             interrupt,
+            stop_fd,
 
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
@@ -89,19 +111,24 @@ impl NetWorker {
         })
     }
 
-    pub fn run(self) {
+    pub fn stop_fd(&self) -> &EventFd {
+        &self.stop_fd
+    }
+
+    pub fn run(self) -> thread::JoinHandle<NetWorkerStopResult> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> NetWorkerStopResult {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
+        let stop_ev_fd = self.stop_fd.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
 
         let mut epoll = Epoll::new().unwrap();
@@ -118,6 +145,11 @@ impl NetWorker {
         );
         let _ = epoll.ctl(
             ControlOperation::Add,
+            stop_ev_fd,
+            &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
+        );
+        let _ = epoll.ctl(
+            ControlOperation::Add,
             backend_socket,
             &EpollEvent::new(
                 EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
@@ -126,13 +158,21 @@ impl NetWorker {
         );
 
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
+        let mut stopping = false;
         loop {
+            if stopping {
+                break;
+            }
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_ev_fd => {
+                                let _ = self.stop_fd.read();
+                                stopping = true;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
@@ -181,6 +221,11 @@ impl NetWorker {
                     debug!("vsock: failed to consume muxer epoll event: {e}");
                 }
             }
+        }
+        NetWorkerStopResult {
+            rx_q: self.rx_q,
+            tx_q: self.tx_q,
+            backend: self.backend,
         }
     }
 
@@ -420,6 +465,10 @@ impl NetWorker {
             }
 
             let len = std::cmp::min(frame_slice.len(), descriptor.len as usize);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let _ = hvf::mark_dirty_ranges(&[(descriptor.addr.raw_value(), len as u64)]);
+            }
             match self.mem.write_slice(&frame_slice[..len], descriptor.addr) {
                 Ok(()) => {
                     frame_slice = &frame_slice[len..];

@@ -80,14 +80,17 @@ impl BlockWorker {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    /// Spawn the worker thread. On clean stop (via `stop_fd`) the thread
+    /// returns its `DeviceQueue` and `DiskProperties` so the device can
+    /// snapshot/restart without re-opening the backing file.
+    pub fn run(self) -> thread::JoinHandle<(DeviceQueue, DiskProperties)> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> (DeviceQueue, DiskProperties) {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
@@ -119,7 +122,7 @@ impl BlockWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return (self.device_queue, self.disk);
                             }
                             _ => {
                                 log::warn!(

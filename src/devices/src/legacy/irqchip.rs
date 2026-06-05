@@ -35,6 +35,20 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    pub fn clear_irq(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        self.inner.clear_irq(irq_line)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.inner.snapshot_state()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_snapshot_state(data)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -121,6 +135,10 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: Option<u32>) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -132,6 +150,20 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: Option<u32>) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn snapshot_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        Ok(None)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn restore_snapshot_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -143,6 +175,10 @@ pub trait IrqChipT: BusDevice + AIADevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: Option<u32>) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "test_utils"))]

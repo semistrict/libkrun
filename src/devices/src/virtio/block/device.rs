@@ -31,7 +31,10 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::worker::BlockWorker;
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
+    super::{
+        ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState, QueueConfig,
+        VirtioDevice, TYPE_BLOCK,
+    },
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
@@ -39,6 +42,8 @@ use crate::virtio::{
     block::{ImageType, SyncMode},
     ActivateError, InterruptTransport,
 };
+
+use serde::{Deserialize, Serialize};
 
 /// Configuration options for disk caching.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -207,8 +212,11 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<(DeviceQueue, DiskProperties)>>,
     worker_stopfd: EventFd,
+    /// When paused, holds the queue + disk handed back by the worker so we can
+    /// either snapshot the queue cursors or resume by re-spawning the worker.
+    paused: Option<(DeviceQueue, DiskProperties)>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -327,6 +335,7 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            paused: None,
         })
     }
 
@@ -438,7 +447,103 @@ impl VirtioDevice for Block {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.paused = None;
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        if self.paused.is_some() {
+            return Ok(());
+        }
+        let worker = match self.worker_thread.take() {
+            Some(w) => w,
+            // Inactive: nothing to drain.
+            None => return Ok(()),
+        };
+        let _ = self.worker_stopfd.write(1);
+        let (dq, disk) = worker
+            .join()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("block worker join: {e:?}")))?;
+        self.paused = Some((dq, disk));
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        let (dq, disk) = match self.paused.take() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(m, i) => (m.clone(), i.clone()),
+            DeviceState::Inactive => {
+                return Err(DeviceSnapshotError::Invalid(
+                    "block resume on inactive device".into(),
+                ))
+            }
+        };
+        let worker = BlockWorker::new(
+            dq,
+            interrupt,
+            mem,
+            disk,
+            self.worker_stopfd
+                .try_clone()
+                .map_err(|e| DeviceSnapshotError::Invalid(format!("dup worker_stopfd: {e}")))?,
+        );
+        self.worker_thread = Some(worker.run());
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let (dq, _disk) = self
+            .paused
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("block serialize before pause".into()))?;
+        let queues = vec![dq.queue.to_state()];
+        let body = BlockSnapshotBody {
+            acked_features: self.acked_features,
+            disk_image_id: self.disk_image_id.clone(),
+            capacity_sectors: self.config.capacity,
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        let (dq, _disk) = self
+            .paused
+            .as_mut()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("block restore before pause".into()))?;
+        if snap.queues.len() != 1 {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "block: expected 1 queue, got {}",
+                snap.queues.len()
+            )));
+        }
+        let body: BlockSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        if body.capacity_sectors != self.config.capacity {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "block capacity mismatch: snapshot={} current={}",
+                { body.capacity_sectors },
+                { self.config.capacity }
+            )));
+        }
+        // Snapshot users may restore memory together with a point-in-time copy
+        // of the backing disk. That can change the host path/device identity
+        // while preserving the guest-visible block geometry checked above.
+        self.acked_features = body.acked_features;
+        dq.queue.restore_state(&snap.queues[0]);
+        Ok(())
+    }
+}
+
+/// Device-specific snapshot payload for virtio-block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BlockSnapshotBody {
+    acked_features: u64,
+    disk_image_id: Vec<u8>,
+    capacity_sectors: u64,
 }

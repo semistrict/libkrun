@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use utils::eventfd::EventFd;
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::defs;
 use super::defs::uapi;
@@ -60,14 +60,7 @@ impl Pmem {
         &self.id
     }
 
-    fn flush(&self, mem: &GuestMemoryMmap) -> io::Result<()> {
-        let host_addr = mem
-            .get_host_address(GuestAddress(self.guest_addr))
-            .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        let ret = unsafe { libc::msync(host_addr.cast(), self.size as usize, libc::MS_SYNC) };
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
+    fn flush(&self) -> io::Result<()> {
         self.file.sync_all()
     }
 
@@ -105,7 +98,7 @@ impl Pmem {
             }
 
             let ret = if req_type == Some(uapi::VIRTIO_PMEM_REQ_TYPE_FLUSH) {
-                match self.flush(mem) {
+                match self.flush() {
                     Ok(()) => 0u32,
                     Err(e) => {
                         error!("pmem: flush failed: {e}");

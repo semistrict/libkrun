@@ -134,9 +134,11 @@ const EC_AA64_BKPT: u64 = 0x3c;
 pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
+    GetIpaSize,
     MemoryMap,
     MemoryUnmap,
     NestedCheck,
+    SetIpaSize(u32),
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -157,12 +159,14 @@ impl Display for Error {
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            GetIpaSize => write!(f, "Error getting maximum HVF IPA size"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
             ),
+            SetIpaSize(ipa_size) => write!(f, "Error setting HVF IPA size to {ipa_size} bits"),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -270,6 +274,15 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 impl HvfVm {
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
+        let mut max_ipa_size = 0;
+        let ret = unsafe { hv_vm_config_get_max_ipa_size(&mut max_ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GetIpaSize);
+        }
+        let ret = unsafe { hv_vm_config_set_ipa_size(config, max_ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::SetIpaSize(max_ipa_size));
+        }
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
                 'static,
@@ -649,7 +662,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
-
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)

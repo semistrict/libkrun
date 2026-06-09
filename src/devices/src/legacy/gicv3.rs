@@ -2,6 +2,8 @@ use std::convert::TryInto;
 use std::io;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::VcpuList;
@@ -89,6 +91,14 @@ const GICV3_PIDR0_REDIST: u8 = 0x93;
 const GICV3_BASE_SIZE: u64 = 0x0001_0000;
 const GICV3_MAINT_IRQ: u32 = 8;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GicV3State {
+    pub gicd_ctlr: u32,
+    pub edge_trigger: Vec<u32>,
+    pub gicr_waker: u32,
+    pub gicd_irouter: Vec<u64>,
+}
+
 #[derive(Clone)]
 pub struct GicV3 {
     dist_addr: u64,
@@ -129,6 +139,29 @@ impl GicV3 {
 
     pub const fn get_redist_size(&self) -> u64 {
         self.redist_size
+    }
+
+    /// Capture the mutable distributor/redistributor state. Static
+    /// configuration (addresses, revision, vcpu_list) is reconstructed by the
+    /// caller before invoking `restore_state`.
+    pub fn to_state(&self) -> GicV3State {
+        GicV3State {
+            gicd_ctlr: self.gicd_ctlr,
+            edge_trigger: self.edge_trigger.to_vec(),
+            gicr_waker: self.gicr_waker,
+            gicd_irouter: self.gicd_irouter.to_vec(),
+        }
+    }
+
+    pub fn restore_state(&mut self, st: &GicV3State) {
+        self.gicd_ctlr = st.gicd_ctlr;
+        if st.edge_trigger.len() == self.edge_trigger.len() {
+            self.edge_trigger.copy_from_slice(&st.edge_trigger);
+        }
+        self.gicr_waker = st.gicr_waker;
+        if st.gicd_irouter.len() == self.gicd_irouter.len() {
+            self.gicd_irouter.copy_from_slice(&st.gicd_irouter);
+        }
     }
 
     pub fn new(vcpu_list: Arc<VcpuList>) -> Self {

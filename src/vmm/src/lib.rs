@@ -38,8 +38,12 @@ use macos::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -63,7 +67,7 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
@@ -196,6 +200,7 @@ pub struct Vmm {
     // Guest VM core resources.
     guest_memory: GuestMemoryMmap,
     arch_memory_info: ArchMemoryInfo,
+    ram_ranges: Vec<(u64, u64)>,
 
     kernel_cmdline: KernelCmdline,
 
@@ -209,6 +214,10 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+
+    // Snapshot/restore support (macOS arm64 / HVF only).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    snapshot_ctx: Option<crate::macos::vstate::SnapshotCtx>,
 }
 
 impl Vmm {
@@ -275,7 +284,9 @@ impl Vmm {
         initrd: &Option<InitrdConfig>,
         _smbios_oem_strings: &Option<Vec<String>>,
         _pvh: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<(u64, u64)>> {
+        let mut written_ranges = Vec::new();
+
         #[cfg(target_arch = "x86_64")]
         {
             let cmdline_len = if cfg!(feature = "tee") {
@@ -299,7 +310,7 @@ impl Vmm {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpu_mpidr = vcpus.iter().map(|cpu| cpu.get_mpidr()).collect();
-            fdt::create_fdt(
+            let fdt = fdt::create_fdt(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 vcpu_mpidr,
@@ -309,16 +320,20 @@ impl Vmm {
                 initrd,
             )
             .map_err(Error::SetupFDT)?;
+            written_ranges.push((self.arch_memory_info.fdt_addr, fdt.len() as u64));
         }
 
         #[cfg(target_arch = "aarch64")]
         {
-            arch::aarch64::configure_system(
+            if let Some(smbios_size) = arch::aarch64::configure_system(
                 &self.guest_memory,
                 &self.arch_memory_info,
                 _smbios_oem_strings,
             )
-            .map_err(Error::ConfigureSystem)?;
+            .map_err(Error::ConfigureSystem)?
+            {
+                written_ranges.push((arch::aarch64::layout::SMBIOS_START, smbios_size));
+            }
         }
 
         #[cfg(target_arch = "riscv64")]
@@ -338,7 +353,7 @@ impl Vmm {
                 .map_err(Error::ConfigureSystem)?;
         }
 
-        Ok(())
+        Ok(written_ranges)
     }
 
     /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
@@ -396,7 +411,255 @@ impl Vmm {
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
     }
+
+    /// Capture a snapshot of this running VMM into `path` (a directory).
+    /// Pauses every vCPU and virtio device, writes vmstate.bin + pages.img,
+    /// then resumes. Mac+arm64 only.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::capture(inputs, path).map_err(|e| e.to_string())
+    }
+
+    /// Capture a snapshot and copy one host file into the snapshot directory
+    /// while vCPUs and devices are still paused.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot_with_file_copy(
+        &mut self,
+        path: &std::path::Path,
+        copy_src: &std::path::Path,
+        copy_dst_name: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
+            let dst = stage_dir.join(copy_dst_name);
+            clone_or_copy_file(copy_src, &dst)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Arm write-protect dirty tracking for subsequent incremental snapshot capture.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn arm_dirty_tracking(&mut self) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::orchestrator::arm_dirty_tracking(&inputs).map_err(|e| e.to_string())
+    }
+
+    /// Arm write-protect dirty tracking before vCPUs have started running.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn arm_dirty_tracking_pre_vcpu_start(
+        &self,
+        initial_dirty_ranges: &[(u64, u64)],
+    ) -> std::result::Result<(), String> {
+        let ranges = self
+            .guest_memory
+            .iter()
+            .filter(|region| {
+                self.ram_ranges.iter().any(|(addr, size)| {
+                    region.start_addr().raw_value() == *addr && region.len() == *size
+                })
+            })
+            .map(|region| (region.start_addr().raw_value(), region.len()))
+            .collect::<Vec<_>>();
+        hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())?;
+        hvf::mark_dirty_ranges(initial_dirty_ranges).map_err(|e| e.to_string())
+    }
+
+    /// Restore a previously-captured snapshot into this VMM. The VMM must
+    /// already have been built with matching configuration (vcpu count,
+    /// device count, MMIO bases) and vCPUs started — but kernel boot will be
+    /// overridden by the captured PC.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_from(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let ctx = self
+            .snapshot_ctx
+            .as_ref()
+            .ok_or_else(|| "snapshot ctx not initialized".to_string())?;
+        let reader =
+            crate::macos::snapshot::SnapshotReader::open(path).map_err(|e| e.to_string())?;
+        let inputs = crate::macos::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            vcpu_ids: &ctx.vcpu_ids,
+            vcpu_list: &ctx.vcpu_list,
+            irqchip: Some(&ctx.irqchip),
+            gic: ctx.gic.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: ctx.nested_enabled,
+        };
+        crate::macos::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn resume_after_restore(&mut self) -> std::result::Result<(), String> {
+        crate::timing_event("snapshot.restore.resume_vcpus.begin");
+        crate::macos::snapshot::orchestrator::resume_vcpus(&self.vcpus_handles)
+            .map_err(|e| e.to_string())?;
+        crate::timing_event("snapshot.restore.resume_vcpus.done");
+        Ok(())
+    }
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_src = CString::new(src.as_os_str().as_bytes())?;
+    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
+    let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct TimingState {
+    file: std::fs::File,
+    state_file: std::fs::File,
+    base_unix_nanos: u128,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static TIMING_LOG: OnceLock<Option<Mutex<TimingState>>> = OnceLock::new();
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn timing_event(label: &str) {
+    let Some(lock) = TIMING_LOG
+        .get_or_init(|| {
+            let path = std::env::var_os("KRUN_TIMINGS_LOG")?;
+            let state_path = std::env::var_os("KRUN_TIMINGS_STATE")?;
+            let base_unix_nanos = std::env::var("KRUN_TIMINGS_BASE_UNIX_NANOS")
+                .ok()?
+                .parse()
+                .ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            let state_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(state_path)
+                .ok()?;
+            Some(Mutex::new(TimingState {
+                file,
+                state_file,
+                base_unix_nanos,
+            }))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+
+    let Ok(mut state) = lock.lock() else {
+        return;
+    };
+    let now = unix_nanos();
+    if lock_file(&state.state_file).is_err() {
+        return;
+    }
+    let elapsed = now.saturating_sub(state.base_unix_nanos);
+    let base_unix_nanos = state.base_unix_nanos;
+    let delta =
+        replace_timing_state(&mut state.state_file, base_unix_nanos, now).unwrap_or_default();
+    let line = format!(
+        "{:>10.3}ms +{:>9.3}ms libkrun.{label}\n",
+        elapsed as f64 / 1_000_000.0,
+        delta as f64 / 1_000_000.0
+    );
+    let _ = state.file.write_all(line.as_bytes());
+    let _ = unlock_file(&state.state_file);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replace_timing_state(file: &mut std::fs::File, base: u128, now: u128) -> std::io::Result<u128> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    let previous = raw.trim().parse::<u128>().unwrap_or(base);
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{now}")?;
+    Ok(now.saturating_sub(previous))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn unlock_file(file: &std::fs::File) -> std::io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn timing_event(_label: &str) {}
 
 impl Subscriber for Vmm {
     /// Handle a read event (EPOLLIN).

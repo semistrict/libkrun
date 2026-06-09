@@ -26,6 +26,7 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+use crate::vmm_config::pmem::{PmemBuilder, PmemDeviceConfig};
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
@@ -171,6 +172,8 @@ pub struct VmResources {
     /// The network devices builder.
     #[cfg(feature = "net")]
     pub net: NetBuilder,
+    /// File-backed pmem regions.
+    pub pmem: PmemBuilder,
     /// TEE configuration
     #[cfg(feature = "tee")]
     pub tee_config: TeeConfig,
@@ -207,6 +210,10 @@ pub struct VmResources {
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
     /// Enable the embedded dhcp client in init.c
     pub dhcp_client: bool,
+    /// If set, build_microvm will restore from this snapshot directory instead
+    /// of doing a fresh boot. macOS arm64 only.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub snapshot_restore_path: Option<PathBuf>,
 }
 
 impl VmResources {
@@ -345,6 +352,10 @@ impl VmResources {
         self.block.insert(config)
     }
 
+    pub fn add_pmem_device(&mut self, config: PmemDeviceConfig) {
+        self.pmem.insert(config)
+    }
+
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
@@ -449,6 +460,8 @@ mod tests {
             virtio_consoles: Vec::new(),
             kernel_console: None,
             dhcp_client: false,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            snapshot_restore_path: None,
         }
     }
 

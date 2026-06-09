@@ -25,4 +25,12 @@ impl InodeAllocator {
     pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
+
+    pub(crate) fn snapshot_next(&self) -> u64 {
+        self.next.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn restore_next(&self, next: u64) {
+        self.next.store(next, Ordering::Release);
+    }
 }

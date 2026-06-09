@@ -14,7 +14,11 @@ examples/boot_efi
 examples/external_kernel
 examples/nitro
 examples/consoles
+examples/krun/krun
+examples/snapshot_demo
+examples/snapshot_demo.dSYM/
 examples/rootfs_fedora
 test-prefix
 /linux-sysroot
 /freebsd-sysroot
+/.codex-scratch/

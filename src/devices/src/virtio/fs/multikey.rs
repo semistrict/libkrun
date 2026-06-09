@@ -111,6 +111,10 @@ where
         self.alt.clear();
         self.main.clear()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K1, &V)> {
+        self.main.iter().map(|(k, (_, v))| (k, v))
+    }
 }
 
 #[cfg(test)]

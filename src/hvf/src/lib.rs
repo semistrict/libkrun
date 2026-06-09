@@ -8,6 +8,8 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod state;
 
 #[macro_use]
 extern crate log;
@@ -19,20 +21,48 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
 
-unsafe extern "C" {
-    pub fn mach_absolute_time() -> u64;
+#[cfg(target_arch = "aarch64")]
+fn cntvct_el0() -> u64 {
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+    unsafe { mach_absolute_time() }
 }
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
 const HV_EXIT_REASON_EXCEPTION: hv_exit_reason_t = 1;
 const HV_EXIT_REASON_VTIMER_ACTIVATED: hv_exit_reason_t = 2;
+
+pub const DIRTY_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirtyBlock {
+    pub guest_addr: u64,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DirtyRegion {
+    guest_addr: u64,
+    size: u64,
+    blocks: Vec<bool>,
+}
+
+#[derive(Default, Debug)]
+struct DirtyTracker {
+    enabled: bool,
+    regions: Vec<DirtyRegion>,
+}
+
+static DIRTY_TRACKER: LazyLock<Mutex<DirtyTracker>> =
+    LazyLock::new(|| Mutex::new(DirtyTracker::default()));
 
 const TMR_CTL_ENABLE: u64 = 1 << 0;
 const TMR_CTL_IMASK: u64 = 1 << 1;
@@ -104,9 +134,11 @@ const EC_AA64_BKPT: u64 = 0x3c;
 pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
+    GetIpaSize,
     MemoryMap,
     MemoryUnmap,
     NestedCheck,
+    SetIpaSize(u32),
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -127,12 +159,14 @@ impl Display for Error {
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            GetIpaSize => write!(f, "Error getting maximum HVF IPA size"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
             ),
+            SetIpaSize(ipa_size) => write!(f, "Error setting HVF IPA size to {ipa_size} bits"),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -156,7 +190,7 @@ pub enum InterruptType {
     Fiq,
 }
 
-pub trait Vcpus {
+pub trait Vcpus: Send + Sync {
     fn set_vtimer_irq(&self, vcpuid: u64);
     fn should_wait(&self, vcpuid: u64) -> bool;
     fn has_pending_irq(&self, vcpuid: u64) -> bool;
@@ -240,6 +274,15 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 impl HvfVm {
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
+        let mut max_ipa_size = 0;
+        let ret = unsafe { hv_vm_config_get_max_ipa_size(&mut max_ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GetIpaSize);
+        }
+        let ret = unsafe { hv_vm_config_set_ipa_size(config, max_ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::SetIpaSize(max_ipa_size));
+        }
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
                 'static,
@@ -295,6 +338,197 @@ impl HvfVm {
     }
 }
 
+pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let mut regions = Vec::new();
+    for &(guest_addr, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+        let block_count = size.div_ceil(DIRTY_BLOCK_SIZE) as usize;
+        let ret = unsafe {
+            hv_vm_protect(
+                guest_addr,
+                size as usize,
+                (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::MemoryMap);
+        }
+        regions.push(DirtyRegion {
+            guest_addr,
+            size,
+            blocks: vec![false; block_count],
+        });
+    }
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    tracker.enabled = true;
+    tracker.regions = regions;
+    Ok(())
+}
+
+fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64)]) {
+    for &(guest_addr, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+
+        let range_end = guest_addr.saturating_add(size);
+        for region in regions.iter_mut() {
+            let region_end = region.guest_addr.saturating_add(region.size);
+            let start = guest_addr.max(region.guest_addr);
+            let end = range_end.min(region_end);
+            if start >= end {
+                continue;
+            }
+
+            let first_block = ((start - region.guest_addr) / DIRTY_BLOCK_SIZE) as usize;
+            let last_block = ((end - 1 - region.guest_addr) / DIRTY_BLOCK_SIZE) as usize;
+            for index in first_block..=last_block {
+                region.blocks[index] = true;
+            }
+        }
+    }
+}
+
+pub fn mark_dirty_ranges(ranges: &[(u64, u64)]) -> Result<(), Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(());
+    }
+    mark_dirty_ranges_in_regions(&mut tracker.regions, ranges);
+    Ok(())
+}
+
+pub fn take_dirty_blocks_and_reprotect() -> Result<Vec<DirtyBlock>, Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(Vec::new());
+    }
+
+    let mut dirty = Vec::new();
+    for region in &mut tracker.regions {
+        for (index, is_dirty) in region.blocks.iter_mut().enumerate() {
+            if !*is_dirty {
+                continue;
+            }
+            *is_dirty = false;
+            let offset = index as u64 * DIRTY_BLOCK_SIZE;
+            let guest_addr = region.guest_addr + offset;
+            let size = DIRTY_BLOCK_SIZE.min(region.size - offset);
+            let ret = unsafe {
+                hv_vm_protect(
+                    guest_addr,
+                    size as usize,
+                    (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
+                )
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::MemoryMap);
+            }
+            dirty.push(DirtyBlock { guest_addr, size });
+        }
+    }
+    Ok(dirty)
+}
+
+fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
+    let mut tracker = DIRTY_TRACKER.lock().unwrap();
+    if !tracker.enabled {
+        return Ok(false);
+    }
+
+    for region in &mut tracker.regions {
+        if pa < region.guest_addr || pa >= region.guest_addr + region.size {
+            continue;
+        }
+        let offset = pa - region.guest_addr;
+        let block_index = (offset / DIRTY_BLOCK_SIZE) as usize;
+        let block_offset = block_index as u64 * DIRTY_BLOCK_SIZE;
+        let block_addr = region.guest_addr + block_offset;
+        let block_size = DIRTY_BLOCK_SIZE.min(region.size - block_offset);
+        region.blocks[block_index] = true;
+        let ret = unsafe {
+            hv_vm_protect(
+                block_addr,
+                block_size as usize,
+                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::MemoryMap);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_dirty_ranges_marks_intersecting_blocks_only() {
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE * 4,
+            blocks: vec![false; 4],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[(
+                0x1000_0000 + DIRTY_BLOCK_SIZE - 0x1000,
+                DIRTY_BLOCK_SIZE + 0x2000,
+            )],
+        );
+
+        assert_eq!(regions[0].blocks, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn mark_dirty_ranges_ignores_non_overlapping_ranges() {
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE,
+            blocks: vec![false],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[
+                (0x1000_0000 - 0x2000, 0x1000),
+                (0x1000_0000 + DIRTY_BLOCK_SIZE, 0x1000),
+            ],
+        );
+
+        assert_eq!(regions[0].blocks, vec![false]);
+    }
+
+    #[test]
+    fn mark_dirty_ranges_handles_one_tib_region_sparse() {
+        let one_tib = 1_u64 << 40;
+        let block_count = (one_tib / DIRTY_BLOCK_SIZE) as usize;
+        let mut regions = vec![DirtyRegion {
+            guest_addr: 0x8000_0000,
+            size: one_tib,
+            blocks: vec![false; block_count],
+        }];
+
+        mark_dirty_ranges_in_regions(
+            &mut regions,
+            &[
+                (0x8000_0000, 0x1000),
+                (0x8000_0000 + one_tib - 0x1000, 0x1000),
+            ],
+        );
+
+        assert_eq!(regions[0].blocks.iter().filter(|block| **block).count(), 2);
+        assert!(regions[0].blocks[0]);
+        assert!(regions[0].blocks[block_count - 1]);
+    }
+}
+
 #[derive(Debug)]
 pub enum VcpuExit<'a> {
     Breakpoint,
@@ -303,6 +537,7 @@ pub enum VcpuExit<'a> {
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
+    DirtyMemory,
     PsciHandled,
     SecureMonitorCall,
     Shutdown,
@@ -427,30 +662,6 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
-
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &val as *const _ as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
         } else {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
@@ -458,6 +669,30 @@ impl HvfVcpu<'_> {
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuInitialRegisters);
             }
+        }
+
+        // libkrun snapshots NEON Q registers but not HVF's SME state. Do not
+        // expose SME to guests until that state is saved/restored too.
+        let val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                &val as *const _ as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
+                val & !AA64PFR1_EL1_SMEMASK,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };
@@ -516,11 +751,35 @@ impl HvfVcpu<'_> {
             .unwrap();
         let irq_state = (ctl & (TMR_CTL_ENABLE | TMR_CTL_IMASK | TMR_CTL_ISTATUS))
             == (TMR_CTL_ENABLE | TMR_CTL_ISTATUS);
-        vcpu_list.set_vtimer_irq(self.vcpuid);
+        if irq_state {
+            vcpu_list.set_vtimer_irq(self.vcpuid);
+        }
         if !irq_state {
             vcpu_set_vtimer_mask(self.vcpuid, false).unwrap();
             self.vtimer_masked = false;
         }
+    }
+
+    pub fn vtimer_wait_duration(&self) -> Option<Duration> {
+        let ctl = self
+            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)
+            .ok()?;
+        if (ctl & TMR_CTL_ENABLE) == 0 || (ctl & TMR_CTL_IMASK) != 0 {
+            return None;
+        }
+
+        let cval = self
+            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)
+            .ok()?;
+        let mut offset: u64 = 0;
+        unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
+        let guest_now = cntvct_el0().wrapping_sub(offset);
+        let duration = if guest_now >= cval {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq))
+        };
+        Some(duration)
     }
 
     fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
@@ -550,24 +809,22 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+    pub fn complete_pending_emulation(&mut self) -> Result<(), Error> {
+        if let Some(mmio_read) = self.pending_mmio_read.take() {
+            if mmio_read.srt < 31 {
+                let val = match mmio_read.len {
+                    1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
+                    2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
+                    4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
+                    8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
+                    _ => panic!(
+                        "unsupported mmio pa={} len={}",
+                        mmio_read.addr, mmio_read.len
+                    ),
+                };
 
-        if let Some(mmio_read) = self.pending_mmio_read.take()
-            && mmio_read.srt < 31
-        {
-            let val = match mmio_read.len {
-                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => panic!(
-                    "unsupported mmio pa={} len={}",
-                    mmio_read.addr, mmio_read.len
-                ),
-            };
-
-            self.write_reg(mmio_read.srt, val)?;
+                self.write_reg(mmio_read.srt, val)?;
+            }
         }
 
         if self.pending_advance_pc {
@@ -576,7 +833,16 @@ impl HvfVcpu<'_> {
             self.pending_advance_pc = false;
         }
 
+        Ok(())
+    }
+
+    pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
+        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+
+        self.complete_pending_emulation()?;
+
         if pending_irq {
+            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, false)?;
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
 
@@ -627,9 +893,14 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
-                self.pending_advance_pc = true;
 
                 if iswrite {
+                    if dirty_tracking_handle_write_fault(pa)? {
+                        self.pending_advance_pc = false;
+                        return Ok(VcpuExit::DirtyMemory);
+                    }
+
+                    self.pending_advance_pc = true;
                     let val = if srt < 31 {
                         self.read_reg(hv_reg_t_HV_REG_X0 + srt)?
                     } else {
@@ -645,6 +916,7 @@ impl HvfVcpu<'_> {
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
                 } else {
+                    self.pending_advance_pc = true;
                     self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
                     Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
                 }
@@ -710,14 +982,17 @@ impl HvfVcpu<'_> {
                     return Ok(VcpuExit::WaitForEvent);
                 }
 
-                // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
-                if now > cval {
+                let mut offset: u64 = 0;
+                // SAFETY: FFI.
+                unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
+                let host_now = cntvct_el0();
+                let guest_now = host_now.wrapping_sub(offset);
+                if guest_now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
-
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                let timeout =
+                    Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq));
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),
@@ -725,7 +1000,22 @@ impl HvfVcpu<'_> {
                 self.pending_advance_pc = true;
                 self.handle_psci_request()
             }
-            _ => panic!("unexpected exception: 0x{ec:x}"),
+            _ => {
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);
+                let hcr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_HCR_EL2)
+                    .unwrap_or(0);
+                let vtcr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_VTCR_EL2)
+                    .unwrap_or(0);
+                let vttbr = self
+                    .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2)
+                    .unwrap_or(0);
+                panic!(
+                    "unexpected exception: ec=0x{ec:x} syndrome=0x{syndrome:x} pc=0x{pc:x} ipa=0x{:x} hcr=0x{hcr:x} vtcr=0x{vtcr:x} vttbr=0x{vttbr:x}",
+                    self.vcpu_exit.exception.physical_address
+                )
+            }
         }
     }
 }

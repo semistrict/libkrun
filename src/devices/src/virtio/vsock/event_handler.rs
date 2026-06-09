@@ -68,7 +68,7 @@ impl Vsock {
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
         }
-        false
+        self.process_transport_reset_event()
     }
 
     fn handle_activate_event(&self, event_manager: &mut EventManager) {
@@ -107,6 +107,19 @@ impl Vsock {
             )
             .unwrap_or_else(|e| {
                 error!("Failed to register vsock txq with event manager: {e:?}");
+            });
+
+        event_manager
+            .register(
+                self.queue_events[EVQ_INDEX].as_raw_fd(),
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+                ),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register vsock evq with event manager: {e:?}");
             });
 
         event_manager

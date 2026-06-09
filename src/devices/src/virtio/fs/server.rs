@@ -78,6 +78,18 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
+    pub(crate) fn fs(&self) -> &F {
+        &self.fs
+    }
+
+    pub(crate) fn options_bits(&self) -> u64 {
+        self.options.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn restore_options_bits(&self, bits: u64) {
+        self.options.store(bits, Ordering::Relaxed);
+    }
+
     #[allow(clippy::cognitive_complexity)]
     pub fn handle_message(
         &self,

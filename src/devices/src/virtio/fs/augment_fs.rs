@@ -81,6 +81,10 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
         }
     }
 
+    pub(crate) fn inner(&self) -> &T {
+        &self.inner
+    }
+
     fn register_entries(
         parent: Inode,
         entries: Vec<VirtualDirEntry>,

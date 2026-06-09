@@ -1,12 +1,14 @@
 use rand::{TryRngCore, rngs::OsRng};
 use utils::eventfd::EventFd;
-use vm_memory::{Bytes, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, RngError, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    QueueConfig, RngError, VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use serde::{Deserialize, Serialize};
 
 // Request queue.
 pub(crate) const REQ_INDEX: usize = 0;
@@ -64,6 +66,10 @@ impl Rng {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let _ = hvf::mark_dirty_ranges(&[(desc.addr.raw_value(), desc.len as u64)]);
                 }
                 if let Err(e) = mem.write_slice(&rand_bytes[..], desc.addr) {
                     error!("Failed to write slice: {e:?}");
@@ -155,4 +161,54 @@ impl VirtioDevice for Rng {
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let queues = self
+            .queues
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("rng not activated".into()))?
+            .iter()
+            .map(|q| q.queue.to_state())
+            .collect();
+        let body = RngSnapshotBody {
+            acked_features: self.acked_features,
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        let queues = self
+            .queues
+            .as_mut()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("rng not activated".into()))?;
+        if snap.queues.len() != queues.len() {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "rng: expected {} queues, got {}",
+                queues.len(),
+                snap.queues.len()
+            )));
+        }
+        let body: RngSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        self.acked_features = body.acked_features;
+        for (queue, state) in queues.iter_mut().zip(&snap.queues) {
+            queue.queue.restore_state(state);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RngSnapshotBody {
+    acked_features: u64,
 }

@@ -9,7 +9,8 @@ use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
+    QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -21,6 +22,7 @@ use crate::virtio::console::port_queue_mapping::{
     QueueDirection, num_queues, port_id_to_queue_idx,
 };
 use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
@@ -70,6 +72,7 @@ pub struct Console {
     pub(crate) sigwinch_evt: EventFd,
 
     config: VirtioConsoleConfig,
+    active_ports: Vec<bool>,
 }
 
 impl Console {
@@ -90,6 +93,7 @@ impl Console {
             .map(|t| t.get_win_size())
             .unwrap_or((0, 0));
         let config = VirtioConsoleConfig::new(cols, rows, ports.len() as u32);
+        let active_ports = vec![false; ports.len()];
 
         Ok(Console {
             control: ConsoleControl::new(),
@@ -105,6 +109,7 @@ impl Console {
                 .map_err(super::ConsoleError::EventFd)?,
             device_state: DeviceState::Inactive,
             config,
+            active_ports,
         })
     }
 
@@ -163,6 +168,8 @@ impl Console {
         let DeviceState::Activated(ref mem, ref interrupt) = self.device_state else {
             unreachable!()
         };
+        let mem = mem.clone();
+        let interrupt = interrupt.clone();
 
         let control_tx = self.queues[CONTROL_TXQ_INDEX]
             .as_mut()
@@ -171,7 +178,7 @@ impl Console {
 
         let mut ports_to_start = Vec::new();
 
-        while let Some(head) = control_tx.queue.pop(mem) {
+        while let Some(head) = control_tx.queue.pop(&mem) {
             raise_irq = true;
 
             let cmd: VirtioConsoleControl = match mem.read_obj(head.addr) {
@@ -187,7 +194,7 @@ impl Console {
             };
             if let Err(e) = control_tx
                 .queue
-                .add_used(mem, head.index, size_of_val(&cmd) as u32)
+                .add_used(&mem, head.index, size_of_val(&cmd) as u32)
             {
                 error!("failed to add used elements to the queue: {e:?}");
             }
@@ -210,7 +217,7 @@ impl Console {
                     }
 
                     if let Some(term) = self.ports[cmd.id as usize].terminal() {
-                        self.control.mark_console_port(mem, cmd.id);
+                        self.control.mark_console_port(&mem, cmd.id);
                         self.control.port_open(cmd.id, true);
                         let (cols, rows) = term.get_win_size();
                         self.control
@@ -253,30 +260,29 @@ impl Console {
         }
 
         for port_id in ports_to_start {
-            log::trace!("Starting port io for port {port_id}");
-            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
-            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
-
-            // Take ownership of port queues - they are moved to the port.
-            let rx_queue = self.queues[rx_idx]
-                .take()
-                .expect("port rx queue should exist")
-                .queue;
-            let tx_queue = self.queues[tx_idx]
-                .take()
-                .expect("port tx queue should exist")
-                .queue;
-
-            self.ports[port_id].start(
-                mem.clone(),
-                rx_queue,
-                tx_queue,
-                interrupt.clone(),
-                self.control.clone(),
-            );
+            self.start_port(port_id, mem.clone(), interrupt.clone());
         }
 
         raise_irq
+    }
+
+    fn start_port(&mut self, port_id: usize, mem: GuestMemoryMmap, interrupt: InterruptTransport) {
+        log::trace!("Starting port io for port {port_id}");
+        let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+        let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+
+        // Take ownership of port queues - they are moved to the port.
+        let rx_queue = self.queues[rx_idx]
+            .take()
+            .expect("port rx queue should exist")
+            .queue;
+        let tx_queue = self.queues[tx_idx]
+            .take()
+            .expect("port tx queue should exist")
+            .queue;
+
+        self.ports[port_id].start(mem, rx_queue, tx_queue, interrupt, self.control.clone());
+        self.active_ports[port_id] = true;
     }
 }
 
@@ -354,11 +360,139 @@ impl VirtioDevice for Console {
         for port in &mut self.ports {
             port.shutdown();
         }
+        self.active_ports.fill(false);
         self.queues.clear();
         self.queue_events.clear();
         self.device_state = DeviceState::Inactive;
         true
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        for (port_id, port) in self.ports.iter_mut().enumerate() {
+            if let Some((rx_queue, tx_queue)) = port.stop() {
+                let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+                let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+                if let Some(queue) = rx_queue {
+                    self.queues[rx_idx] =
+                        Some(DeviceQueue::new(queue, self.queue_events[rx_idx].clone()));
+                }
+                if let Some(queue) = tx_queue {
+                    self.queues[tx_idx] =
+                        Some(DeviceQueue::new(queue, self.queue_events[tx_idx].clone()));
+                }
+                self.active_ports[port_id] = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        let (mem, interrupt) = match &self.device_state {
+            DeviceState::Activated(m, i) => (m.clone(), i.clone()),
+            DeviceState::Inactive => return Ok(()),
+        };
+        for port_id in 0..self.active_ports.len() {
+            if self.active_ports[port_id] {
+                self.start_port(port_id, mem.clone(), interrupt.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let queues = self
+            .queues
+            .iter()
+            .map(|q| {
+                q.as_ref()
+                    .ok_or_else(|| DeviceSnapshotError::Invalid("console port still active".into()))
+                    .map(|q| q.queue.to_state())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = ConsoleSnapshotBody {
+            acked_features: self.acked_features,
+            config: self.config.into(),
+            control_queue: self.control.to_state(),
+            active_ports: self.active_ports.clone(),
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        self.pause()?;
+        if snap.queues.len() != self.queues.len() {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "console: expected {} queues, got {}",
+                self.queues.len(),
+                snap.queues.len()
+            )));
+        }
+        let body: ConsoleSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        let current_config: ConsoleConfigSnapshot = self.config.into();
+        if body.config.max_nr_ports != current_config.max_nr_ports {
+            return Err(DeviceSnapshotError::Invalid(
+                "console port count mismatch".into(),
+            ));
+        }
+        if body.active_ports.len() != self.ports.len() {
+            return Err(DeviceSnapshotError::Invalid(
+                "console active port count mismatch".into(),
+            ));
+        }
+        self.acked_features = body.acked_features;
+        self.config = body.config.into();
+        self.control.restore_state(&body.control_queue);
+        self.active_ports = body.active_ports;
+        for (queue, state) in self.queues.iter_mut().zip(&snap.queues) {
+            queue
+                .as_mut()
+                .ok_or_else(|| DeviceSnapshotError::Invalid("console queue missing".into()))?
+                .queue
+                .restore_state(state);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct ConsoleConfigSnapshot {
+    cols: u16,
+    rows: u16,
+    max_nr_ports: u32,
+    emerg_wr: u32,
+}
+
+impl From<VirtioConsoleConfig> for ConsoleConfigSnapshot {
+    fn from(config: VirtioConsoleConfig) -> Self {
+        Self {
+            cols: config.cols,
+            rows: config.rows,
+            max_nr_ports: config.max_nr_ports,
+            emerg_wr: config.emerg_wr,
+        }
+    }
+}
+
+impl From<ConsoleConfigSnapshot> for VirtioConsoleConfig {
+    fn from(config: ConsoleConfigSnapshot) -> Self {
+        Self {
+            cols: config.cols,
+            rows: config.rows,
+            max_nr_ports: config.max_nr_ports,
+            emerg_wr: config.emerg_wr,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConsoleSnapshotBody {
+    acked_features: u64,
+    config: ConsoleConfigSnapshot,
+    control_queue: Vec<Vec<u8>>,
+    active_ports: Vec<bool>,
 }
 
 impl VmmExitObserver for Console {

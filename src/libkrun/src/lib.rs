@@ -55,6 +55,7 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+use vmm::vmm_config::pmem::PmemDeviceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -106,8 +107,11 @@ fn init_virtual_entry() -> VirtualDirEntry {
     }
 }
 
-static KRUNFW: LazyLock<Option<libloading::Library>> =
-    LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
+static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
+    std::env::var_os("KRUNFW_PATH")
+        .and_then(|path| libloading::Library::new(path).ok())
+        .or_else(|| libloading::Library::new(KRUNFW_NAME).ok())
+});
 
 pub struct KrunfwBindings {
     get_kernel: libloading::Symbol<
@@ -173,6 +177,7 @@ struct ContextConfig {
     data_block_cfg: Option<BlockDeviceConfig>,
     #[cfg(feature = "blk")]
     block_root: Option<BlockRootConfig>,
+    pmem_cfgs: Vec<PmemDeviceConfig>,
     #[cfg(feature = "tee")]
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
@@ -184,6 +189,10 @@ struct ContextConfig {
     vmm_gid: Option<libc::gid_t>,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     disable_implicit_init: bool,
+    /// If set, `krun_start_enter` will restore from this snapshot directory
+    /// instead of doing a fresh boot.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    snapshot_restore_path: Option<PathBuf>,
 }
 
 impl ContextConfig {
@@ -300,6 +309,10 @@ impl ContextConfig {
         } else {
             self.block_cfgs.clone()
         }
+    }
+
+    fn add_pmem_cfg(&mut self, pmem_cfg: PmemDeviceConfig) {
+        self.pmem_cfgs.push(pmem_cfg);
     }
 
     #[cfg(feature = "net")]
@@ -448,6 +461,12 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 }
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Registry of running VMMs, populated by `krun_start_enter` so that
+/// `krun_snapshot` can find the Vmm to operate on from another thread.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static RUNNING_VMMS: Lazy<Mutex<HashMap<u32, std::sync::Arc<Mutex<vmm::Vmm>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
@@ -868,6 +887,40 @@ pub unsafe extern "C" fn krun_add_disk3(
                     sync_mode,
                 };
                 cfg.add_block_cfg(block_device_config);
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+
+        KRUN_SUCCESS
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_add_pmem(
+    ctx_id: u32,
+    c_pmem_id: *const c_char,
+    c_file_path: *const c_char,
+    read_only: bool,
+) -> i32 {
+    unsafe {
+        let file_path = match CStr::from_ptr(c_file_path).to_str() {
+            Ok(path) => path,
+            Err(_) => return -libc::EINVAL,
+        };
+
+        let pmem_id = match CStr::from_ptr(c_pmem_id).to_str() {
+            Ok(id) => id,
+            Err(_) => return -libc::EINVAL,
+        };
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                ctx_cfg.get_mut().add_pmem_cfg(PmemDeviceConfig {
+                    id: pmem_id.to_string(),
+                    path: file_path.to_string(),
+                    read_only,
+                });
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }
@@ -2903,6 +2956,7 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 #[unsafe(no_mangle)]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
+    vmm::timing_event("start_enter.entry");
     #[cfg(target_os = "linux")]
     {
         let prname = match env::var("HOSTNAME") {
@@ -2922,11 +2976,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+    vmm::timing_event("start_enter.event_manager.created");
 
     let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
+    vmm::timing_event("start_enter.ctx.loaded");
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
@@ -2950,6 +3006,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     }
+    vmm::timing_event("start_enter.block.configured");
+    for pmem_cfg in ctx_cfg.pmem_cfgs.clone() {
+        ctx_cfg.vmr.add_pmem_device(pmem_cfg);
+    }
+    vmm::timing_event("start_enter.pmem.configured");
 
     /*
      * Before krun_start_enter() is called in an encrypted context, the TEE
@@ -2984,6 +3045,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
         return -libc::EINVAL;
     }
+    vmm::timing_event("start_enter.kernel_cmdline.configured");
 
     #[cfg(feature = "net")]
     {
@@ -3041,6 +3103,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             }
         }
     }
+    vmm::timing_event("start_enter.vsock.configured");
 
     if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
         ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
@@ -3052,6 +3115,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Some(console_output) = ctx_cfg.console_output {
         ctx_cfg.vmr.set_console_output(console_output);
     }
+    vmm::timing_event("start_enter.resources.finalized");
 
     if let Some(gid) = ctx_cfg.vmm_gid
         && unsafe { libc::setgid(gid) } != 0
@@ -3069,6 +3133,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        ctx_cfg.vmr.snapshot_restore_path = ctx_cfg.snapshot_restore_path.clone();
+    }
+    vmm::timing_event("start_enter.build_microvm.begin");
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
@@ -3081,6 +3151,33 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+    vmm::timing_event("start_enter.build_microvm.done");
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        RUNNING_VMMS.lock().unwrap().insert(ctx_id, _vmm.clone());
+    }
+    vmm::timing_event("start_enter.running_vmm.registered");
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if ctx_cfg.snapshot_restore_path.is_some() {
+        match event_manager.run_with_timeout(0) {
+            Ok(count) => {
+                vmm::timing_event(&format!(
+                    "start_enter.restore.event_manager_primed count={count}"
+                ));
+            }
+            Err(e) => {
+                error!("Error priming EventManager before snapshot restore resume: {e:?}");
+                return -libc::EINVAL;
+            }
+        }
+        if let Err(e) = _vmm.lock().unwrap().resume_after_restore() {
+            error!("snapshot restore resume failed: {e}");
+            return -libc::EINVAL;
+        }
+        vmm::timing_event("start_enter.restore.resumed");
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
@@ -3095,6 +3192,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    vmm::timing_event("start_enter.event_loop.begin");
     loop {
         match event_manager.run() {
             Ok(_) => {}
@@ -3151,4 +3249,168 @@ mod test_disable_implicit_init {
 
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
+}
+
+/// Mac+arm64 only. Capture a snapshot of a running VM into `path` (a directory
+/// that will be created). The VM must have been started by a prior call to
+/// `krun_start_enter` on this ctx_id; the call blocks until the snapshot is
+/// durable and the VM has been resumed.
+///
+/// Returns 0 on success, a negated errno on failure (-ENOENT if the ctx is not
+/// running, -EPERM if a device refuses snapshot, -EIO on I/O errors).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot(ctx_id: u32, c_path: *const c_char) -> i32 {
+    unsafe {
+        if c_path.is_null() {
+            return -libc::EINVAL;
+        }
+        let path = match CStr::from_ptr(c_path).to_str() {
+            Ok(s) => PathBuf::from(s),
+            Err(_) => return -libc::EINVAL,
+        };
+        let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+            Some(v) => v,
+            None => return -libc::ENOENT,
+        };
+        let result = vmm.lock().unwrap().snapshot(&path);
+        match result {
+            Ok(()) => KRUN_SUCCESS,
+            Err(e) => {
+                error!("krun_snapshot failed: {e}");
+                if e.contains("device refused") || e.contains("connections") {
+                    -libc::EPERM
+                } else {
+                    -libc::EIO
+                }
+            }
+        }
+    }
+}
+
+/// Mac+arm64 only. Capture a snapshot and copy one host file into the snapshot
+/// directory while the VM is still paused. `c_copy_dst_name` must be a relative
+/// filename inside the snapshot directory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot_with_file_copy(
+    ctx_id: u32,
+    c_path: *const c_char,
+    c_copy_src: *const c_char,
+    c_copy_dst_name: *const c_char,
+) -> i32 {
+    unsafe {
+        if c_path.is_null() || c_copy_src.is_null() || c_copy_dst_name.is_null() {
+            return -libc::EINVAL;
+        }
+        let path = match CStr::from_ptr(c_path).to_str() {
+            Ok(s) => PathBuf::from(s),
+            Err(_) => return -libc::EINVAL,
+        };
+        let copy_src = match CStr::from_ptr(c_copy_src).to_str() {
+            Ok(s) => PathBuf::from(s),
+            Err(_) => return -libc::EINVAL,
+        };
+        let copy_dst_name = match CStr::from_ptr(c_copy_dst_name).to_str() {
+            Ok(s) => PathBuf::from(s),
+            Err(_) => return -libc::EINVAL,
+        };
+        if copy_dst_name.is_absolute() || copy_dst_name.components().count() != 1 {
+            return -libc::EINVAL;
+        }
+        let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+            Some(v) => v,
+            None => return -libc::ENOENT,
+        };
+        let result =
+            vmm.lock()
+                .unwrap()
+                .snapshot_with_file_copy(&path, &copy_src, &copy_dst_name);
+        match result {
+            Ok(()) => KRUN_SUCCESS,
+            Err(e) => {
+                error!("krun_snapshot_with_file_copy failed: {e}");
+                if e.contains("device refused") || e.contains("connections") {
+                    -libc::EPERM
+                } else {
+                    -libc::EIO
+                }
+            }
+        }
+    }
+}
+
+/// Mac+arm64 only. Arm dirty RAM tracking for a running VM. This is intended
+/// to be called after a restored guest reaches a stable command boundary and
+/// before the command whose effects should be captured incrementally.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_arm_dirty_tracking(ctx_id: u32) -> i32 {
+    let vmm = match RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(v) => v,
+        None => return -libc::ENOENT,
+    };
+    let result = vmm.lock().unwrap().arm_dirty_tracking();
+    match result {
+        Ok(()) => KRUN_SUCCESS,
+        Err(e) => {
+            error!("krun_arm_dirty_tracking failed: {e}");
+            -libc::EIO
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_arm_dirty_tracking(_ctx_id: u32) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Mac+arm64 only. Stub on other targets — always returns -ENOSYS.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot(_ctx_id: u32, _c_path: *const c_char) -> i32 {
+    -libc::ENOSYS
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_snapshot_with_file_copy(
+    _ctx_id: u32,
+    _c_path: *const c_char,
+    _c_copy_src: *const c_char,
+    _c_copy_dst_name: *const c_char,
+) -> i32 {
+    -libc::ENOSYS
+}
+
+/// Mark this ctx for restore-from-snapshot. Must be called before
+/// `krun_start_enter`. Caller is responsible for matching vcpu count, RAM
+/// size, and device configuration to what was captured.
+///
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_snapshot_path(ctx_id: u32, c_path: *const c_char) -> i32 {
+    unsafe {
+        if c_path.is_null() {
+            return -libc::EINVAL;
+        }
+        let path = match CStr::from_ptr(c_path).to_str() {
+            Ok(s) => PathBuf::from(s),
+            Err(_) => return -libc::EINVAL,
+        };
+        match CTX_MAP.lock().unwrap().get_mut(&ctx_id) {
+            Some(cfg) => {
+                cfg.snapshot_restore_path = Some(path);
+                KRUN_SUCCESS
+            }
+            None => -libc::ENOENT,
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_snapshot_path(_ctx_id: u32, _c_path: *const c_char) -> i32 {
+    -libc::ENOSYS
 }

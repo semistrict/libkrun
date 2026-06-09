@@ -6,11 +6,12 @@ use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
-    VirtioDevice,
+    ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceSnapshot, DeviceSnapshotError,
+    DeviceState, QueueConfig, VirtioDevice,
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use serde::{Deserialize, Serialize};
 
 // Inflate queue.
 pub(crate) const IFQ_INDEX: usize = 0;
@@ -192,4 +193,108 @@ impl VirtioDevice for Balloon {
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
     }
+
+    fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
+    fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
+        let queues = self
+            .queues
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("balloon not activated".into()))?
+            .iter()
+            .map(|q| q.queue.to_state())
+            .collect();
+        let body = BalloonSnapshotBody {
+            acked_features: self.acked_features,
+            config: self.config,
+        };
+        let payload =
+            bincode::serialize(&body).map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        Ok(DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        let queues = self
+            .queues
+            .as_mut()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("balloon not activated".into()))?;
+        if snap.queues.len() != queues.len() {
+            return Err(DeviceSnapshotError::Invalid(format!(
+                "balloon: expected {} queues, got {}",
+                queues.len(),
+                snap.queues.len()
+            )));
+        }
+        let body: BalloonSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        self.acked_features = body.acked_features;
+        self.config = body.config;
+        for (queue, state) in queues.iter_mut().zip(&snap.queues) {
+            queue.queue.restore_state(state);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct BalloonConfigSnapshot {
+    num_pages: u32,
+    actual: u32,
+    free_page_report_cmd_id: u32,
+    poison_val: u32,
+}
+
+impl From<VirtioBalloonConfig> for BalloonConfigSnapshot {
+    fn from(config: VirtioBalloonConfig) -> Self {
+        Self {
+            num_pages: config.num_pages,
+            actual: config.actual,
+            free_page_report_cmd_id: config.free_page_report_cmd_id,
+            poison_val: config.poison_val,
+        }
+    }
+}
+
+impl From<BalloonConfigSnapshot> for VirtioBalloonConfig {
+    fn from(config: BalloonConfigSnapshot) -> Self {
+        Self {
+            num_pages: config.num_pages,
+            actual: config.actual,
+            free_page_report_cmd_id: config.free_page_report_cmd_id,
+            poison_val: config.poison_val,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BalloonSnapshotBody {
+    acked_features: u64,
+    #[serde(
+        serialize_with = "serialize_balloon_config",
+        deserialize_with = "deserialize_balloon_config"
+    )]
+    config: VirtioBalloonConfig,
+}
+
+fn serialize_balloon_config<S>(
+    config: &VirtioBalloonConfig,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    BalloonConfigSnapshot::from(*config).serialize(serializer)
+}
+
+fn deserialize_balloon_config<'de, D>(deserializer: D) -> Result<VirtioBalloonConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(BalloonConfigSnapshot::deserialize(deserializer)?.into())
 }

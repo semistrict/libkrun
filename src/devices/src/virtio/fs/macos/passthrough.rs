@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Sender, unbounded};
 use nix::errno::Errno;
+use serde::{Deserialize, Serialize};
 use utils::worker_message::WorkerMessage;
 
 use crate::virtio::fs::filesystem::SecContext;
@@ -151,6 +152,45 @@ struct HandleData {
     inode: Inode,
     file: RwLock<File>,
     dirstream: Mutex<DirStream>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PassthroughFsSnapshot {
+    inodes: Vec<InodeDataSnapshot>,
+    next_inode: u64,
+    handles: Vec<HandleDataSnapshot>,
+    next_handle: u64,
+    writeback: bool,
+    announce_submounts: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InodeDataSnapshot {
+    inode: Inode,
+    ino: u64,
+    dev: i32,
+    refcount: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HandleDataSnapshot {
+    handle: Handle,
+    inode: Inode,
+    flags: i32,
+    dirstream: DirStreamSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DirStreamSnapshot {
+    entries: Vec<CachedDirEntrySnapshot>,
+    ready: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachedDirEntrySnapshot {
+    ino: bindings::ino64_t,
+    name: Vec<u8>,
+    type_: u8,
 }
 
 fn ebadf() -> io::Error {
@@ -587,6 +627,142 @@ impl PassthroughFs {
         })
     }
 
+    pub(crate) fn snapshot_state(&self) -> io::Result<PassthroughFsSnapshot> {
+        let inodes = self
+            .inodes
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(_, data)| {
+                let unlinked_fd = data.unlinked_fd.load(Ordering::Acquire);
+                if unlinked_fd >= 0 {
+                    return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTSUP)));
+                }
+                Ok(InodeDataSnapshot {
+                    inode: data.inode,
+                    ino: data.ino,
+                    dev: data.dev,
+                    refcount: data.refcount.load(Ordering::Acquire),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let handles = self
+            .handles
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&handle, data)| {
+                let file = data.file.read().unwrap();
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(linux_error(io::Error::last_os_error()));
+                }
+                let dirstream = data.dirstream.lock().unwrap();
+                Ok(HandleDataSnapshot {
+                    handle,
+                    inode: data.inode,
+                    flags,
+                    dirstream: DirStreamSnapshot {
+                        ready: dirstream.ready,
+                        entries: dirstream
+                            .entries
+                            .iter()
+                            .map(|e| CachedDirEntrySnapshot {
+                                ino: e.ino,
+                                name: e.name.to_vec(),
+                                type_: e.type_,
+                            })
+                            .collect(),
+                    },
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        Ok(PassthroughFsSnapshot {
+            inodes,
+            next_inode: self.inode_alloc.snapshot_next(),
+            handles,
+            next_handle: self.next_handle.load(Ordering::Acquire),
+            writeback: self.writeback.load(Ordering::Acquire),
+            announce_submounts: self.announce_submounts.load(Ordering::Acquire),
+        })
+    }
+
+    pub(crate) fn restore_state(&self, snap: &PassthroughFsSnapshot) -> io::Result<()> {
+        let mut inodes = MultikeyBTreeMap::new();
+        for inode in &snap.inodes {
+            inodes.insert(
+                inode.inode,
+                InodeAltKey {
+                    ino: inode.ino,
+                    dev: inode.dev,
+                },
+                Arc::new(InodeData {
+                    inode: inode.inode,
+                    ino: inode.ino,
+                    dev: inode.dev,
+                    refcount: AtomicU64::new(inode.refcount),
+                    unlinked_fd: AtomicI64::new(-1),
+                }),
+            );
+        }
+
+        let mut handles = BTreeMap::new();
+        {
+            let mut current = self.inodes.write().unwrap();
+            *current = inodes;
+        }
+        for handle in &snap.handles {
+            let flags = handle.flags & !libc::O_EXLOCK;
+            let backing = self
+                .inodes
+                .read()
+                .unwrap()
+                .get(&handle.inode)
+                .map(|inode| format!("/.vol/{}/{}", inode.dev, inode.ino))
+                .unwrap_or_else(|| "<missing inode>".to_string());
+            let file = RwLock::new(self.open_inode(handle.inode, flags).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "open restored handle {} inode {} backing {} flags {:#x}: {}",
+                        handle.handle, handle.inode, backing, flags, e
+                    ),
+                )
+            })?);
+            let dirstream = DirStream {
+                ready: handle.dirstream.ready,
+                entries: handle
+                    .dirstream
+                    .entries
+                    .iter()
+                    .map(|e| CachedDirEntry {
+                        ino: e.ino,
+                        name: Box::<[u8]>::from(e.name.as_slice()),
+                        type_: e.type_,
+                    })
+                    .collect(),
+            };
+            handles.insert(
+                handle.handle,
+                Arc::new(HandleData {
+                    inode: handle.inode,
+                    file,
+                    dirstream: Mutex::new(dirstream),
+                }),
+            );
+        }
+
+        *self.handles.write().unwrap() = handles;
+        self.inode_alloc.restore_next(snap.next_inode);
+        self.next_handle.store(snap.next_handle, Ordering::Release);
+        self.writeback.store(snap.writeback, Ordering::Release);
+        self.announce_submounts
+            .store(snap.announce_submounts, Ordering::Release);
+        Ok(())
+    }
+
     fn inode_to_handle(&self, inode: Inode, supports_fd: bool) -> io::Result<InodeHandle> {
         debug!("inode_to_handle: inode={inode}");
         let data = self
@@ -1003,9 +1179,14 @@ fn remove_security_capability(file: &InodeHandle) {
         },
     };
 
-    // ENODATA means the attribute didn't exist, which is fine
-    if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-        warn!("Error removing security.capability from file");
+    // ENODATA/ENOATTR mean the attribute didn't exist, which is fine.
+    // ENOTSUP means this host filesystem cannot store the attribute anyway.
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOATTR | libc::ENOTSUP) => {}
+            _ => warn!("Error removing security.capability from file: {err}"),
+        }
     }
 }
 

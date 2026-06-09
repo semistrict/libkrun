@@ -95,15 +95,16 @@ pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
     mem_info: &ArchMemoryInfo,
     smbios_oem_strings: &Option<Vec<String>>,
-) -> super::Result<()> {
+) -> super::Result<Option<u64>> {
     // When booting EFI, RAM starts at 0x4000_0000, while when doing a direct kernel
     // boot RAM starts at 0x8000_0000. Only write SMBIOS in the former case.
     if mem_info.ram_start_addr < layout::SMBIOS_START {
-        smbios::setup_smbios(guest_mem, layout::SMBIOS_START, smbios_oem_strings)
+        let size = smbios::setup_smbios(guest_mem, layout::SMBIOS_START, smbios_oem_strings)
             .map_err(Error::Smbios)?;
+        return Ok(Some(size));
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]

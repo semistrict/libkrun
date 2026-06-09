@@ -82,10 +82,8 @@ pub fn write_full_pages_img(
                     )))
                 })?;
             let file_offset = base_offset + copied;
-            if buf[..size].iter().any(|&byte| byte != 0) {
+            if has_nonzero_byte(&buf[..size]) {
                 file.write_all_at(&buf[..size], file_offset)?;
-            } else {
-                punch_hole(&file, file_offset, size as u64)?;
             }
             copied += size as u64;
             if copied >= next_progress {
@@ -232,12 +230,20 @@ fn patch_dirty_blocks_serial(
                     block.guest_addr
                 )))
             })?;
-        file.write_all_at(&buf[..size], file_offset)?;
+        if has_nonzero_byte(&buf[..size]) {
+            file.write_all_at(&buf[..size], file_offset)?;
+        } else {
+            punch_hole(file, file_offset, size as u64)?;
+        }
         if index > 0 && index % 1024 == 0 {
             crate::timing_event(&format!("snapshot.ram.patch_dirty.progress blocks={index}"));
         }
     }
     Ok(())
+}
+
+fn has_nonzero_byte(buf: &[u8]) -> bool {
+    buf.iter().any(|&byte| byte != 0)
 }
 
 #[cfg(target_os = "macos")]

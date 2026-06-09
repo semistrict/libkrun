@@ -294,7 +294,7 @@ where
         publish_snapshot_dir(&stage_dir, dir)?;
         crate::timing_event("snapshot.capture_paused.publish.done");
         crate::timing_event("snapshot.capture_paused.dirty_tracking.begin");
-        enable_dirty_tracking(inputs)?;
+        ensure_dirty_tracking(inputs)?;
         crate::timing_event("snapshot.capture_paused.dirty_tracking.done");
         Ok(())
     })();
@@ -321,6 +321,15 @@ fn resume_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
 fn enable_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
     hvf::enable_dirty_tracking(inputs.ram_ranges)
         .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
+}
+
+fn ensure_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
+    if hvf::dirty_tracking_enabled_for_ranges(inputs.ram_ranges) {
+        crate::timing_event("snapshot.dirty_tracking.already_armed");
+        Ok(())
+    } else {
+        enable_dirty_tracking(inputs)
+    }
 }
 
 fn add_virtio_dma_dirty_blocks(

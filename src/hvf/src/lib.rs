@@ -367,6 +367,24 @@ pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
     Ok(())
 }
 
+fn dirty_tracking_regions_match(regions: &[DirtyRegion], ranges: &[(u64, u64)]) -> bool {
+    let mut ranges = ranges.iter().copied().filter(|(_, size)| *size != 0);
+    for region in regions {
+        let Some((guest_addr, size)) = ranges.next() else {
+            return false;
+        };
+        if region.guest_addr != guest_addr || region.size != size {
+            return false;
+        }
+    }
+    ranges.next().is_none()
+}
+
+pub fn dirty_tracking_enabled_for_ranges(ranges: &[(u64, u64)]) -> bool {
+    let tracker = DIRTY_TRACKER.lock().unwrap();
+    tracker.enabled && dirty_tracking_regions_match(&tracker.regions, ranges)
+}
+
 fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64)]) {
     for &(guest_addr, size) in ranges {
         if size == 0 {
@@ -526,6 +544,34 @@ mod tests {
         assert_eq!(regions[0].blocks.iter().filter(|block| **block).count(), 2);
         assert!(regions[0].blocks[0]);
         assert!(regions[0].blocks[block_count - 1]);
+    }
+
+    #[test]
+    fn dirty_tracking_regions_match_ignores_zero_size_ranges() {
+        let regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE,
+            blocks: vec![false],
+        }];
+
+        assert!(dirty_tracking_regions_match(
+            &regions,
+            &[(0x2000_0000, 0), (0x1000_0000, DIRTY_BLOCK_SIZE)]
+        ));
+    }
+
+    #[test]
+    fn dirty_tracking_regions_match_rejects_different_ranges() {
+        let regions = vec![DirtyRegion {
+            guest_addr: 0x1000_0000,
+            size: DIRTY_BLOCK_SIZE,
+            blocks: vec![false],
+        }];
+
+        assert!(!dirty_tracking_regions_match(
+            &regions,
+            &[(0x1000_0000, DIRTY_BLOCK_SIZE * 2)]
+        ));
     }
 }
 

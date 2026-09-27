@@ -62,7 +62,7 @@ use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use crate::vmm_config::fs::FsDeviceConfig;
+use crate::vmm_config::fs::{FsDeviceConfig, FsSource};
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
@@ -2288,6 +2288,22 @@ fn attach_mmio_device(
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn fs_backend(source: &FsSource) -> devices::virtio::FsBackend {
+    use devices::virtio::FsBackend;
+    match source {
+        FsSource::Virtual => FsBackend::Null,
+        FsSource::Directory(root_dir) => {
+            FsBackend::Passthrough(devices::virtio::fs::passthrough::Config {
+                root_dir: root_dir.clone(),
+                ..Default::default()
+            })
+        }
+        #[cfg(feature = "redoxfs")]
+        FsSource::RedoxFsImage(image) => FsBackend::RedoxFs(image.into()),
+    }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
@@ -2303,7 +2319,7 @@ fn attach_fs_devices(
         let fs = Arc::new(Mutex::new(
             devices::virtio::Fs::new(
                 config.fs_id.clone(),
-                config.shared_dir.clone(),
+                fs_backend(&config.source),
                 exit_code.clone(),
                 config.read_only,
                 config.virtual_entries.clone(),

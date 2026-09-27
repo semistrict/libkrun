@@ -368,6 +368,26 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
                            uint64_t shm_size,
                            bool read_only);
 
+/**
+ * Adds an independent virtio-fs device serving a RedoxFS image with a tag. With a
+ * non-zero "shm_size", the guest may map file pages directly through a DAX window
+ * (mount with "-o dax"). The image must not be used by anything else while the VM
+ * runs. Only available when libkrun is built with REDOXFS=1.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_tag"          - tag to identify the filesystem in the guest.
+ *  "c_image_path"   - full path to the RedoxFS image in the host.
+ *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_virtiofs_redoxfs(uint32_t ctx_id,
+                                  const char *c_tag,
+                                  const char *c_image_path,
+                                  uint64_t shm_size);
+
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)

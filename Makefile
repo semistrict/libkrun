@@ -58,6 +58,9 @@ endif
 ifeq ($(INPUT),1)
     FEATURE_FLAGS += --features input
 endif
+ifeq ($(REDOXFS),1)
+    FEATURE_FLAGS += --features redoxfs
+endif
 ifeq ($(VHOST_USER),1)
     FEATURE_FLAGS += --features vhost-user
 endif

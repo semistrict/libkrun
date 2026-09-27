@@ -47,7 +47,7 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
-use vmm::vmm_config::fs::FsDeviceConfig;
+use vmm::vmm_config::fs::{FsDeviceConfig, FsSource};
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
@@ -384,7 +384,10 @@ impl TryFrom<ContextConfig> for NitroEnclave {
         };
 
         let rootfs = if let Some(path) = &ctx.vmr.fs.first() {
-            path.shared_dir.clone()
+            match &path.source {
+                FsSource::Directory(dir) => Some(dir.clone()),
+                _ => None,
+            }
         } else {
             error!("rootfs path required");
             return Err(-libc::EINVAL);
@@ -626,14 +629,13 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
         };
 
         let fs_id = "/dev/root".to_string();
-        let shared_dir = root_path.to_string();
 
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
                 cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id,
-                    shared_dir: Some(shared_dir),
+                    source: FsSource::Directory(root_path.to_string()),
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
@@ -724,7 +726,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 }
                 cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: tag.to_string(),
-                    shared_dir: path.map(|p| p.to_string()),
+                    source: path.map_or(FsSource::Virtual, |p| FsSource::Directory(p.to_string())),
                     shm_size: shm,
                     read_only,
                     virtual_entries,
@@ -734,6 +736,55 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
         }
 
         KRUN_SUCCESS
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "redoxfs", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub unsafe extern "C" fn krun_add_virtiofs_redoxfs(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_image_path: *const c_char,
+    shm_size: u64,
+) -> i32 {
+    if c_tag.is_null() || c_image_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let (tag, image_path) = unsafe {
+        match (
+            CStr::from_ptr(c_tag).to_str(),
+            CStr::from_ptr(c_image_path).to_str(),
+        ) {
+            (Ok(tag), Ok(image_path)) => (tag, image_path),
+            _ => return -libc::EINVAL,
+        }
+    };
+    let shm_size = match shm_size {
+        0 => None,
+        size => match size.try_into() {
+            Ok(size) => Some(size),
+            Err(_) => return -libc::EINVAL,
+        },
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            let mut virtual_entries = Vec::new();
+            if tag == "/dev/root" && !cfg.disable_implicit_init {
+                virtual_entries.push(init_virtual_entry());
+            }
+            cfg.vmr.add_fs_device(FsDeviceConfig {
+                fs_id: tag.to_string(),
+                source: FsSource::RedoxFsImage(image_path.to_string()),
+                shm_size,
+                read_only: false,
+                virtual_entries,
+            });
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
     }
 }
 
@@ -2547,7 +2598,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
 
                 ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: "/dev/root".into(),
-                    shared_dir: None,
+                    source: FsSource::Virtual,
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,

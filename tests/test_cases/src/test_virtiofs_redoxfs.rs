@@ -3,8 +3,9 @@
 // The host creates a RedoxFS image and exposes it with
 // krun_add_virtiofs_redoxfs. The guest mounts it with dax=always, checks that
 // files really are DAX-mapped, and exercises writes through mappings, regular
-// writes and namespace operations, syncing everything. After the VM exits
-// the host reopens the image and checks what the guest left behind.
+// writes and namespace operations, and evicts a file to remove its
+// mappings. After the VM exits the host reopens the image and checks what
+// the guest left behind.
 
 use macros::{guest, host};
 
@@ -15,6 +16,7 @@ const CHUNK: usize = 2 << 20;
 const MAPPED_SIZE: usize = CHUNK + (1 << 20);
 const HOST_CONTENT: &[u8] = b"written by the host\n";
 const WRITTEN: &[u8] = b"written through FUSE_WRITE\n";
+const EVICTED: &[u8] = b"written back by FUSE_REMOVEMAPPING\n";
 
 /// Content of the guest's mmapped file at `offset`.
 fn pattern(offset: usize) -> u8 {
@@ -172,6 +174,8 @@ mod host {
             );
             assert_eq!(read_path(&vfs, "truncated"), vec![b't'; 100]);
             assert!(vfs.lookup(ROOT_INO, b"unlinked").is_err());
+            // Never fsynced: only removing the mapping wrote it back
+            assert_eq!(read_path(&vfs, "evicted"), EVICTED);
 
             TestOutcome::Pass
         }
@@ -357,6 +361,36 @@ mod guest {
         file.sync_all().unwrap();
     }
 
+    fn test_eviction_writes_back() {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("evicted"))
+            .unwrap();
+        file.set_len(EVICTED.len() as u64).unwrap();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                EVICTED.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>(), EVICTED.len()) }
+            .copy_from_slice(EVICTED);
+        assert_eq!(unsafe { libc::munmap(map, EVICTED.len()) }, 0);
+        drop(file);
+
+        // Evicting the inode makes the kernel remove its DAX mappings
+        fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
+        assert_eq!(fs::read(path("evicted")).unwrap(), EVICTED);
+    }
+
     impl Test for TestVirtiofsRedoxFs {
         fn in_guest(self: Box<Self>) {
             mount();
@@ -367,6 +401,7 @@ mod guest {
                 ("regular_write", test_regular_write),
                 ("namespace", test_namespace),
                 ("truncate_mapped", test_truncate_mapped),
+                ("eviction_writes_back", test_eviction_writes_back),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {

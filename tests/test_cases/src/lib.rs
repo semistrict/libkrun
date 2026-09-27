@@ -36,6 +36,11 @@ mod test_pjdfstest;
 use test_pjdfstest::TestPjdfstest;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_redoxfs;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_redoxfs::TestVirtiofsRedoxFs;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
@@ -117,6 +122,8 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("root-disk-remount", Box::new(TestRootDiskRemount)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-redoxfs", Box::new(TestVirtiofsRedoxFs)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),

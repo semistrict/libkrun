@@ -3,7 +3,7 @@ name = "test_cases"
 edition = "2024"
 
 [features]
-host = ["krun-sys", "serde", "serde_json"]
+host = ["krun-sys", "redoxfs", "serde", "serde_json"]
 guest = []
 
 [lib]
@@ -17,3 +17,5 @@ anyhow = "1.0.95"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tempdir = "0.3.7"
+# The redosfs repository that vendors this libkrun
+redoxfs = { path = "../../../..", default-features = false, features = ["std"], optional = true }

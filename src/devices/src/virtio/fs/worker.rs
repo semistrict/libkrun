@@ -221,7 +221,7 @@ impl FsWorker {
                 // Virtual entries get inode numbers above Fxfs's.
                 let inode_alloc = InodeAllocator::starting_at(fxdax::FIRST_VIRTUAL_INODE);
                 FsServer::Fxdax(Server::new(AugmentFs::new(
-                    FxdaxFs::open(&image)?,
+                    FxdaxFs::open(&image, shm_region.as_ref())?,
                     &inode_alloc,
                     virtual_entries,
                 )))

@@ -2,8 +2,12 @@
 //
 // All filesystem semantics live in `fxdax::Vfs`, which runs Fxfs on the
 // in-process kernel; this adapter translates between it and the FUSE server.
-// DAX mapping is not served yet: setupmapping and removemapping fail with
-// ENOSYS.
+//
+// DAX mappings map files' pages into an `fxdax::DaxWindow`, whose pages the
+// kernel maps as the guest faults on them. On macOS the device's shared memory
+// region is demand paged: HVF passes the guest's faults there to the window,
+// and the kernel maps the window's pages into the guest too. DAX is not served
+// on Linux yet: setupmapping and removemapping fail with ENOSYS.
 
 use std::ffi::CStr;
 use std::io;
@@ -11,14 +15,20 @@ use std::mem;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use crossbeam_channel::Sender;
 use fxdax::vfs::{Attr, Creds, DirEntry as VfsDirEntry, FileKind, SetAttr, SetTime, Timespec};
 use fxdax::{Result as VfsResult, Vfs};
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 
 use super::bindings;
 use super::filesystem::{
     Context, DirEntry, Entry, Extensions, FileSystem, FsOptions, OpenOptions, SetattrValid,
     ZeroCopyReader, ZeroCopyWriter,
 };
+use super::fuse::{RemovemappingOne, SetupmappingFlags};
+use crate::virtio::VirtioShmRegion;
 
 type Inode = u64;
 type Handle = u64;
@@ -43,6 +53,9 @@ pub const FIRST_VIRTUAL_INODE: u64 = 1 << 63;
 
 pub struct FxdaxFs {
     vfs: Vfs,
+    /// The guest memory of the DAX window, while the guest may fault on it.
+    #[cfg(target_os = "macos")]
+    _dax_memory: Option<hvf::DemandPagedRegion>,
 }
 
 /// Conversion of `Vfs` results for the guest.
@@ -139,12 +152,22 @@ fn is_dot(name: &[u8]) -> bool {
 }
 
 impl FxdaxFs {
-    /// Open the fxdax image at `image`.
-    pub fn open(image: &Path) -> io::Result<Self> {
+    /// Open the fxdax image at `image`, serving DAX mappings in `shm_region`.
+    pub fn open(image: &Path, shm_region: Option<&VirtioShmRegion>) -> io::Result<Self> {
         let vfs = Vfs::mount_image(image).map_err(|err| {
             io::Error::other(format!("mounting fxdax image {}: {err:?}", image.display()))
         })?;
-        Ok(Self { vfs })
+        #[cfg(target_os = "macos")]
+        let _dax_memory = shm_region
+            .map(|shm_region| hvf_dax_window(&vfs, shm_region))
+            .transpose()?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = shm_region;
+        Ok(Self {
+            vfs,
+            #[cfg(target_os = "macos")]
+            _dax_memory,
+        })
     }
 
     fn truncate(&self, inode: Inode, kill_priv: bool) -> io::Result<()> {
@@ -569,5 +592,105 @@ impl FileSystem for FxdaxFs {
     ) -> io::Result<()> {
         self.vfs.releasedir(handle);
         Ok(())
+    }
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: Inode,
+        _handle: Handle,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        _shm_base: u64,
+        _shm_size: u64,
+        #[cfg(target_os = "macos")] _map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        let writable = flags & SetupmappingFlags::WRITE.bits() != 0;
+        self.vfs
+            .setup_mapping(inode, foffset, len, writable, moffset)
+            .guest()
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<RemovemappingOne>,
+        _shm_base: u64,
+        _shm_size: u64,
+        #[cfg(target_os = "macos")] _map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        for request in requests {
+            self.vfs
+                .remove_mapping(request.moffset, request.len)
+                .guest()?;
+        }
+        Ok(())
+    }
+}
+
+/// Creates `vfs`'s DAX window as the guest memory of `shm_region`, which HVF
+/// demand pages: the guest's faults there go to the window, and the kernel
+/// maps the window's pages into the guest's memory as it maps them into the
+/// window's host memory.
+#[cfg(target_os = "macos")]
+fn hvf_dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<hvf::DemandPagedRegion> {
+    let guest_addr = shm_region.guest_addr;
+    let size = shm_region.size as u64;
+    let window = vfs
+        .create_dax_window(
+            size,
+            Some(std::sync::Arc::new(HvfSecondStage { guest_addr })),
+        )
+        .guest()?;
+    hvf::DemandPagedRegion::new(
+        guest_addr,
+        size,
+        std::sync::Arc::new(move |offset, write| window.fault(offset, write).is_ok()),
+    )
+    .map_err(|err| io::Error::other(format!("demand paging the DAX window: {err}")))
+}
+
+/// HVF's second stage translation of a DAX window at `guest_addr`.
+#[cfg(target_os = "macos")]
+struct HvfSecondStage {
+    guest_addr: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl HvfSecondStage {
+    /// HVF memory flags for host protection `prot`. The guest may execute
+    /// what it may read, such as programs on the filesystem.
+    fn flags(prot: libc::c_int) -> hvf::bindings::hv_memory_flags_t {
+        use hvf::bindings::{HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE};
+        let mut flags = 0;
+        if prot & libc::PROT_READ != 0 {
+            flags |= HV_MEMORY_READ | HV_MEMORY_EXEC;
+        }
+        if prot & libc::PROT_WRITE != 0 {
+            flags |= HV_MEMORY_WRITE;
+        }
+        flags.into()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl fxdax::SecondStage for HvfSecondStage {
+    fn map(&self, vaddr: usize, host_addr: usize, len: usize, prot: libc::c_int) {
+        let guest_addr = self.guest_addr + vaddr as u64;
+        hvf::map_guest_memory(host_addr as u64, guest_addr, len as u64, Self::flags(prot))
+            .unwrap_or_else(|err| panic!("mapping DAX window memory at {guest_addr:#x}: {err}"));
+    }
+
+    fn protect(&self, vaddr: usize, len: usize, prot: libc::c_int) {
+        let guest_addr = self.guest_addr + vaddr as u64;
+        hvf::protect_guest_memory(guest_addr, len as u64, Self::flags(prot))
+            .unwrap_or_else(|err| panic!("protecting DAX window memory at {guest_addr:#x}: {err}"));
+    }
+
+    fn unmap(&self, vaddr: usize, len: usize) {
+        let guest_addr = self.guest_addr + vaddr as u64;
+        hvf::unmap_guest_memory(guest_addr, len as u64)
+            .unwrap_or_else(|err| panic!("unmapping DAX window memory at {guest_addr:#x}: {err}"));
     }
 }

@@ -410,6 +410,7 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::DirtyMemory => Ok(VcpuEmulation::Handled),
+                VcpuExit::DemandPagedMemory => Ok(VcpuEmulation::Handled),
                 VcpuExit::PsciHandled => {
                     debug!("vCPU {vcpuid} PSCI");
                     Ok(VcpuEmulation::Handled)

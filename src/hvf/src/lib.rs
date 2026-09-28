@@ -28,7 +28,8 @@ use std::time::Duration;
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
 
-#[cfg(target_arch = "aarch64")]
+/// The host's counter, which HVF's virtual counter counts from: on macOS, the
+/// one `mach_absolute_time` reads.
 fn cntvct_el0() -> u64 {
     unsafe extern "C" {
         fn mach_absolute_time() -> u64;

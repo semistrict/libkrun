@@ -4,10 +4,13 @@
 // in-process kernel; this adapter translates between it and the FUSE server.
 //
 // DAX mappings map files' pages into an `fxdax::DaxWindow`, whose pages the
-// kernel maps as the guest faults on them. On macOS the device's shared memory
-// region is demand paged: HVF passes the guest's faults there to the window,
-// and the kernel maps the window's pages into the guest too. DAX is not served
-// on Linux yet: setupmapping and removemapping fail with ENOSYS.
+// kernel maps as the guest faults on them, and into the device's shared memory
+// region too:
+// - On macOS the region is demand paged: HVF passes the guest's faults there
+//   to the window, and the kernel maps the window's pages into HVF's stage 2.
+// - On Linux, KVM follows the region's host memory, which an
+//   `fxdax::UffdSecondStage` maps the window's pages into; userfaultfd passes
+//   the faults KVM takes there to the window.
 
 use std::ffi::CStr;
 use std::io;
@@ -53,10 +56,15 @@ pub const FIRST_VIRTUAL_INODE: u64 = 1 << 63;
 
 pub struct FxdaxFs {
     vfs: Vfs,
-    /// The guest memory of the DAX window, while the guest may fault on it.
-    #[cfg(target_os = "macos")]
-    _dax_memory: Option<hvf::DemandPagedRegion>,
+    /// What serves the guest's faults on the DAX window, while it may fault on
+    /// it.
+    _dax_faults: Option<DaxFaults>,
 }
+
+#[cfg(target_os = "macos")]
+type DaxFaults = hvf::DemandPagedRegion;
+#[cfg(target_os = "linux")]
+type DaxFaults = fxdax::FaultThread;
 
 /// Conversion of `Vfs` results for the guest.
 trait Guest<T> {
@@ -157,17 +165,10 @@ impl FxdaxFs {
         let vfs = Vfs::mount_image(image).map_err(|err| {
             io::Error::other(format!("mounting fxdax image {}: {err:?}", image.display()))
         })?;
-        #[cfg(target_os = "macos")]
-        let _dax_memory = shm_region
-            .map(|shm_region| hvf_dax_window(&vfs, shm_region))
+        let _dax_faults = shm_region
+            .map(|shm_region| dax_window(&vfs, shm_region))
             .transpose()?;
-        #[cfg(not(target_os = "macos"))]
-        let _ = shm_region;
-        Ok(Self {
-            vfs,
-            #[cfg(target_os = "macos")]
-            _dax_memory,
-        })
+        Ok(Self { vfs, _dax_faults })
     }
 
     fn truncate(&self, inode: Inode, kill_priv: bool) -> io::Result<()> {
@@ -629,12 +630,35 @@ impl FileSystem for FxdaxFs {
     }
 }
 
+/// Creates `vfs`'s DAX window as the guest memory of `shm_region`, which KVM
+/// follows: the kernel maps the window's pages into its host memory, whose
+/// faults userfaultfd passes to the window.
+#[cfg(target_os = "linux")]
+fn dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
+    let size = shm_region.size;
+    // SAFETY: The region's host memory is the device's, which only the guest
+    // accesses.
+    let second_stage = unsafe { fxdax::UffdSecondStage::new(shm_region.host_addr as usize, size) }
+        .map_err(|err| dax_error("taking over the DAX window's memory", err))?;
+    let window = vfs
+        .create_dax_window(size as u64, Some(second_stage.clone()))
+        .map_err(|err| dax_error("creating the DAX window", err))?;
+    second_stage
+        .serve(window)
+        .map_err(|err| dax_error("serving the DAX window's faults", err))
+}
+
+/// An error setting up the DAX window in `step`.
+fn dax_error(step: &str, err: fxdax::Error) -> io::Error {
+    io::Error::other(format!("{step}: {err}"))
+}
+
 /// Creates `vfs`'s DAX window as the guest memory of `shm_region`, which HVF
 /// demand pages: the guest's faults there go to the window, and the kernel
 /// maps the window's pages into the guest's memory as it maps them into the
 /// window's host memory.
 #[cfg(target_os = "macos")]
-fn hvf_dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<hvf::DemandPagedRegion> {
+fn dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
     let guest_addr = shm_region.guest_addr;
     let size = shm_region.size as u64;
     let window = vfs
@@ -642,7 +666,7 @@ fn hvf_dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<hvf::De
             size,
             Some(std::sync::Arc::new(HvfSecondStage { guest_addr })),
         )
-        .guest()?;
+        .map_err(|err| dax_error("creating the DAX window", err))?;
     hvf::DemandPagedRegion::new(
         guest_addr,
         size,

@@ -751,6 +751,7 @@ dependencies = [
  "futures",
  "fxfs",
  "fxfs-platform",
+ "libc",
  "log",
  "refaults_vmo",
  "storage_device",

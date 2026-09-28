@@ -141,6 +141,7 @@ pub enum Error {
     MemoryUnmap,
     NestedCheck,
     SetIpaSize(u32),
+    UnresolvedFault(u64, bool),
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -170,6 +171,10 @@ impl Display for Error {
                 "Nested virtualization was requested but it's not support in this system"
             ),
             SetIpaSize(ipa_size) => write!(f, "Error setting HVF IPA size to {ipa_size} bits"),
+            UnresolvedFault(pa, write) => write!(
+                f,
+                "Unresolved guest fault at {pa:#x} (write: {write}) in demand-paged memory"
+            ),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -498,7 +503,8 @@ static DEMAND_PAGED: RwLock<Vec<DemandPagedRange>> = RwLock::new(Vec::new());
 
 /// Guest physical memory whose pages the VMM maps as the guest faults on them, such as a virtio-fs
 /// DAX window whose files' pages a pager supplies. Faults on its unmapped pages go to its handler,
-/// rather than to MMIO devices, until it is dropped.
+/// rather than to MMIO devices, until it is dropped; a fault the handler cannot resolve stops the
+/// vCPU.
 pub struct DemandPagedRegion {
     guest_addr: u64,
 }
@@ -529,20 +535,19 @@ impl Drop for DemandPagedRegion {
     }
 }
 
-/// Passes the guest's fault at `pa` to the handler of the demand-paged region it is in, if any.
-/// Returns whether the handler resolved it.
-fn handle_demand_fault(pa: u64, write: bool) -> bool {
+/// Passes the guest's fault at `pa` to the handler of the demand-paged region it is in, and returns
+/// whether it is in one. A fault the handler cannot resolve is an error, as the guest cannot go on.
+fn handle_demand_fault(pa: u64, write: bool) -> Result<bool, Error> {
     let Some((offset, handler)) = DEMAND_PAGED.read().unwrap().iter().find_map(|range| {
         let offset = pa.checked_sub(range.guest_addr)?;
         (offset < range.size).then(|| (offset, range.handler.clone()))
     }) else {
-        return false;
+        return Ok(false);
     };
-    let resolved = handler(offset, write);
-    if !resolved {
-        error!("unresolved guest fault at {pa:#x} (write: {write}) in demand-paged memory");
+    if !handler(offset, write) {
+        return Err(Error::UnresolvedFault(pa, write));
     }
-    resolved
+    Ok(true)
 }
 
 /// Maps the `size` bytes of host memory at `host_addr` at `guest_addr`, where nothing is mapped,
@@ -1050,7 +1055,7 @@ impl HvfVcpu<'_> {
 
                 let pa = self.vcpu_exit.exception.physical_address;
 
-                if handle_demand_fault(pa, iswrite) {
+                if handle_demand_fault(pa, iswrite)? {
                     self.pending_advance_pc = false;
                     return Ok(VcpuExit::DemandPagedMemory);
                 }
@@ -1157,7 +1162,7 @@ impl HvfVcpu<'_> {
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_INSTABORT
-                if handle_demand_fault(self.vcpu_exit.exception.physical_address, false) =>
+                if handle_demand_fault(self.vcpu_exit.exception.physical_address, false)? =>
             {
                 self.pending_advance_pc = false;
                 Ok(VcpuExit::DemandPagedMemory)

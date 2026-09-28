@@ -123,7 +123,12 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         #[cfg(any(feature = "host", target_os = "linux"))]
-        TestCase::new("virtiofs-fxdax", Box::new(TestVirtiofsFxdax)),
+        TestCase::new("virtiofs-fxdax", Box::new(TestVirtiofsFxdax { dax: true })),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "virtiofs-fxdax-nodax",
+            Box::new(TestVirtiofsFxdax { dax: false }),
+        ),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),

@@ -1,22 +1,24 @@
-// Test the fxdax virtio-fs backend, with DAX.
+// Test the fxdax virtio-fs backend, with DAX and without.
 //
 // The host creates an fxdax image and exposes it with krun_add_virtiofs_fxdax.
-// The guest mounts it with dax=always, checks that files really are
+// The guest mounts it with dax=always or dax=never, checks whether files are
 // DAX-mapped, and exercises writes through mappings, regular writes and
-// namespace operations, and evicts a file to remove its mappings. After the VM
-// exits the host reopens the image, checks it, and checks what the guest left
-// behind.
+// namespace operations, and evicts a file to write it back. After the VM exits
+// the host reopens the image, checks it, and checks what the guest left behind.
 
 use macros::{guest, host};
 
-pub struct TestVirtiofsFxdax;
+pub struct TestVirtiofsFxdax {
+    /// Whether the device has a DAX window, and the guest maps files into it.
+    pub dax: bool,
+}
 
 /// Offset of the second 2 MiB DAX chunk.
 const CHUNK: usize = 2 << 20;
 const MAPPED_SIZE: usize = CHUNK + (1 << 20);
 const HOST_CONTENT: &[u8] = b"written by the host\n";
 const WRITTEN: &[u8] = b"written through FUSE_WRITE\n";
-const EVICTED: &[u8] = b"written back by FUSE_REMOVEMAPPING\n";
+const EVICTED: &[u8] = b"written back when its inode is evicted\n";
 /// Size of the image, which is sparse.
 const IMAGE_SIZE: u64 = 256 << 20;
 
@@ -123,7 +125,7 @@ mod host {
                     ctx,
                     c"fxdax".as_ptr(),
                     c_image.as_ptr(),
-                    1 << 29,
+                    if self.dax { 1 << 29 } else { 0 },
                 ))?;
                 krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
                 let argv = [test_case.as_ptr(), null()];
@@ -187,7 +189,7 @@ mod guest {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
-    use std::panic::catch_unwind;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     const MNT: &str = "/mnt/fxdax";
 
@@ -195,12 +197,12 @@ mod guest {
         format!("{MNT}/{name}")
     }
 
-    fn mount() {
+    fn mount(dax: bool) {
         fs::create_dir_all(MNT).unwrap();
         let source = CString::new("fxdax").unwrap();
         let target = CString::new(MNT).unwrap();
         let fstype = CString::new("virtiofs").unwrap();
-        let options = CString::new("dax=always").unwrap();
+        let options = CString::new(if dax { "dax=always" } else { "dax=never" }).unwrap();
         let ret = unsafe {
             libc::mount(
                 source.as_ptr(),
@@ -243,7 +245,7 @@ mod guest {
         assert_eq!(fs::read(path("from-host")).unwrap(), HOST_CONTENT);
     }
 
-    fn test_mmap_write_through_dax() {
+    fn test_mmap_write(dax: bool) {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -252,7 +254,11 @@ mod guest {
             .open(path("dax-mapped"))
             .unwrap();
         file.set_len(MAPPED_SIZE as u64).unwrap();
-        assert!(is_dax(&path("dax-mapped")), "dax-mapped is not DAX");
+        assert_eq!(
+            is_dax(&path("dax-mapped")),
+            dax,
+            "dax-mapped's DAX attribute"
+        );
 
         let map = unsafe {
             libc::mmap(
@@ -380,26 +386,28 @@ mod guest {
         assert_eq!(unsafe { libc::munmap(map, EVICTED.len()) }, 0);
         drop(file);
 
-        // Evicting the inode makes the kernel remove its DAX mappings
+        // Evicting the inode writes it back: with DAX, by removing its mappings
         fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
         assert_eq!(fs::read(path("evicted")).unwrap(), EVICTED);
     }
 
     impl Test for TestVirtiofsFxdax {
         fn in_guest(self: Box<Self>) {
-            mount();
+            let dax = self.dax;
+            mount(dax);
 
-            let tests: &[(&str, fn())] = &[
-                ("host_file", test_host_file),
-                ("mmap_write_through_dax", test_mmap_write_through_dax),
-                ("regular_write", test_regular_write),
-                ("namespace", test_namespace),
-                ("truncate_mapped", test_truncate_mapped),
-                ("eviction_writes_back", test_eviction_writes_back),
+            let mmap_write = || test_mmap_write(dax);
+            let tests: &[(&str, &dyn Fn())] = &[
+                ("host_file", &test_host_file),
+                ("mmap_write", &mmap_write),
+                ("regular_write", &test_regular_write),
+                ("namespace", &test_namespace),
+                ("truncate_mapped", &test_truncate_mapped),
+                ("eviction_writes_back", &test_eviction_writes_back),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {
-                if catch_unwind(test).is_err() {
+                if catch_unwind(AssertUnwindSafe(test)).is_err() {
                     eprintln!("FAIL: {name}");
                     failed.push(*name);
                 } else {

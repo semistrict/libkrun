@@ -26,6 +26,18 @@ use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 use serde::{Deserialize, Serialize};
 
+/// The filesystem implementation behind a device.
+#[derive(Clone)]
+pub enum FsBackend {
+    /// Only virtual entries, no host storage.
+    Null,
+    /// A host directory, passed through.
+    Passthrough(passthrough::Config),
+    /// An fxdax (Fxfs) image file, with DAX support.
+    #[cfg(feature = "fxdax")]
+    Fxdax(std::path::PathBuf),
+}
+
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
 struct VirtioFsConfig {
@@ -50,7 +62,7 @@ pub struct Fs {
     device_state: DeviceState,
     config: VirtioFsConfig,
     shm_region: Option<VirtioShmRegion>,
-    passthrough_cfg: Option<passthrough::Config>,
+    backend: FsBackend,
     read_only: bool,
     virtual_entries: Vec<VirtualDirEntry>,
     worker_thread: Option<JoinHandle<FsWorkerStopResult>>,
@@ -64,7 +76,7 @@ pub struct Fs {
 impl Fs {
     pub fn new(
         fs_id: String,
-        shared_dir: Option<String>,
+        backend: FsBackend,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
@@ -76,10 +88,6 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
-            root_dir,
-            ..Default::default()
-        });
 
         Ok(Fs {
             avail_features,
@@ -87,7 +95,7 @@ impl Fs {
             device_state: DeviceState::Inactive,
             config,
             shm_region: None,
-            passthrough_cfg: fs_cfg,
+            backend,
             read_only,
             virtual_entries,
             worker_thread: None,
@@ -110,9 +118,8 @@ impl Fs {
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
-        let Some(cfg) = self.passthrough_cfg.as_mut() else {
-            // NullFs-backed devices have no passthrough config and don't
-            // participate in cross-domain fd export. Consume (and waste) an
+        let FsBackend::Passthrough(cfg) = &mut self.backend else {
+            // Only passthrough devices participate in cross-domain fd export. Consume (and waste) an
             // fsid so numbering stays dense, but don't store the table.
             return FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
         };
@@ -200,7 +207,7 @@ impl VirtioDevice for Fs {
             interrupt.clone(),
             mem.clone(),
             self.shm_region.clone(),
-            self.passthrough_cfg.clone(),
+            self.backend.clone(),
             self.read_only,
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
@@ -264,7 +271,7 @@ impl VirtioDevice for Fs {
             DeviceState::Inactive => {
                 return Err(DeviceSnapshotError::Invalid(
                     "fs resume on inactive device".into(),
-                ))
+                ));
             }
         };
         let worker = FsWorker::from_parts(

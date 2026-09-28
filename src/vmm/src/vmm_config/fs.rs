@@ -1,12 +1,23 @@
 #[cfg(not(feature = "aws-nitro"))]
 use devices::virtio::fs::virtual_entry::VirtualDirEntry;
 
+/// What a virtio-fs device serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FsSource {
+    /// Only virtual entries, no host storage.
+    Virtual,
+    /// A host directory, passed through.
+    Directory(String),
+    /// An fxdax (Fxfs) image file, with DAX support.
+    #[cfg(feature = "fxdax")]
+    FxdaxImage(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct FsDeviceConfig {
     pub fs_id: String,
-    /// Host directory to pass through. None means a virtual-only filesystem
-    /// (NullFs + AugmentFs, no host directory).
-    pub shared_dir: Option<String>,
+    /// What the device serves.
+    pub source: FsSource,
     pub shm_size: Option<usize>,
     pub read_only: bool,
     #[cfg(not(feature = "aws-nitro"))]

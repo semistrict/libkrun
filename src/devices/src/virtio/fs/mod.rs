@@ -8,6 +8,8 @@ mod inode_alloc;
 mod multikey;
 mod null_fs;
 mod read_only;
+#[cfg(feature = "fxdax")]
+mod fxdax;
 mod server;
 pub mod virtual_entry;
 mod worker;
@@ -29,7 +31,7 @@ use super::bindings;
 use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
-pub use self::device::Fs;
+pub use self::device::{Fs, FsBackend};
 pub use self::filesystem::ExportTable;
 
 mod defs {

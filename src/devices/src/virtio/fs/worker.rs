@@ -17,11 +17,14 @@ use super::super::{FsError, Queue};
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
+use super::device::FsBackend;
+#[cfg(feature = "fxdax")]
+use super::fxdax::{self, FxdaxFs};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
+use super::passthrough::PassthroughFs;
 #[cfg(target_os = "macos")]
 use super::passthrough::PassthroughFsSnapshot;
-use super::passthrough::{self, PassthroughFs};
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;
@@ -31,6 +34,8 @@ pub(crate) enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    #[cfg(feature = "fxdax")]
+    Fxdax(Server<AugmentFs<FxdaxFs>>),
 }
 
 #[cfg(target_os = "macos")]
@@ -61,6 +66,11 @@ impl FsServer {
             FsServer::Null(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "virtio-fs null server snapshot is unsupported",
+            )),
+            #[cfg(feature = "fxdax")]
+            FsServer::Fxdax(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "virtio-fs fxdax server snapshot is unsupported",
             )),
         }
     }
@@ -130,6 +140,15 @@ impl FsServer {
                 #[cfg(target_os = "macos")]
                 map_sender,
             ),
+            #[cfg(feature = "fxdax")]
+            FsServer::Fxdax(s) => s.handle_message(
+                r,
+                w,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
         }
     }
 }
@@ -161,7 +180,7 @@ impl FsWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         shm_region: Option<VirtioShmRegion>,
-        passthrough_cfg: Option<passthrough::Config>,
+        backend: FsBackend,
         read_only: bool,
         virtual_entries: Vec<VirtualDirEntry>,
         stop_fd: EventFd,
@@ -169,8 +188,8 @@ impl FsWorker {
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
-        let server = match passthrough_cfg {
-            Some(cfg) if read_only => {
+        let server = match backend {
+            FsBackend::Passthrough(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
@@ -178,7 +197,7 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            Some(cfg) => {
+            FsBackend::Passthrough(cfg) => {
                 let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadWrite(Server::new(AugmentFs::new(
                     inner,
@@ -186,11 +205,27 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            None => FsServer::Null(Server::new(AugmentFs::new(
+            FsBackend::Null => FsServer::Null(Server::new(AugmentFs::new(
                 NullFs,
                 &inode_alloc,
                 virtual_entries,
             ))),
+            #[cfg(feature = "fxdax")]
+            FsBackend::Fxdax(image) => {
+                if read_only {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "read-only fxdax devices are unsupported",
+                    ));
+                }
+                // Virtual entries get inode numbers above Fxfs's.
+                let inode_alloc = InodeAllocator::starting_at(fxdax::FIRST_VIRTUAL_INODE);
+                FsServer::Fxdax(Server::new(AugmentFs::new(
+                    FxdaxFs::open(&image)?,
+                    &inode_alloc,
+                    virtual_entries,
+                )))
+            }
         };
         Ok(Self {
             queues,

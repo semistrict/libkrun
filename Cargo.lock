@@ -941,6 +941,7 @@ dependencies = [
  "refaults_vmo",
  "storage_device",
  "tokio",
+ "zircon",
  "zx",
  "zx-status",
 ]

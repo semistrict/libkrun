@@ -477,6 +477,10 @@ name = "fidl-fuchsia-fs"
 version = "0.1.0"
 
 [[package]]
+name = "fidl-fuchsia-fs-startup"
+version = "0.1.0"
+
+[[package]]
 name = "fidl-fuchsia-fxfs"
 version = "0.1.0"
 
@@ -489,6 +493,14 @@ dependencies = [
  "futures",
  "tokio",
  "zx",
+]
+
+[[package]]
+name = "fidl-fuchsia-memorypressure"
+version = "0.1.0"
+dependencies = [
+ "fidl",
+ "futures",
 ]
 
 [[package]]
@@ -746,6 +758,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fidl",
+ "fidl-fuchsia-fs-startup",
  "fidl-fuchsia-io",
  "fuchsia-async",
  "futures",
@@ -841,9 +854,12 @@ dependencies = [
  "anyhow",
  "bitflags",
  "either",
+ "event-listener",
  "fidl",
  "fidl-fuchsia-fs",
+ "fidl-fuchsia-fs-startup",
  "fidl-fuchsia-io",
+ "fidl-fuchsia-memorypressure",
  "fuchsia-async-kernel",
  "fuchsia-sync",
  "futures",
@@ -853,6 +869,7 @@ dependencies = [
  "fxfs_macros",
  "fxfs_trace",
  "linked-hash-map",
+ "memory-pressure-signaler",
  "refaults_vmo",
  "rustc-hash",
  "scopeguard",
@@ -1084,6 +1101,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "memory-pressure-signaler"
+version = "0.1.0"
+dependencies = [
+ "fidl",
+ "fidl-fuchsia-memorypressure",
+ "futures",
+ "log",
+ "zx",
 ]
 
 [[package]]

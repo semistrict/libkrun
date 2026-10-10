@@ -772,6 +772,7 @@ dependencies = [
  "log",
  "refaults_vmo",
  "storage_device",
+ "tokio",
  "zerocopy",
  "zircon",
  "zx",

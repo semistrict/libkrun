@@ -3,7 +3,7 @@ name = "test_cases"
 edition = "2024"
 
 [features]
-host = ["krun-sys", "fxdax", "serde", "serde_json"]
+host = ["krun-sys", "fxdax", "futures", "serde", "serde_json"]
 guest = []
 
 [lib]
@@ -19,3 +19,4 @@ serde_json = { version = "1", optional = true }
 tempdir = "0.3.7"
 # The fxdax repository that vendors this libkrun
 fxdax = { path = "../../../../crates/fxdax", optional = true }
+futures = { version = "0.3.34", optional = true }

@@ -20,7 +20,7 @@ virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
 vhost-user = ["vhost", "vmm-sys-util"]
-fxdax = ["dep:fxdax"]
+fxdax = ["dep:fxdax", "dep:futures"]
 
 [dependencies]
 bitflags = "1.2.0"
@@ -48,6 +48,7 @@ rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-1.18.0", path 
 imago = { version = "0.2.2", features = ["sync-wrappers", "vm-memory"] }
 # The fxdax repository that vendors this libkrun
 fxdax = { path = "../../../../crates/fxdax", optional = true }
+futures = { version = "0.3.34", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }

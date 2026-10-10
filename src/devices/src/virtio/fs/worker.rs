@@ -19,7 +19,7 @@ use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
 use super::device::FsBackend;
 #[cfg(feature = "fxdax")]
-use super::fxdax::{self, FxdaxFs};
+use super::fxdax::FxdaxServer;
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::PassthroughFs;
@@ -28,6 +28,7 @@ use super::passthrough::PassthroughFsSnapshot;
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;
+use crate::virtio::queue::DescriptorChain;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
 pub(crate) enum FsServer {
@@ -35,7 +36,7 @@ pub(crate) enum FsServer {
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
     #[cfg(feature = "fxdax")]
-    Fxdax(Server<AugmentFs<FxdaxFs>>),
+    Fxdax(FxdaxServer),
 }
 
 #[cfg(target_os = "macos")]
@@ -107,15 +108,27 @@ impl FsServer {
         }
     }
 
-    fn handle_message(
+    /// Handles the request in `head`, and returns the length of its reply.
+    fn handle_chain(
         &self,
-        r: Reader,
-        w: Writer,
+        mem: &GuestMemoryMmap,
+        head: DescriptorChain,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
-    ) -> super::Result<usize> {
-        match self {
+    ) -> usize {
+        // fxdax decodes requests itself, from the chain's buffers.
+        #[cfg(feature = "fxdax")]
+        if let FsServer::Fxdax(server) = self {
+            return server.handle_chain(mem, head);
+        }
+        let r = Reader::new(mem, head.clone())
+            .map_err(FsError::QueueReader)
+            .unwrap();
+        let w = Writer::new(mem, head)
+            .map_err(FsError::QueueWriter)
+            .unwrap();
+        let result = match self {
             FsServer::ReadWrite(s) => s.handle_message(
                 r,
                 w,
@@ -141,15 +154,12 @@ impl FsServer {
                 map_sender,
             ),
             #[cfg(feature = "fxdax")]
-            FsServer::Fxdax(s) => s.handle_message(
-                r,
-                w,
-                shm_region,
-                exit_code,
-                #[cfg(target_os = "macos")]
-                map_sender,
-            ),
-        }
+            FsServer::Fxdax(_) => unreachable!("fxdax handles its chains above"),
+        };
+        result.unwrap_or_else(|e| {
+            error!("error handling message: {e:?}");
+            0
+        })
     }
 }
 
@@ -218,13 +228,15 @@ impl FsWorker {
                         "read-only fxdax devices are unsupported",
                     ));
                 }
-                // Virtual entries get inode numbers above Fxfs's.
-                let inode_alloc = InodeAllocator::starting_at(fxdax::FIRST_VIRTUAL_INODE);
-                FsServer::Fxdax(Server::new(AugmentFs::new(
-                    FxdaxFs::open(&image, shm_region.as_ref())?,
-                    &inode_alloc,
-                    virtual_entries,
-                )))
+                // fxdax serves FUSE itself, so libkrun cannot add entries,
+                // such as a root's implicit init.
+                if !virtual_entries.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "fxdax devices cannot have virtual entries, such as a root's implicit init",
+                    ));
+                }
+                FsServer::Fxdax(FxdaxServer::open(&image, shm_region.as_ref())?)
             }
         };
         Ok(Self {
@@ -360,29 +372,17 @@ impl FsWorker {
     fn process_queue(&mut self, queue_index: usize) {
         let queue = &mut self.queues[queue_index];
         while let Some(head) = queue.pop(&self.mem) {
-            let reader = Reader::new(&self.mem, head.clone())
-                .map_err(FsError::QueueReader)
-                .unwrap();
-            let writer = Writer::new(&self.mem, head.clone())
-                .map_err(FsError::QueueWriter)
-                .unwrap();
-
-            let len = match self.server.handle_message(
-                reader,
-                writer,
+            let index = head.index;
+            let len = self.server.handle_chain(
+                &self.mem,
+                head,
                 &self.shm_region,
                 &self.exit_code,
                 #[cfg(target_os = "macos")]
                 &self.map_sender,
-            ) {
-                Ok(len) => len,
-                Err(e) => {
-                    error!("error handling message: {e:?}");
-                    0
-                }
-            };
+            );
 
-            if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
+            if let Err(e) = queue.add_used(&self.mem, index, len as u32) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 

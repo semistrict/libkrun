@@ -33,6 +33,7 @@ mod host {
 
     use crate::common::setup_rootfs;
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
+    use futures::executor::block_on;
     use fxdax::{Attr, Filesystem, Inode, Owner, Storage};
     use krun_sys::*;
     use nix::libc;
@@ -56,25 +57,26 @@ mod host {
     }
 
     fn create_image(path: &Path) -> anyhow::Result<()> {
-        let fs = Filesystem::format(Storage::create(path, IMAGE_SIZE)?)?;
-        let owner = Owner { uid: 0, gid: 0 };
-        let file = fs.create(Inode::ROOT, b"from-host", 0o644, owner)?;
-        fs.write(file.inode, 0, HOST_CONTENT)?;
-        fs.close()?;
-        Ok(())
+        block_on(async {
+            let fs = Filesystem::format(Storage::create(path, IMAGE_SIZE)?).await?;
+            let owner = Owner { uid: 0, gid: 0 };
+            let file = fs.create(Inode::ROOT, b"from-host", 0o644, owner).await?;
+            fs.write(file.inode, 0, HOST_CONTENT).await?;
+            fs.close().await?;
+            Ok(())
+        })
     }
 
     /// Checks the image at `path`, and serves it.
     fn open_image(path: &Path) -> Filesystem {
         let storage = Storage::open(path).expect("open image");
-        Filesystem::mount(storage.check().expect("check image")).expect("mount image")
+        block_on(async { Filesystem::mount(storage.check().await?).await }).expect("mount image")
     }
 
     fn lookup_path(fs: &Filesystem, path: &str) -> Attr {
-        let mut attr = fs.getattr(Inode::ROOT).unwrap();
+        let mut attr = block_on(fs.getattr(Inode::ROOT)).unwrap();
         for name in path.split('/') {
-            attr = fs
-                .lookup(attr.inode, name.as_bytes())
+            attr = block_on(fs.lookup(attr.inode, name.as_bytes()))
                 .unwrap_or_else(|err| panic!("host: lookup {path}: {err}"));
         }
         attr
@@ -83,7 +85,7 @@ mod host {
     fn read_path(fs: &Filesystem, path: &str) -> Vec<u8> {
         let attr = lookup_path(fs, path);
         let mut buf = vec![0; attr.size as usize];
-        let count = fs.read(attr.inode, 0, &mut buf).unwrap();
+        let count = block_on(fs.read(attr.inode, 0, &mut buf)).unwrap();
         buf.truncate(count);
         buf
     }
@@ -162,11 +164,11 @@ mod host {
             assert_eq!(lookup_path(&fs, "dir/renamed").nlink, 2);
             assert_eq!(read_path(&fs, "dir/link"), b"renamed");
             assert_eq!(
-                fs.readlink(lookup_path(&fs, "sym").inode).unwrap(),
+                block_on(fs.readlink(lookup_path(&fs, "sym").inode)).unwrap(),
                 b"written"
             );
             assert_eq!(read_path(&fs, "truncated"), vec![b't'; 100]);
-            assert!(fs.lookup(Inode::ROOT, b"unlinked").is_err());
+            assert!(block_on(fs.lookup(Inode::ROOT, b"unlinked")).is_err());
             // Never fsynced: only removing the mapping wrote it back
             assert_eq!(read_path(&fs, "evicted"), EVICTED);
 

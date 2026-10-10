@@ -413,6 +413,24 @@ int32_t krun_add_virtiofs_fxdax_volume(uint32_t ctx_id,
                                        const char *c_volume,
                                        uint64_t shm_size);
 
+/**
+ * Sets how much memory fxdax keeps files' pages in, for every fxdax device in
+ * the process: the most host memory their cached and dirty pages, and their
+ * DAX windows' pages, take, 1 GiB unless set. As free memory runs low, fxdax
+ * writes dirty pages back sooner, and drops clean ones; its thresholds for
+ * that scale with the memory. May be called once, before the first fxdax
+ * device starts, which is when a VM with one starts. Only available when
+ * libkrun is built with FXDAX=1.
+ *
+ * Arguments:
+ *  "memory_bytes"   - the memory, in bytes.
+ *
+ * Returns:
+ *  Zero on success, -EBUSY if already set or once an fxdax device has started,
+ *  or -EINVAL for too little memory.
+ */
+int32_t krun_set_fxdax_memory(uint64_t memory_bytes);
+
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)

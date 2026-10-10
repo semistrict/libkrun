@@ -35,6 +35,8 @@ pub use self::device::{Fs, FsBackend};
 pub use self::filesystem::ExportTable;
 #[cfg(all(feature = "fxdax", target_os = "linux"))]
 pub use self::fxdax::PrefaultGuestMemory;
+#[cfg(feature = "fxdax")]
+pub use self::fxdax::set_kernel_memory as set_fxdax_kernel_memory;
 
 mod defs {
     use super::super::QueueConfig;

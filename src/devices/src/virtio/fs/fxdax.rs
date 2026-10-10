@@ -194,6 +194,15 @@ fn buffers<'m>(
     Ok((readable, writable))
 }
 
+/// Gives fxdax's in-process kernel, which files' pages live in, `memory_bytes`
+/// of memory, with its memory pressure thresholds scaled to it, once. Fails
+/// with `EBUSY` if set already or once a device has started the kernel, and
+/// with `EINVAL` for too little memory.
+pub fn set_kernel_memory(memory_bytes: u64) -> Result<(), i32> {
+    fxdax::kernel::configure(fxdax::kernel::Config::with_memory(memory_bytes))
+        .map_err(|err| err.errno().map_or(libc::EINVAL, Errno::raw))
+}
+
 /// Maps guest memory for the guest ahead of its accesses, as KVM's
 /// `KVM_PRE_FAULT_MEMORY` does, rather than on a fault on each page.
 #[cfg(target_os = "linux")]

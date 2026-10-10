@@ -791,6 +791,15 @@ pub unsafe extern "C" fn krun_add_virtiofs_fxdax_volume(
     add_fxdax_device(ctx_id, c_tag, source, shm_size)
 }
 
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub extern "C" fn krun_set_fxdax_memory(memory_bytes: u64) -> i32 {
+    match devices::virtio::fs::set_fxdax_kernel_memory(memory_bytes) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(errno) => -errno,
+    }
+}
+
 /// Adds a virtio-fs device tagged `c_tag` serving the fxdax `source`, with a
 /// DAX window of `shm_size` bytes, or none if it is 0.
 #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]

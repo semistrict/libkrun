@@ -41,6 +41,11 @@ mod test_virtiofs_fxdax;
 use test_virtiofs_fxdax::TestVirtiofsFxdax;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_fxdax_memory;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_fxdax_memory::TestVirtiofsFxdaxMemory;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_fxdax_volumes;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_fxdax_volumes::TestVirtiofsFxdaxVolumes;
@@ -141,6 +146,8 @@ pub fn test_cases() -> Vec<TestCase> {
         ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-fxdax-memory", Box::new(TestVirtiofsFxdaxMemory)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(

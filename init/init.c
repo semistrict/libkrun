@@ -33,6 +33,8 @@
 #include <linux/reboot.h>
 #include <linux/vm_sockets.h>
 #include <sys/reboot.h>
+#include <sys/syscall.h>
+#include <sys/timex.h>
 #endif
 
 #include "dhcp.h"
@@ -498,6 +500,75 @@ static int chroot_luks()
     chroot(".");
 
     return 0;
+}
+#endif
+
+#if __linux__
+#define NSEC_PER_SEC 1000000000LL
+
+static int64_t timespec_ns(const struct timespec *ts)
+{
+    return ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec;
+}
+
+/*
+ * The guest's clock starts from the hypervisor's at boot, which can leave it
+ * a fraction of a second off the host's (~170 ms behind under nested KVM),
+ * while files on virtio-fs are stamped by the host's. KVM's PTP clock, if the
+ * guest's kernel has it, reads the host's clock: move the guest's onto it.
+ */
+static void set_clock_from_host()
+{
+    struct timespec before, host, after;
+    struct timex timex;
+    char name[32];
+    int64_t offset;
+    clockid_t clock;
+    FILE *file;
+    int fd;
+
+    file = fopen("/sys/class/ptp/ptp0/clock_name", "r");
+    if (!file) {
+        return;
+    }
+    if (!fgets(name, sizeof(name), file) ||
+        strncmp(name, "KVM virtual PTP", strlen("KVM virtual PTP")) != 0) {
+        fclose(file);
+        return;
+    }
+    fclose(file);
+
+    fd = open("/dev/ptp0", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror("open(/dev/ptp0)");
+        return;
+    }
+    /* FD_TO_CLOCKID, from the kernel's posix-timers. */
+    clock = ((~(clockid_t)fd) << 3) | 3;
+    if (clock_gettime(CLOCK_REALTIME, &before) < 0 ||
+        clock_gettime(clock, &host) < 0 ||
+        clock_gettime(CLOCK_REALTIME, &after) < 0) {
+        perror("reading the host's clock");
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    offset = timespec_ns(&host) -
+             (timespec_ns(&before) + timespec_ns(&after)) / 2;
+    memset(&timex, 0, sizeof(timex));
+    timex.modes = ADJ_SETOFFSET | ADJ_NANO;
+    timex.time.tv_sec = offset / NSEC_PER_SEC;
+    /* With ADJ_NANO, tv_usec is nanoseconds, which must not be negative. */
+    timex.time.tv_usec = offset % NSEC_PER_SEC;
+    if (timex.time.tv_usec < 0) {
+        timex.time.tv_sec -= 1;
+        timex.time.tv_usec += NSEC_PER_SEC;
+    }
+    /* libc declares clock_adjtime only with _GNU_SOURCE. */
+    if (syscall(SYS_clock_adjtime, CLOCK_REALTIME, &timex) < 0) {
+        perror("clock_adjtime");
+    }
 }
 #endif
 
@@ -1471,6 +1542,8 @@ int main(int argc, char **argv)
     }
 
 #if __linux__
+    set_clock_from_host();
+
     krun_root = clone_str(getenv("KRUN_BLOCK_ROOT_DEVICE"));
     if (krun_root) {
         if (mkdir("/newroot", 0755) < 0 && errno != EEXIST) {

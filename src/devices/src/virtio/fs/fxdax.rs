@@ -1,27 +1,32 @@
 // virtio-fs backend serving an fxdax (Fxfs) image.
 //
-// All filesystem semantics live in `fxdax::Vfs`, which runs Fxfs on the
-// in-process kernel; this adapter translates between it and the FUSE server.
+// All filesystem semantics live in `fxdax::Filesystem`, which runs Fxfs on
+// the in-process kernel; this adapter translates between it and the FUSE
+// server.
 //
-// DAX mappings map files' pages into an `fxdax::DaxWindow`, whose pages the
-// kernel maps as the guest faults on them, and into the device's shared memory
-// region too:
+// DAX mappings map files' pages into the filesystem's DAX window, whose pages
+// the kernel maps as the guest faults on them, and into the device's shared
+// memory region too:
 // - On macOS the region is demand paged: HVF passes the guest's faults there
 //   to the window, and the kernel maps the window's pages into HVF's stage 2.
-// - On Linux, KVM follows the region's host memory, which an
-//   `fxdax::UffdSecondStage` maps the window's pages into; userfaultfd passes
-//   the faults KVM takes there to the window.
+// - On Linux, KVM follows the region's host memory, which the filesystem takes
+//   over: it maps the window's pages there, and serves the faults KVM takes
+//   there itself.
 
 use std::ffi::CStr;
 use std::io;
 use std::mem;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
-use fxdax::vfs::{Attr, Creds, DirEntry as VfsDirEntry, FileKind, SetAttr, SetTime, Timespec};
-use fxdax::{Result as VfsResult, Vfs};
+#[cfg(target_os = "macos")]
+use fxdax::Protection;
+use fxdax::{
+    Attr, DirEntry as FxDirEntry, DirHandle, Errno, FileType, Filesystem, Owner, RenameFlags,
+    SetAttr, SetTime, Storage,
+};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
@@ -40,55 +45,66 @@ type Handle = u64;
 /// back and cached names and attributes stay valid.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
-// Linux `d_type` values.
-const DT_FIFO: u32 = 1;
-const DT_CHR: u32 = 2;
-const DT_DIR: u32 = 4;
-const DT_BLK: u32 = 6;
-const DT_REG: u32 = 8;
-const DT_LNK: u32 = 10;
-const DT_SOCK: u32 = 12;
-
 /// Lowest inode number `AugmentFs` may hand to virtual entries: fxdax inode
 /// numbers are Fxfs object ids, which an unencrypted volume allocates
 /// sequentially from small numbers.
 pub const FIRST_VIRTUAL_INODE: u64 = 1 << 63;
 
 pub struct FxdaxFs {
-    vfs: Vfs,
-    /// What serves the guest's faults on the DAX window, while it may fault on
-    /// it.
+    fs: Filesystem,
+    /// What passes the guest's faults on the DAX window to it, while the guest
+    /// may fault on it.
     _dax_faults: Option<DaxFaults>,
 }
 
 #[cfg(target_os = "macos")]
 type DaxFaults = hvf::DemandPagedRegion;
+/// The filesystem serves the faults on the window's memory itself.
 #[cfg(target_os = "linux")]
-type DaxFaults = fxdax::FaultThread;
+type DaxFaults = ();
 
-/// Conversion of `Vfs` results for the guest.
+/// Conversion of `fxdax` results for the guest.
 trait Guest<T> {
     fn guest(self) -> io::Result<T>;
 }
 
-impl<T> Guest<T> for VfsResult<T> {
+impl<T> Guest<T> for fxdax::Result<T> {
     fn guest(self) -> io::Result<T> {
-        // Vfs errors already carry Linux errno values.
-        self.map_err(|err| io::Error::from_raw_os_error(err.errno()))
+        // fxdax's errno values are already Linux's.
+        self.map_err(|errno| io::Error::from_raw_os_error(errno.raw()))
     }
 }
 
-fn creds(ctx: &Context) -> Creds {
-    Creds {
+fn errno(errno: Errno) -> io::Error {
+    io::Error::from_raw_os_error(errno.raw())
+}
+
+fn owner(ctx: &Context) -> Owner {
+    Owner {
         uid: ctx.uid,
         gid: ctx.gid,
     }
 }
 
+/// Seconds and nanoseconds of `time` since the Unix epoch, which fxdax's times
+/// are not before.
+fn timespec(time: SystemTime) -> (i64, i64) {
+    let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+    (
+        since_epoch.as_secs() as i64,
+        since_epoch.subsec_nanos() as i64,
+    )
+}
+
 fn stat(attr: &Attr) -> bindings::stat64 {
     // SAFETY: stat is plain data; all-zero is a valid value.
     let mut st: bindings::stat64 = unsafe { mem::zeroed() };
-    st.st_ino = attr.ino as _;
+    let (atime, mtime, ctime) = (
+        timespec(attr.atime),
+        timespec(attr.mtime),
+        timespec(attr.ctime),
+    );
+    st.st_ino = attr.inode.0 as _;
     st.st_mode = attr.mode() as _;
     st.st_nlink = attr.nlink as _;
     st.st_uid = attr.uid;
@@ -97,12 +113,12 @@ fn stat(attr: &Attr) -> bindings::stat64 {
     st.st_size = attr.size as _;
     st.st_blocks = attr.blocks as _;
     st.st_blksize = attr.blksize as _;
-    st.st_atime = attr.atime.secs as _;
-    st.st_atime_nsec = attr.atime.nanos as _;
-    st.st_mtime = attr.mtime.secs as _;
-    st.st_mtime_nsec = attr.mtime.nanos as _;
-    st.st_ctime = attr.ctime.secs as _;
-    st.st_ctime_nsec = attr.ctime.nanos as _;
+    st.st_atime = atime.0 as _;
+    st.st_atime_nsec = atime.1 as _;
+    st.st_mtime = mtime.0 as _;
+    st.st_mtime_nsec = mtime.1 as _;
+    st.st_ctime = ctime.0 as _;
+    st.st_ctime_nsec = ctime.1 as _;
     st
 }
 
@@ -115,24 +131,12 @@ fn perm(st: &bindings::stat64) -> u16 {
 
 fn entry(attr: &Attr) -> Entry {
     Entry {
-        inode: attr.ino,
+        inode: attr.inode.0,
         generation: 0,
         attr: stat(attr),
         attr_flags: 0,
         attr_timeout: TIMEOUT,
         entry_timeout: TIMEOUT,
-    }
-}
-
-fn dir_type(kind: FileKind) -> u32 {
-    match kind {
-        FileKind::File => DT_REG,
-        FileKind::Directory => DT_DIR,
-        FileKind::Symlink => DT_LNK,
-        FileKind::Fifo => DT_FIFO,
-        FileKind::CharDevice => DT_CHR,
-        FileKind::BlockDevice => DT_BLK,
-        FileKind::Socket => DT_SOCK,
     }
 }
 
@@ -146,10 +150,12 @@ fn set_time(
     if valid.contains(now) {
         Some(SetTime::Now)
     } else if valid.contains(set) {
-        Some(SetTime::At(Timespec {
-            secs: secs as u64,
-            nanos: nanos as u32,
-        }))
+        // Times before the epoch, which fxdax refuses, are before it here too.
+        let time = match u64::try_from(secs) {
+            Ok(secs) => UNIX_EPOCH + Duration::new(secs, nanos as u32),
+            Err(_) => UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs()),
+        };
+        Some(SetTime::At(time))
     } else {
         None
     }
@@ -162,20 +168,22 @@ fn is_dot(name: &[u8]) -> bool {
 impl FxdaxFs {
     /// Open the fxdax image at `image`, serving DAX mappings in `shm_region`.
     pub fn open(image: &Path, shm_region: Option<&VirtioShmRegion>) -> io::Result<Self> {
-        let vfs = Vfs::mount_image(image).map_err(|err| {
-            io::Error::other(format!("mounting fxdax image {}: {err:?}", image.display()))
-        })?;
+        let fs = Storage::open(image)
+            .and_then(Filesystem::mount)
+            .map_err(|err| {
+                io::Error::other(format!("mounting fxdax image {}: {err:#}", image.display()))
+            })?;
         let _dax_faults = shm_region
-            .map(|shm_region| dax_window(&vfs, shm_region))
+            .map(|shm_region| dax_window(&fs, shm_region))
             .transpose()?;
-        Ok(Self { vfs, _dax_faults })
+        Ok(Self { fs, _dax_faults })
     }
 
     fn truncate(&self, inode: Inode, kill_priv: bool) -> io::Result<()> {
-        self.vfs
+        self.fs
             .setattr(
-                inode,
-                SetAttr {
+                inode.into(),
+                &SetAttr {
                     size: Some(0),
                     kill_suid_sgid: kill_priv,
                     ..Default::default()
@@ -187,9 +195,9 @@ impl FxdaxFs {
 
     fn list<F>(&self, handle: Handle, offset: u64, mut add: F) -> io::Result<()>
     where
-        F: FnMut(u64, &VfsDirEntry) -> io::Result<usize>,
+        F: FnMut(u64, &FxDirEntry) -> io::Result<usize>,
     {
-        let entries = self.vfs.readdir(handle, offset).guest()?;
+        let entries = self.fs.readdir(DirHandle(handle), offset).guest()?;
         for (i, entry) in entries.iter().enumerate() {
             if add(offset + i as u64 + 1, entry)? == 0 {
                 break;
@@ -208,18 +216,18 @@ impl FileSystem for FxdaxFs {
     }
 
     fn destroy(&self) {
-        if let Err(err) = self.vfs.unmount() {
+        if let Err(err) = self.fs.unmount() {
             error!("fxdax: failed to write back: {err:?}");
         }
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let attr = self.vfs.lookup(parent, name.to_bytes()).guest()?;
+        let attr = self.fs.lookup(parent.into(), name.to_bytes()).guest()?;
         Ok(entry(&attr))
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
-        self.vfs.forget(inode, count);
+        self.fs.forget(inode.into(), count);
     }
 
     fn getattr(
@@ -228,7 +236,7 @@ impl FileSystem for FxdaxFs {
         inode: Inode,
         _handle: Option<Handle>,
     ) -> io::Result<(bindings::stat64, Duration)> {
-        let attr = self.vfs.getattr(inode).guest()?;
+        let attr = self.fs.getattr(inode.into()).guest()?;
         Ok((stat(&attr), TIMEOUT))
     }
 
@@ -265,12 +273,12 @@ impl FileSystem for FxdaxFs {
             kill_suid_sgid: valid.contains(SetattrValid::SIZE | SetattrValid::KILL_SUIDGID)
                 || valid.intersects(SetattrValid::UID | SetattrValid::GID),
         };
-        let attr = self.vfs.setattr(inode, set).guest()?;
+        let attr = self.fs.setattr(inode.into(), &set).guest()?;
         Ok((stat(&attr), TIMEOUT))
     }
 
     fn readlink(&self, _ctx: Context, inode: Inode) -> io::Result<Vec<u8>> {
-        self.vfs.readlink(inode).guest()
+        self.fs.readlink(inode.into()).guest()
     }
 
     fn symlink(
@@ -282,8 +290,8 @@ impl FileSystem for FxdaxFs {
         _extensions: Extensions,
     ) -> io::Result<Entry> {
         let attr = self
-            .vfs
-            .symlink(parent, name.to_bytes(), linkname.to_bytes())
+            .fs
+            .symlink(parent.into(), name.to_bytes(), linkname.to_bytes())
             .guest()?;
         Ok(entry(&attr))
     }
@@ -298,9 +306,20 @@ impl FileSystem for FxdaxFs {
         umask: u32,
         _extensions: Extensions,
     ) -> io::Result<Entry> {
+        let mode = mode & !umask;
+        // A mode without a type is a regular file's.
+        let file_type = FileType::from_mode(mode).unwrap_or(FileType::File);
+        let perm = (mode & 0o7777) as u16;
         let attr = self
-            .vfs
-            .mknod(creds(&ctx), parent, name.to_bytes(), mode & !umask, rdev)
+            .fs
+            .mknod(
+                parent.into(),
+                name.to_bytes(),
+                file_type,
+                perm,
+                rdev,
+                owner(&ctx),
+            )
             .guest()?;
         Ok(entry(&attr))
     }
@@ -316,18 +335,18 @@ impl FileSystem for FxdaxFs {
     ) -> io::Result<Entry> {
         let perm = ((mode & !umask) & 0o7777) as u16;
         let attr = self
-            .vfs
-            .mkdir(creds(&ctx), parent, name.to_bytes(), perm)
+            .fs
+            .mkdir(parent.into(), name.to_bytes(), perm, owner(&ctx))
             .guest()?;
         Ok(entry(&attr))
     }
 
     fn unlink(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        self.vfs.unlink(parent, name.to_bytes()).guest()
+        self.fs.unlink(parent.into(), name.to_bytes()).guest()
     }
 
     fn rmdir(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        self.vfs.rmdir(parent, name.to_bytes()).guest()
+        self.fs.rmdir(parent.into(), name.to_bytes()).guest()
     }
 
     fn rename(
@@ -339,13 +358,13 @@ impl FileSystem for FxdaxFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
-        self.vfs
+        self.fs
             .rename(
-                olddir,
+                olddir.into(),
                 oldname.to_bytes(),
-                newdir,
+                newdir.into(),
                 newname.to_bytes(),
-                flags,
+                RenameFlags::from_bits_retain(flags),
             )
             .guest()
     }
@@ -358,8 +377,8 @@ impl FileSystem for FxdaxFs {
         newname: &CStr,
     ) -> io::Result<Entry> {
         let attr = self
-            .vfs
-            .link(inode, newparent, newname.to_bytes())
+            .fs
+            .link(inode.into(), newparent.into(), newname.to_bytes())
             .guest()?;
         Ok(entry(&attr))
     }
@@ -392,8 +411,8 @@ impl FileSystem for FxdaxFs {
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let perm = ((mode & !umask) & 0o7777) as u16;
         let attr = self
-            .vfs
-            .create(creds(&ctx), parent, name.to_bytes(), perm)
+            .fs
+            .create(parent.into(), name.to_bytes(), perm, owner(&ctx))
             .guest()?;
         Ok((entry(&attr), None, OpenOptions::KEEP_CACHE))
     }
@@ -410,7 +429,7 @@ impl FileSystem for FxdaxFs {
         _flags: u32,
     ) -> io::Result<usize> {
         let mut buf = vec![0; size as usize];
-        let count = self.vfs.read(inode, offset, &mut buf).guest()?;
+        let count = self.fs.read(inode.into(), offset, &mut buf).guest()?;
         w.write_all(&buf[..count])?;
         Ok(count)
     }
@@ -430,12 +449,12 @@ impl FileSystem for FxdaxFs {
     ) -> io::Result<usize> {
         let mut buf = vec![0; size as usize];
         r.read_exact(&mut buf)?;
-        let count = self.vfs.write(inode, offset, &buf).guest()?;
+        let count = self.fs.write(inode.into(), offset, &buf).guest()?;
         if kill_priv {
-            self.vfs
+            self.fs
                 .setattr(
-                    inode,
-                    SetAttr {
+                    inode.into(),
+                    &SetAttr {
                         kill_suid_sgid: true,
                         ..Default::default()
                     },
@@ -462,7 +481,7 @@ impl FileSystem for FxdaxFs {
         _datasync: bool,
         _handle: Handle,
     ) -> io::Result<()> {
-        self.vfs.fsync(inode).guest()
+        self.fs.fsync(inode.into()).guest()
     }
 
     fn fallocate(
@@ -474,7 +493,11 @@ impl FileSystem for FxdaxFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        self.vfs.fallocate(inode, mode, offset, length).guest()
+        // Only the default mode, 0, is supported.
+        if mode != 0 {
+            return Err(errno(Errno::ENOTSUP));
+        }
+        self.fs.allocate(inode.into(), offset, length).guest()
     }
 
     fn release(
@@ -491,7 +514,7 @@ impl FileSystem for FxdaxFs {
     }
 
     fn statfs(&self, _ctx: Context, _inode: Inode) -> io::Result<bindings::statvfs64> {
-        let statfs = self.vfs.statfs().guest()?;
+        let statfs = self.fs.statfs().guest()?;
         // SAFETY: statvfs is plain data; all-zero is a valid value.
         let mut st: bindings::statvfs64 = unsafe { mem::zeroed() };
         st.f_bsize = statfs.block_size as _;
@@ -510,8 +533,8 @@ impl FileSystem for FxdaxFs {
         inode: Inode,
         _flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        let handle = self.vfs.opendir(inode).guest()?;
-        Ok((Some(handle), OpenOptions::empty()))
+        let handle = self.fs.opendir(inode.into()).guest()?;
+        Ok((Some(handle.into()), OpenOptions::empty()))
     }
 
     fn readdir<F>(
@@ -528,9 +551,9 @@ impl FileSystem for FxdaxFs {
     {
         self.list(handle, offset, |offset, entry| {
             add_entry(DirEntry {
-                ino: entry.ino as _,
+                ino: entry.inode.into(),
                 offset,
-                type_: dir_type(entry.kind),
+                type_: entry.file_type.dirent_type().into(),
                 name: &entry.name,
             })
         })
@@ -551,24 +574,24 @@ impl FileSystem for FxdaxFs {
         self.list(handle, offset, |offset, dir_entry| {
             // The kernel takes no lookup reference for "." and ".."
             let attr = if is_dot(&dir_entry.name) {
-                self.vfs.getattr(dir_entry.ino)
+                self.fs.getattr(dir_entry.inode)
             } else {
-                self.vfs.lookup(inode, &dir_entry.name)
+                self.fs.lookup(inode.into(), &dir_entry.name)
             }
             .guest()?;
 
             let added = add_entry(
                 DirEntry {
-                    ino: dir_entry.ino as _,
+                    ino: dir_entry.inode.into(),
                     offset,
-                    type_: dir_type(dir_entry.kind),
+                    type_: dir_entry.file_type.dirent_type().into(),
                     name: &dir_entry.name,
                 },
                 entry(&attr),
             )?;
             if added == 0 && !is_dot(&dir_entry.name) {
                 // Did not fit: the kernel never saw this lookup
-                self.vfs.forget(attr.ino, 1);
+                self.fs.forget(attr.inode, 1);
             }
             Ok(added)
         })
@@ -581,7 +604,7 @@ impl FileSystem for FxdaxFs {
         _datasync: bool,
         _handle: Handle,
     ) -> io::Result<()> {
-        self.vfs.fsync(inode).guest()
+        self.fs.fsync(inode.into()).guest()
     }
 
     fn releasedir(
@@ -591,7 +614,7 @@ impl FileSystem for FxdaxFs {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
-        self.vfs.releasedir(handle);
+        self.fs.releasedir(DirHandle(handle));
         Ok(())
     }
     fn setupmapping(
@@ -608,8 +631,8 @@ impl FileSystem for FxdaxFs {
         #[cfg(target_os = "macos")] _map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         let writable = flags & SetupmappingFlags::WRITE.bits() != 0;
-        self.vfs
-            .setup_mapping(inode, foffset, len, writable, moffset)
+        self.fs
+            .setup_mapping(inode.into(), foffset, len, moffset, writable)
             .guest()
     }
 
@@ -622,7 +645,7 @@ impl FileSystem for FxdaxFs {
         #[cfg(target_os = "macos")] _map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         for request in requests {
-            self.vfs
+            self.fs
                 .remove_mapping(request.moffset, request.len)
                 .guest()?;
         }
@@ -630,47 +653,50 @@ impl FileSystem for FxdaxFs {
     }
 }
 
-/// Creates `vfs`'s DAX window as the guest memory of `shm_region`, which KVM
-/// follows: the kernel maps the window's pages into its host memory, whose
-/// faults userfaultfd passes to the window.
+/// Creates `fs`'s DAX window in the host memory of `shm_region`, which KVM
+/// follows: the filesystem maps the window's pages there, and serves the
+/// faults KVM takes on the rest.
 #[cfg(target_os = "linux")]
-fn dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
-    let size = shm_region.size;
+fn dax_window(fs: &Filesystem, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
+    let base = std::ptr::NonNull::new(shm_region.host_addr as *mut u8)
+        .ok_or_else(|| io::Error::other("the DAX window has no host memory"))?;
     // SAFETY: The region's host memory is the device's, which only the guest
-    // accesses.
-    let second_stage = unsafe { fxdax::UffdSecondStage::new(shm_region.host_addr as usize, size) }
-        .map_err(|err| dax_error("taking over the DAX window's memory", err))?;
-    let window = vfs
-        .create_dax_window(size as u64, Some(second_stage.clone()))
-        .map_err(|err| dax_error("creating the DAX window", err))?;
-    second_stage
-        .serve(window)
-        .map_err(|err| dax_error("serving the DAX window's faults", err))
+    // accesses, and outlives the filesystem.
+    unsafe { fs.create_dax_window_in_host_memory(base, shm_region.size as u64) }
+        .map_err(dax_error)?;
+    Ok(())
 }
 
-/// An error setting up the DAX window in `step`.
-fn dax_error(step: &str, err: fxdax::Error) -> io::Error {
-    io::Error::other(format!("{step}: {err}"))
+/// An error creating the DAX window.
+fn dax_error(err: fxdax::Error) -> io::Error {
+    io::Error::other(format!("creating the DAX window: {err:#}"))
 }
 
-/// Creates `vfs`'s DAX window as the guest memory of `shm_region`, which HVF
+/// Creates `fs`'s DAX window as the guest memory of `shm_region`, which HVF
 /// demand pages: the guest's faults there go to the window, and the kernel
 /// maps the window's pages into the guest's memory as it maps them into the
 /// window's host memory.
 #[cfg(target_os = "macos")]
-fn dax_window(vfs: &Vfs, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
+fn dax_window(fs: &Filesystem, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
     let guest_addr = shm_region.guest_addr;
     let size = shm_region.size as u64;
-    let window = vfs
+    let window = fs
         .create_dax_window(
             size,
             Some(std::sync::Arc::new(HvfSecondStage { guest_addr })),
         )
-        .map_err(|err| dax_error("creating the DAX window", err))?;
+        .map_err(dax_error)?;
     hvf::DemandPagedRegion::new(
         guest_addr,
         size,
-        std::sync::Arc::new(move |offset, write| window.fault(offset, write).is_ok()),
+        std::sync::Arc::new(move |offset, write| {
+            let access = if write {
+                fxdax::Access::Write
+            } else {
+                fxdax::Access::Read
+            };
+            window.fault(offset, access).is_ok()
+        }),
     )
     .map_err(|err| io::Error::other(format!("demand paging the DAX window: {err}")))
 }
@@ -683,38 +709,36 @@ struct HvfSecondStage {
 
 #[cfg(target_os = "macos")]
 impl HvfSecondStage {
-    /// HVF memory flags for host protection `prot`. The guest may execute
-    /// what it may read, such as programs on the filesystem.
-    fn flags(prot: libc::c_int) -> hvf::bindings::hv_memory_flags_t {
+    /// HVF memory flags for `protection`. The guest may execute what it may
+    /// read, such as programs on the filesystem.
+    fn flags(protection: Protection) -> hvf::bindings::hv_memory_flags_t {
         use hvf::bindings::{HV_MEMORY_EXEC, HV_MEMORY_READ, HV_MEMORY_WRITE};
-        let mut flags = 0;
-        if prot & libc::PROT_READ != 0 {
-            flags |= HV_MEMORY_READ | HV_MEMORY_EXEC;
-        }
-        if prot & libc::PROT_WRITE != 0 {
-            flags |= HV_MEMORY_WRITE;
-        }
+        let flags = match protection {
+            Protection::None => 0,
+            Protection::Read => HV_MEMORY_READ | HV_MEMORY_EXEC,
+            Protection::ReadWrite => HV_MEMORY_READ | HV_MEMORY_EXEC | HV_MEMORY_WRITE,
+        };
         flags.into()
     }
 }
 
 #[cfg(target_os = "macos")]
 impl fxdax::SecondStage for HvfSecondStage {
-    fn map(&self, vaddr: usize, host_addr: usize, len: usize, prot: libc::c_int) {
-        let guest_addr = self.guest_addr + vaddr as u64;
-        hvf::map_guest_memory(host_addr as u64, guest_addr, len as u64, Self::flags(prot))
+    fn map(&self, offset: u64, host_addr: *mut u8, len: u64, protection: Protection) {
+        let guest_addr = self.guest_addr + offset;
+        hvf::map_guest_memory(host_addr as u64, guest_addr, len, Self::flags(protection))
             .unwrap_or_else(|err| panic!("mapping DAX window memory at {guest_addr:#x}: {err}"));
     }
 
-    fn protect(&self, vaddr: usize, len: usize, prot: libc::c_int) {
-        let guest_addr = self.guest_addr + vaddr as u64;
-        hvf::protect_guest_memory(guest_addr, len as u64, Self::flags(prot))
+    fn protect(&self, offset: u64, len: u64, protection: Protection) {
+        let guest_addr = self.guest_addr + offset;
+        hvf::protect_guest_memory(guest_addr, len, Self::flags(protection))
             .unwrap_or_else(|err| panic!("protecting DAX window memory at {guest_addr:#x}: {err}"));
     }
 
-    fn unmap(&self, vaddr: usize, len: usize) {
-        let guest_addr = self.guest_addr + vaddr as u64;
-        hvf::unmap_guest_memory(guest_addr, len as u64)
+    fn unmap(&self, offset: u64, len: u64) {
+        let guest_addr = self.guest_addr + offset;
+        hvf::unmap_guest_memory(guest_addr, len)
             .unwrap_or_else(|err| panic!("unmapping DAX window memory at {guest_addr:#x}: {err}"));
     }
 }

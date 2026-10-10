@@ -943,6 +943,7 @@ name = "fxdax"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags 2.13.2",
  "fidl",
  "fidl-fuchsia-fs-startup",
  "fidl-fuchsia-io",

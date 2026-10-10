@@ -33,8 +33,7 @@ mod host {
 
     use crate::common::setup_rootfs;
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use fxdax::Vfs;
-    use fxdax::vfs::{Attr, Creds, ROOT_INO};
+    use fxdax::{Attr, Filesystem, Inode, Owner, Storage};
     use krun_sys::*;
     use nix::libc;
     use std::ffi::CString;
@@ -57,36 +56,34 @@ mod host {
     }
 
     fn create_image(path: &Path) -> anyhow::Result<()> {
-        std::fs::File::create(path)?.set_len(IMAGE_SIZE)?;
-        let vfs = Vfs::format_image(path)?;
-        let creds = Creds { uid: 0, gid: 0 };
-        let file = vfs.create(creds, ROOT_INO, b"from-host", 0o644)?;
-        vfs.write(file.ino, 0, HOST_CONTENT)?;
-        vfs.close()?;
+        let fs = Filesystem::format(Storage::create(path, IMAGE_SIZE)?)?;
+        let owner = Owner { uid: 0, gid: 0 };
+        let file = fs.create(Inode::ROOT, b"from-host", 0o644, owner)?;
+        fs.write(file.inode, 0, HOST_CONTENT)?;
+        fs.close()?;
         Ok(())
     }
 
     /// Checks the image at `path`, and serves it.
-    fn open_image(path: &Path) -> Vfs {
-        let vfs = Vfs::mount_image(path).expect("mount image");
-        Vfs::fsck(vfs.close().expect("close image")).expect("check image");
-        Vfs::mount_image(path).expect("mount image")
+    fn open_image(path: &Path) -> Filesystem {
+        let storage = Storage::open(path).expect("open image");
+        Filesystem::mount(storage.check().expect("check image")).expect("mount image")
     }
 
-    fn lookup_path(vfs: &Vfs, path: &str) -> Attr {
-        let mut attr = vfs.getattr(ROOT_INO).unwrap();
+    fn lookup_path(fs: &Filesystem, path: &str) -> Attr {
+        let mut attr = fs.getattr(Inode::ROOT).unwrap();
         for name in path.split('/') {
-            attr = vfs
-                .lookup(attr.ino, name.as_bytes())
+            attr = fs
+                .lookup(attr.inode, name.as_bytes())
                 .unwrap_or_else(|err| panic!("host: lookup {path}: {err}"));
         }
         attr
     }
 
-    fn read_path(vfs: &Vfs, path: &str) -> Vec<u8> {
-        let attr = lookup_path(vfs, path);
+    fn read_path(fs: &Filesystem, path: &str) -> Vec<u8> {
+        let attr = lookup_path(fs, path);
         let mut buf = vec![0; attr.size as usize];
-        let count = vfs.read(attr.ino, 0, &mut buf).unwrap();
+        let count = fs.read(attr.inode, 0, &mut buf).unwrap();
         buf.truncate(count);
         buf
     }
@@ -147,9 +144,9 @@ mod host {
                 return TestOutcome::Fail(format!("expected exactly \"OK\\n\", got {output:?}"));
             }
 
-            let vfs = open_image(&test_setup.tmp_dir.join("fxdax.img"));
+            let fs = open_image(&test_setup.tmp_dir.join("fxdax.img"));
 
-            let mapped = read_path(&vfs, "dax-mapped");
+            let mapped = read_path(&fs, "dax-mapped");
             assert_eq!(mapped.len(), MAPPED_SIZE, "host: dax-mapped size");
             for (offset, &byte) in mapped.iter().enumerate() {
                 let expected = if (CHUNK..CHUNK + WRITTEN.len()).contains(&offset) {
@@ -160,18 +157,18 @@ mod host {
                 assert_eq!(byte, expected, "host: dax-mapped byte {offset}");
             }
 
-            assert_eq!(read_path(&vfs, "written"), WRITTEN);
-            assert_eq!(read_path(&vfs, "dir/renamed"), b"renamed");
-            assert_eq!(lookup_path(&vfs, "dir/renamed").nlink, 2);
-            assert_eq!(read_path(&vfs, "dir/link"), b"renamed");
+            assert_eq!(read_path(&fs, "written"), WRITTEN);
+            assert_eq!(read_path(&fs, "dir/renamed"), b"renamed");
+            assert_eq!(lookup_path(&fs, "dir/renamed").nlink, 2);
+            assert_eq!(read_path(&fs, "dir/link"), b"renamed");
             assert_eq!(
-                vfs.readlink(lookup_path(&vfs, "sym").ino).unwrap(),
+                fs.readlink(lookup_path(&fs, "sym").inode).unwrap(),
                 b"written"
             );
-            assert_eq!(read_path(&vfs, "truncated"), vec![b't'; 100]);
-            assert!(vfs.lookup(ROOT_INO, b"unlinked").is_err());
+            assert_eq!(read_path(&fs, "truncated"), vec![b't'; 100]);
+            assert!(fs.lookup(Inode::ROOT, b"unlinked").is_err());
             // Never fsynced: only removing the mapping wrote it back
-            assert_eq!(read_path(&vfs, "evicted"), EVICTED);
+            assert_eq!(read_path(&fs, "evicted"), EVICTED);
 
             TestOutcome::Pass
         }

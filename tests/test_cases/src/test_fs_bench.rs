@@ -503,7 +503,9 @@ mod guest {
         drop_caches();
         let job = fio(&["--rw=read", "--bs=1M"]);
         result("seq-read-cold", "MiB/s", true, job.read_bytes_per_sec / MIB);
-        let job = fio(&["--rw=read", "--bs=1M"]);
+        // A warm read of the file takes milliseconds, which fio's runtimes would quantize, so
+        // it reads for a while.
+        let job = fio(&["--rw=read", "--bs=1M", "--time_based", RUNTIME]);
         result("seq-read-warm", "MiB/s", true, job.read_bytes_per_sec / MIB);
         let job = fio(&["--rw=randread", "--bs=4k", "--time_based", RUNTIME]);
         result("rand-read-warm", "IOPS", true, job.read_iops);

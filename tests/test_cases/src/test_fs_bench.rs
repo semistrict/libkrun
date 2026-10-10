@@ -13,8 +13,9 @@
 // of the groups of workloads: io, metadata and build, separated by commas. With
 // FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
 // JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
-// FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory;
-// set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each second of the run,
+// FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory,
+// or with `record:EVENTS` records the events, such as the scheduler's tracepoints, with stacks;
+// set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each 100 ms of the run,
 // into the case's log, where they line up with the guest's results.
 
 use macros::{guest, host};
@@ -273,11 +274,20 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 use std::os::unix::process::CommandExt;
                 let mut command = std::process::Command::new("perf");
                 match perf.strip_prefix("stat:") {
-                    Some(events) => command.args(["stat", "-I", "1000", "-e", events]),
-                    None if perf == "record" => command
-                        .args(["record", "-g", "-F", "999", "-o"])
-                        .arg(test_setup.tmp_dir.join("perf.data")),
-                    None => anyhow::bail!("FXDAX_BENCH_PERF is record or stat:EVENTS"),
+                    Some(events) => command.args(["stat", "-I", "100", "-e", events]),
+                    None => {
+                        let record = match perf.strip_prefix("record:") {
+                            Some(events) => vec!["record", "-g", "-e", events],
+                            None if perf == "record" => vec!["record", "-g", "-F", "999"],
+                            None => anyhow::bail!(
+                                "FXDAX_BENCH_PERF is record, record:EVENTS or stat:EVENTS"
+                            ),
+                        };
+                        command
+                            .args(record)
+                            .arg("-o")
+                            .arg(test_setup.tmp_dir.join("perf.data"))
+                    }
                 };
                 let error = command
                     .arg("--")

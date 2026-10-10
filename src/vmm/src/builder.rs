@@ -29,7 +29,7 @@ use crate::resources::{
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
-use crate::vmm_config::pmem::{build_pmem_regions, PmemRegionConfig};
+use crate::vmm_config::pmem::{PmemRegionConfig, build_pmem_regions};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
@@ -222,6 +222,9 @@ pub enum StartMicrovmError {
     ShmCreate(device_manager::shm::Error),
     /// Error obtaining the host address of an SHM region.
     ShmHostAddr(vm_memory::GuestMemoryError),
+    /// Cannot create the vCPU that maps fxdax's DAX windows for the guest.
+    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+    FxdaxPrefault(io::Error),
     /// The TEE specified is not supported.
     InvalidTee,
 }
@@ -498,6 +501,11 @@ impl Display for StartMicrovmError {
                     "Error obtaining the host address of an SHM region. {err_msg}"
                 )
             }
+            #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+            FxdaxPrefault(ref err) => write!(
+                f,
+                "Cannot create the vCPU that maps fxdax's DAX windows for the guest. {err}"
+            ),
             ShmConfig(ref err) => {
                 let mut err_msg = format!("{err:?}");
                 err_msg = err_msg.replace('\"', "");
@@ -591,7 +599,7 @@ pub fn build_microvm(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(snap_path) = &vm_resources.snapshot_restore_path {
         use crate::macos::snapshot::{
-            container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img, SectionId,
+            SectionId, container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img,
         };
         crate::timing_event("build_microvm.snapshot.reader.open.begin");
         let reader = SnapshotReader::open(snap_path)
@@ -1132,6 +1140,8 @@ pub fn build_microvm(
         exit_code,
         #[cfg(target_os = "macos")]
         _sender,
+        #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+        vm_resources.vm_config().vcpu_count.unwrap(),
     )?;
     crate::timing_event("build_microvm.fs.attached");
     #[cfg(feature = "blk")]
@@ -2320,8 +2330,14 @@ fn attach_fs_devices(
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))] vcpu_count: u8,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
+
+    // fxdax's DAX windows have KVM map their pages for the guest as they map
+    // them, with a vCPU of their own, whose id follows the guest's vCPUs'.
+    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+    let mut prefault: Option<Option<Arc<crate::linux::prefault::KvmPrefault>>> = None;
 
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
@@ -2346,6 +2362,25 @@ fn attach_fs_devices(
                 guest_addr: shm_region.guest_addr.raw_value(),
                 size: shm_region.size,
             });
+            #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+            if matches!(
+                config.source,
+                FsSource::FxdaxImage(_) | FsSource::FxdaxVolume { .. }
+            ) {
+                let prefault = match &prefault {
+                    Some(prefault) => prefault.clone(),
+                    None => prefault
+                        .insert(
+                            crate::linux::prefault::KvmPrefault::new(&vmm.vm, vcpu_count.into())
+                                .map_err(FxdaxPrefault)?
+                                .map(Arc::new),
+                        )
+                        .clone(),
+                };
+                if let Some(prefault) = prefault {
+                    fs.lock().unwrap().set_prefault(prefault);
+                }
+            }
         }
 
         #[cfg(not(feature = "tee"))]

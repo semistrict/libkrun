@@ -33,6 +33,8 @@ use super::descriptor_utils;
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::{Fs, FsBackend};
 pub use self::filesystem::ExportTable;
+#[cfg(all(feature = "fxdax", target_os = "linux"))]
+pub use self::fxdax::PrefaultGuestMemory;
 
 mod defs {
     use super::super::QueueConfig;

@@ -191,6 +191,9 @@ impl FsWorker {
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
+        #[cfg(all(feature = "fxdax", target_os = "linux"))] prefault: Option<
+            Arc<dyn super::PrefaultGuestMemory>,
+        >,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match backend {
@@ -235,6 +238,8 @@ impl FsWorker {
                     &image,
                     volume.as_deref(),
                     shm_region.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    prefault,
                 )?)
             }
         };

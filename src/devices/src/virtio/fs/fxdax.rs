@@ -20,7 +20,9 @@
 //   to the window, and the kernel maps the window's pages into HVF's stage 2.
 // - On Linux, KVM follows the region's host memory, which the filesystem takes
 //   over: it maps the window's pages there, and serves the faults KVM takes
-//   there itself.
+//   there itself. KVM would map each page for the guest on a fault of the
+//   guest's, which nested virtualization makes slow: given a
+//   `PrefaultGuestMemory`, the window has KVM map the pages as it maps them.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -86,11 +88,13 @@ type DaxFaults = ();
 
 impl FxdaxServer {
     /// Opens the fxdax image at `image`, and serves the filesystem on it, or
-    /// its volume `volume`, serving DAX mappings in `shm_region`.
+    /// its volume `volume`, serving DAX mappings in `shm_region`, which
+    /// `prefault`, if any, maps for the guest ahead of its accesses.
     pub fn open(
         image: &Path,
         volume: Option<&str>,
         shm_region: Option<&VirtioShmRegion>,
+        #[cfg(target_os = "linux")] prefault: Option<Arc<dyn PrefaultGuestMemory>>,
     ) -> io::Result<Self> {
         let (fs, _image) = match volume {
             None => {
@@ -116,7 +120,14 @@ impl FxdaxServer {
             }
         };
         let _dax_faults = shm_region
-            .map(|shm_region| dax_window(&fs, shm_region))
+            .map(|shm_region| {
+                dax_window(
+                    &fs,
+                    shm_region,
+                    #[cfg(target_os = "linux")]
+                    prefault,
+                )
+            })
             .transpose()?;
         Ok(Self {
             server: Server::new(fs),
@@ -183,16 +194,50 @@ fn buffers<'m>(
     Ok((readable, writable))
 }
 
+/// Maps guest memory for the guest ahead of its accesses, as KVM's
+/// `KVM_PRE_FAULT_MEMORY` does, rather than on a fault on each page.
+#[cfg(target_os = "linux")]
+pub trait PrefaultGuestMemory: Send + Sync {
+    /// Maps the `len` bytes of guest memory at `guest_addr`, which the host
+    /// has mapped, for the guest. It must not wait for the guest.
+    fn prefault(&self, guest_addr: u64, len: u64);
+}
+
+/// Has `prefault` map the pages the window maps, at its guest address.
+#[cfg(target_os = "linux")]
+struct WindowPrefault {
+    guest_addr: u64,
+    prefault: Arc<dyn PrefaultGuestMemory>,
+}
+
+#[cfg(target_os = "linux")]
+impl fxdax::Prefault for WindowPrefault {
+    fn prefault(&self, offset: u64, len: u64) {
+        self.prefault.prefault(self.guest_addr + offset, len);
+    }
+}
+
 /// Creates `fs`'s DAX window in the host memory of `shm_region`, which KVM
 /// follows: the filesystem maps the window's pages there, and serves the
-/// faults KVM takes on the rest.
+/// faults KVM takes on the rest. With `prefault`, KVM maps the pages for the
+/// guest as the window maps them.
 #[cfg(target_os = "linux")]
-fn dax_window(fs: &Filesystem, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
+fn dax_window(
+    fs: &Filesystem,
+    shm_region: &VirtioShmRegion,
+    prefault: Option<Arc<dyn PrefaultGuestMemory>>,
+) -> io::Result<DaxFaults> {
     let base = std::ptr::NonNull::new(shm_region.host_addr as *mut u8)
         .ok_or_else(|| io::Error::other("the DAX window has no host memory"))?;
+    let prefault = prefault.map(|prefault| -> Arc<dyn fxdax::Prefault> {
+        Arc::new(WindowPrefault {
+            guest_addr: shm_region.guest_addr,
+            prefault,
+        })
+    });
     // SAFETY: The region's host memory is the device's, which only the guest
     // accesses, and outlives the filesystem.
-    unsafe { fs.create_dax_window_in_host_memory(base, shm_region.size as u64) }
+    unsafe { fs.create_dax_window_in_host_memory(base, shm_region.size as u64, prefault) }
         .map_err(dax_error)?;
     Ok(())
 }

@@ -76,6 +76,9 @@ pub struct Fs {
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
+    /// Maps the DAX window's pages for the guest as fxdax maps them.
+    #[cfg(all(feature = "fxdax", target_os = "linux"))]
+    prefault: Option<Arc<dyn super::PrefaultGuestMemory>>,
 }
 
 impl Fs {
@@ -109,6 +112,8 @@ impl Fs {
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
+            #[cfg(all(feature = "fxdax", target_os = "linux"))]
+            prefault: None,
         })
     }
 
@@ -132,6 +137,13 @@ impl Fs {
         cfg.export_table = Some(export_table);
 
         cfg.export_fsid
+    }
+
+    /// Has `prefault` map the DAX window's pages for the guest as an fxdax
+    /// backend maps them, rather than the guest faulting on each.
+    #[cfg(all(feature = "fxdax", target_os = "linux"))]
+    pub fn set_prefault(&mut self, prefault: Arc<dyn super::PrefaultGuestMemory>) {
+        self.prefault = Some(prefault);
     }
 
     #[cfg(target_os = "macos")]
@@ -219,6 +231,8 @@ impl VirtioDevice for Fs {
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
+            #[cfg(all(feature = "fxdax", target_os = "linux"))]
+            self.prefault.clone(),
         )
         .map_err(|e| {
             error!("virtio_fs: failed to create worker: {}", e);

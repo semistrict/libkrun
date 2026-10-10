@@ -9,9 +9,11 @@
 // and iteration, and the host reports their medians and spread. The workloads are sized for an
 // iteration of each case to take well under a minute.
 //
-// The cases only run when FXDAX_BENCH_ITERATIONS is set. With FXDAX_BENCH_RESULTS set to a
-// directory, the host also writes each case's measurements there as JSON, which
-// scripts/bench-report.py turns into tables comparing the filesystems.
+// The cases only run when FXDAX_BENCH_ITERATIONS is set. FXDAX_BENCH_GROUPS limits them to some
+// of the groups of workloads: io, metadata and build, separated by commas. With
+// FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
+// JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
+// FXDAX_BENCH_PERF set, perf profiles each case's VMM into perf.data in its directory.
 
 use macros::{guest, host};
 
@@ -256,6 +258,27 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 "FXDAX_BENCH_ITERATIONS={}",
                 iterations().unwrap_or(1)
             ))?;
+            let groups = CString::new(format!(
+                "FXDAX_BENCH_GROUPS={}",
+                std::env::var("FXDAX_BENCH_GROUPS").unwrap_or_default()
+            ))?;
+
+            // With FXDAX_BENCH_PERF set, this process, which becomes the VMM, runs again under
+            // perf, which samples all its threads, its vCPUs', its devices' and fxdax's.
+            if std::env::var_os("FXDAX_BENCH_PERF").is_some_and(|perf| !perf.is_empty())
+                && std::env::var_os("FXDAX_BENCH_PERF_RUNNING").is_none()
+            {
+                use std::os::unix::process::CommandExt;
+                let error = std::process::Command::new("perf")
+                    .args(["record", "-g", "-F", "999", "-o"])
+                    .arg(test_setup.tmp_dir.join("perf.data"))
+                    .arg("--")
+                    .arg(std::env::current_exe()?)
+                    .args(std::env::args_os().skip(1))
+                    .env("FXDAX_BENCH_PERF_RUNNING", "1")
+                    .exec();
+                return Err(error.into());
+            }
 
             unsafe {
                 // Warnings only, whatever RUST_LOG says: logging every request costs time.
@@ -314,6 +337,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 // The compiler finds the assembler and linker through PATH.
                 let envp = [
                     iterations.as_ptr(),
+                    groups.as_ptr(),
                     c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_ptr(),
                     c"HOME=/root".as_ptr(),
                     null(),
@@ -617,13 +641,19 @@ mod guest {
                 .ok()
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(1);
+            let groups = std::env::var("FXDAX_BENCH_GROUPS").unwrap_or_default();
+            let runs = |group: &str| groups.is_empty() || groups.split(',').any(|g| g == group);
             for i in 0..iterations {
                 eprintln!("iteration {}/{iterations}", i + 1);
                 observe_mtime();
-                io_workloads();
-                metadata_workloads();
+                if runs("io") {
+                    io_workloads();
+                }
+                if runs("metadata") {
+                    metadata_workloads();
+                }
                 // A failed build is recorded, and the other iterations still run.
-                if std::panic::catch_unwind(build_workload).is_err() {
+                if runs("build") && std::panic::catch_unwind(build_workload).is_err() {
                     println!("FAILED build");
                     run("rm", &["-rf", &format!("{MNT}/build")]);
                 }

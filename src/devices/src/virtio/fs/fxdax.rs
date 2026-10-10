@@ -4,6 +4,11 @@
 // server each descriptor chain as the chain's readable and writable buffers,
 // as volatile slices of guest memory, which it only copies into and out of.
 //
+// The device's loop runs on the filesystem's own threads, where Fxfs runs: a
+// request the guest notifies wakes that thread, which handles it, and its
+// work for Fxfs completes there, without waking another thread
+// (`FsWorker::serve_fxdax`). Requests are handled concurrently.
+//
 // A device serves the filesystem on an image, or one of its volumes: devices
 // serving volumes of the same image share it, mounted once, until the last of
 // them is dropped.
@@ -120,8 +125,14 @@ impl FxdaxServer {
         })
     }
 
+    /// What runs the device's loop on the filesystem's own threads (see
+    /// `FsWorker::serve_fxdax`).
+    pub fn spawner(&self) -> fxdax::Spawner {
+        self.server.filesystem().spawner()
+    }
+
     /// Handles the request in `chain`, and returns the length of its reply.
-    pub fn handle_chain(&self, mem: &GuestMemoryMmap, chain: DescriptorChain) -> usize {
+    pub async fn handle(&self, mem: &GuestMemoryMmap, chain: DescriptorChain<'_>) -> usize {
         let (request, mut reply) = match buffers(mem, chain) {
             Ok(buffers) => buffers,
             Err(err) => {
@@ -129,10 +140,13 @@ impl FxdaxServer {
                 return 0;
             }
         };
-        block_on(self.server.handle(&request, &mut reply)).unwrap_or_else(|err| {
-            error!("fxdax: {err:#}");
-            0
-        })
+        self.server
+            .handle(&request, &mut reply)
+            .await
+            .unwrap_or_else(|err| {
+                error!("fxdax: {err:#}");
+                0
+            })
     }
 }
 

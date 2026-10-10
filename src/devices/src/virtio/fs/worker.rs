@@ -117,11 +117,6 @@ impl FsServer {
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> usize {
-        // fxdax decodes requests itself, from the chain's buffers.
-        #[cfg(feature = "fxdax")]
-        if let FsServer::Fxdax(server) = self {
-            return server.handle_chain(mem, head);
-        }
         let r = Reader::new(mem, head.clone())
             .map_err(FsError::QueueReader)
             .unwrap();
@@ -154,7 +149,7 @@ impl FsServer {
                 map_sender,
             ),
             #[cfg(feature = "fxdax")]
-            FsServer::Fxdax(_) => unreachable!("fxdax handles its chains above"),
+            FsServer::Fxdax(_) => unreachable!("fxdax serves its queues itself"),
         };
         result.unwrap_or_else(|e| {
             error!("error handling message: {e:?}");
@@ -284,6 +279,20 @@ impl FsWorker {
     }
 
     pub fn run(self) -> thread::JoinHandle<FsWorkerStopResult> {
+        #[cfg(feature = "fxdax")]
+        if let FsServer::Fxdax(server) = &self.server {
+            // The loop runs on the filesystem's threads, and this thread only
+            // waits for it to stop.
+            let spawner = server.spawner();
+            let (stopped, stop) = std::sync::mpsc::sync_channel(1);
+            spawner.spawn(async move {
+                let _ = stopped.send(self.serve_fxdax().await);
+            });
+            return thread::Builder::new()
+                .name("fs worker".into())
+                .spawn(move || stop.recv().expect("the fxdax device's loop panicked"))
+                .unwrap();
+        }
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
@@ -348,6 +357,94 @@ impl FsWorker {
                     debug!("failed to consume muxer epoll event: {e}");
                 }
             }
+        }
+    }
+
+    /// Serves the queues on fxdax's own threads, until the stop event: a
+    /// queue's event wakes the thread that also runs Fxfs's work for the
+    /// requests, which it handles concurrently, completing each as it finishes.
+    #[cfg(feature = "fxdax")]
+    async fn serve_fxdax(self) -> FsWorkerStopResult {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use futures::{FutureExt, select_biased};
+        use tokio::io::unix::AsyncFd;
+
+        let FsWorker {
+            mut queues,
+            queue_evts,
+            interrupt,
+            mem,
+            server,
+            stop_fd,
+            ..
+        } = self;
+        let FsServer::Fxdax(fxdax) = &server else {
+            unreachable!()
+        };
+        let events = [HPQ_INDEX, REQ_INDEX]
+            .map(|index| AsyncFd::new(queue_evts[index].as_raw_fd()).expect("watch a queue"));
+        let stop = AsyncFd::new(stop_fd.as_raw_fd()).expect("watch the stop event");
+        let mut requests = FuturesUnordered::new();
+        loop {
+            // Take every request the queues have, as process_queue does.
+            for index in [HPQ_INDEX, REQ_INDEX] {
+                let queue = &mut queues[index];
+                loop {
+                    queue.disable_notification(&mem).unwrap();
+                    while let Some(head) = queue.pop(&mem) {
+                        let head_index = head.index;
+                        let mem = &mem;
+                        requests.push(
+                            async move { (index, head_index, fxdax.handle(mem, head).await) },
+                        );
+                    }
+                    if !queue.enable_notification(&mem).unwrap() {
+                        break;
+                    }
+                }
+            }
+            select_biased! {
+                (index, head_index, len) = requests.select_next_some() => {
+                    let queue = &mut queues[index];
+                    if let Err(e) = queue.add_used(&mem, head_index, len as u32) {
+                        error!("failed to add used elements to the queue: {e:?}");
+                    }
+                    if queue.needs_notification(&mem).unwrap() {
+                        interrupt.signal_used_queue();
+                    }
+                }
+                guard = events[HPQ_INDEX].readable().fuse() => {
+                    let _ = queue_evts[HPQ_INDEX].read();
+                    guard.expect("a queue's event").clear_ready();
+                }
+                guard = events[REQ_INDEX].readable().fuse() => {
+                    let _ = queue_evts[REQ_INDEX].read();
+                    guard.expect("a queue's event").clear_ready();
+                }
+                guard = stop.readable().fuse() => {
+                    debug!("stopping the fxdax device's loop");
+                    let _ = stop_fd.read();
+                    guard.expect("the stop event").clear_ready();
+                    break;
+                }
+            }
+        }
+        // The requests in flight complete before the device stops.
+        while let Some((index, head_index, len)) = requests.next().await {
+            let queue = &mut queues[index];
+            if let Err(e) = queue.add_used(&mem, head_index, len as u32) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+            if queue.needs_notification(&mem).unwrap() {
+                interrupt.signal_used_queue();
+            }
+        }
+        drop(requests);
+        drop((events, stop));
+        FsWorkerStopResult {
+            queues,
+            queue_evts,
+            server,
         }
     }
 

@@ -13,7 +13,9 @@
 // of the groups of workloads: io, metadata and build, separated by commas. With
 // FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
 // JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
-// FXDAX_BENCH_PERF set, perf profiles each case's VMM into perf.data in its directory.
+// FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory;
+// set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each second of the run,
+// into the case's log, where they line up with the guest's results.
 
 use macros::{guest, host};
 
@@ -264,14 +266,20 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             ))?;
 
             // With FXDAX_BENCH_PERF set, this process, which becomes the VMM, runs again under
-            // perf, which samples all its threads, its vCPUs', its devices' and fxdax's.
-            if std::env::var_os("FXDAX_BENCH_PERF").is_some_and(|perf| !perf.is_empty())
-                && std::env::var_os("FXDAX_BENCH_PERF_RUNNING").is_none()
-            {
+            // perf, which samples all its threads, its vCPUs', its devices' and fxdax's, or counts
+            // events.
+            let perf = std::env::var("FXDAX_BENCH_PERF").unwrap_or_default();
+            if !perf.is_empty() && std::env::var_os("FXDAX_BENCH_PERF_RUNNING").is_none() {
                 use std::os::unix::process::CommandExt;
-                let error = std::process::Command::new("perf")
-                    .args(["record", "-g", "-F", "999", "-o"])
-                    .arg(test_setup.tmp_dir.join("perf.data"))
+                let mut command = std::process::Command::new("perf");
+                match perf.strip_prefix("stat:") {
+                    Some(events) => command.args(["stat", "-I", "1000", "-e", events]),
+                    None if perf == "record" => command
+                        .args(["record", "-g", "-F", "999", "-o"])
+                        .arg(test_setup.tmp_dir.join("perf.data")),
+                    None => anyhow::bail!("FXDAX_BENCH_PERF is record or stat:EVENTS"),
+                };
+                let error = command
                     .arg("--")
                     .arg(std::env::current_exe()?)
                     .args(std::env::args_os().skip(1))

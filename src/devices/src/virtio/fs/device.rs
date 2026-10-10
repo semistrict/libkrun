@@ -33,9 +33,14 @@ pub enum FsBackend {
     Null,
     /// A host directory, passed through.
     Passthrough(passthrough::Config),
-    /// An fxdax (Fxfs) image file, with DAX support.
+    /// An fxdax (Fxfs) image file, with DAX support: the filesystem on it,
+    /// or one of its volumes, which devices serving volumes of the same image
+    /// share it.
     #[cfg(feature = "fxdax")]
-    Fxdax(std::path::PathBuf),
+    Fxdax {
+        image: std::path::PathBuf,
+        volume: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone)]

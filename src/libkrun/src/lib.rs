@@ -748,17 +748,58 @@ pub unsafe extern "C" fn krun_add_virtiofs_fxdax(
     c_image_path: *const c_char,
     shm_size: u64,
 ) -> i32 {
-    if c_tag.is_null() || c_image_path.is_null() {
+    if c_image_path.is_null() {
         return -libc::EINVAL;
     }
-    let (tag, image_path) = unsafe {
+    let Ok(image_path) = (unsafe { CStr::from_ptr(c_image_path) }).to_str() else {
+        return -libc::EINVAL;
+    };
+    add_fxdax_device(
+        ctx_id,
+        c_tag,
+        FsSource::FxdaxImage(image_path.to_string()),
+        shm_size,
+    )
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub unsafe extern "C" fn krun_add_virtiofs_fxdax_volume(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_image_path: *const c_char,
+    c_volume: *const c_char,
+    shm_size: u64,
+) -> i32 {
+    if c_image_path.is_null() || c_volume.is_null() {
+        return -libc::EINVAL;
+    }
+    let (image, volume) = unsafe {
         match (
-            CStr::from_ptr(c_tag).to_str(),
             CStr::from_ptr(c_image_path).to_str(),
+            CStr::from_ptr(c_volume).to_str(),
         ) {
-            (Ok(tag), Ok(image_path)) => (tag, image_path),
+            (Ok(image), Ok(volume)) if !volume.is_empty() => (image, volume),
             _ => return -libc::EINVAL,
         }
+    };
+    let source = FsSource::FxdaxVolume {
+        image: image.to_string(),
+        volume: volume.to_string(),
+    };
+    add_fxdax_device(ctx_id, c_tag, source, shm_size)
+}
+
+/// Adds a virtio-fs device tagged `c_tag` serving the fxdax `source`, with a
+/// DAX window of `shm_size` bytes, or none if it is 0.
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+fn add_fxdax_device(ctx_id: u32, c_tag: *const c_char, source: FsSource, shm_size: u64) -> i32 {
+    if c_tag.is_null() {
+        return -libc::EINVAL;
+    }
+    let Ok(tag) = (unsafe { CStr::from_ptr(c_tag) }).to_str() else {
+        return -libc::EINVAL;
     };
     let shm_size = match shm_size {
         0 => None,
@@ -777,7 +818,7 @@ pub unsafe extern "C" fn krun_add_virtiofs_fxdax(
             }
             cfg.vmr.add_fs_device(FsDeviceConfig {
                 fs_id: tag.to_string(),
-                source: FsSource::FxdaxImage(image_path.to_string()),
+                source,
                 shm_size,
                 read_only: false,
                 virtual_entries,

@@ -2299,7 +2299,15 @@ fn fs_backend(source: &FsSource) -> devices::virtio::FsBackend {
             })
         }
         #[cfg(feature = "fxdax")]
-        FsSource::FxdaxImage(image) => FsBackend::Fxdax(image.into()),
+        FsSource::FxdaxImage(image) => FsBackend::Fxdax {
+            image: image.into(),
+            volume: None,
+        },
+        #[cfg(feature = "fxdax")]
+        FsSource::FxdaxVolume { image, volume } => FsBackend::Fxdax {
+            image: image.into(),
+            volume: Some(volume.clone()),
+        },
     }
 }
 

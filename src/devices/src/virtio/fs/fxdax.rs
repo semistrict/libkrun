@@ -4,6 +4,10 @@
 // server each descriptor chain as the chain's readable and writable buffers,
 // as volatile slices of guest memory, which it only copies into and out of.
 //
+// A device serves the filesystem on an image, or one of its volumes: devices
+// serving volumes of the same image share it, mounted once, until the last of
+// them is dropped.
+//
 // DAX mappings map files' pages into the filesystem's DAX window, whose pages
 // the kernel maps as the guest faults on them, and into the device's shared
 // memory region too:
@@ -13,15 +17,17 @@
 //   over: it maps the window's pages there, and serves the faults KVM takes
 //   there itself.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures::executor::block_on;
 #[cfg(target_os = "macos")]
 use fxdax::Protection;
 use fxdax::fuse::Server;
-use fxdax::{Filesystem, Storage, VolatileSlice, VolatileSliceMut};
+use fxdax::{Errno, Filesystem, Image, Storage, VolatileSlice, VolatileSliceMut};
 use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, VolatileMemory};
 
 use crate::virtio::VirtioShmRegion;
@@ -33,6 +39,38 @@ pub struct FxdaxServer {
     /// What passes the guest's faults on the DAX window to it, while the guest
     /// may fault on it.
     _dax_faults: Option<DaxFaults>,
+    /// The image whose volume the device serves, which it shares with the
+    /// devices serving its other volumes, and closes once they are all dropped.
+    _image: Option<Arc<Image>>,
+}
+
+/// The images whose volumes devices serve, by their canonical paths.
+static IMAGES: Mutex<BTreeMap<PathBuf, Weak<Image>>> = Mutex::new(BTreeMap::new());
+
+/// The image at `path`, mounted, which devices serving its volumes share.
+fn shared_image(path: &Path) -> io::Result<Arc<Image>> {
+    let path = path.canonicalize()?;
+    let mut images = IMAGES.lock().unwrap();
+    images.retain(|_, image| image.strong_count() > 0);
+    if let Some(image) = images.get(&path).and_then(Weak::upgrade) {
+        return Ok(image);
+    }
+    let image = Storage::open(&path)
+        .and_then(|storage| block_on(Image::mount(storage)))
+        .map(Arc::new)
+        .map_err(|err| {
+            io::Error::other(format!("mounting fxdax image {}: {err:#}", path.display()))
+        })?;
+    images.insert(path, Arc::downgrade(&image));
+    Ok(image)
+}
+
+/// The volume `name` of `image`, which is created if it doesn't exist.
+fn open_volume(image: &Image, name: &str) -> Result<Filesystem, fxdax::Error> {
+    match block_on(image.open_volume(name)) {
+        Err(err) if err.errno() == Some(Errno::ENOENT) => block_on(image.create_volume(name)),
+        result => result,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -42,19 +80,43 @@ type DaxFaults = hvf::DemandPagedRegion;
 type DaxFaults = ();
 
 impl FxdaxServer {
-    /// Opens the fxdax image at `image`, serving DAX mappings in `shm_region`.
-    pub fn open(image: &Path, shm_region: Option<&VirtioShmRegion>) -> io::Result<Self> {
-        let fs = Storage::open(image)
-            .and_then(|storage| block_on(Filesystem::mount(storage)))
-            .map_err(|err| {
-                io::Error::other(format!("mounting fxdax image {}: {err:#}", image.display()))
-            })?;
+    /// Opens the fxdax image at `image`, and serves the filesystem on it, or
+    /// its volume `volume`, serving DAX mappings in `shm_region`.
+    pub fn open(
+        image: &Path,
+        volume: Option<&str>,
+        shm_region: Option<&VirtioShmRegion>,
+    ) -> io::Result<Self> {
+        let (fs, _image) = match volume {
+            None => {
+                let fs = Storage::open(image)
+                    .and_then(|storage| block_on(Filesystem::mount(storage)))
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "mounting fxdax image {}: {err:#}",
+                            image.display()
+                        ))
+                    })?;
+                (fs, None)
+            }
+            Some(volume) => {
+                let shared = shared_image(image)?;
+                let fs = open_volume(&shared, volume).map_err(|err| {
+                    io::Error::other(format!(
+                        "mounting volume {volume} of fxdax image {}: {err:#}",
+                        image.display()
+                    ))
+                })?;
+                (fs, Some(shared))
+            }
+        };
         let _dax_faults = shm_region
             .map(|shm_region| dax_window(&fs, shm_region))
             .transpose()?;
         Ok(Self {
             server: Server::new(fs),
             _dax_faults,
+            _image,
         })
     }
 

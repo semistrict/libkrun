@@ -388,6 +388,31 @@ int32_t krun_add_virtiofs_fxdax(uint32_t ctx_id,
                                 const char *c_image_path,
                                 uint64_t shm_size);
 
+/**
+ * Adds an independent virtio-fs device serving one volume of an fxdax (Fxfs) image with a
+ * tag, creating the volume if the image has none of that name. Devices serving volumes of the
+ * same image share it: each volume is a filesystem of its own, and they share the image's
+ * journal and space. An image's filesystem, as krun_add_virtiofs_fxdax serves it, is its
+ * volume "default". With a non-zero "shm_size", the guest may map file pages directly through a
+ * DAX window (mount with "-o dax"). The image must not be used by anything else while the VM
+ * runs. Only available when libkrun is built with FXDAX=1.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_tag"          - tag to identify the filesystem in the guest.
+ *  "c_image_path"   - full path to the fxdax image in the host.
+ *  "c_volume"       - the name of the volume.
+ *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_virtiofs_fxdax_volume(uint32_t ctx_id,
+                                       const char *c_tag,
+                                       const char *c_image_path,
+                                       const char *c_volume,
+                                       uint64_t shm_size);
+
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)

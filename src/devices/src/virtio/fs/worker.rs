@@ -221,7 +221,7 @@ impl FsWorker {
                 virtual_entries,
             ))),
             #[cfg(feature = "fxdax")]
-            FsBackend::Fxdax(image) => {
+            FsBackend::Fxdax { image, volume } => {
                 if read_only {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -236,7 +236,11 @@ impl FsWorker {
                         "fxdax devices cannot have virtual entries, such as a root's implicit init",
                     ));
                 }
-                FsServer::Fxdax(FxdaxServer::open(&image, shm_region.as_ref())?)
+                FsServer::Fxdax(FxdaxServer::open(
+                    &image,
+                    volume.as_deref(),
+                    shm_region.as_ref(),
+                )?)
             }
         };
         Ok(Self {

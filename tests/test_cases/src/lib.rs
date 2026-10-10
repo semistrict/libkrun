@@ -41,6 +41,11 @@ mod test_virtiofs_fxdax;
 use test_virtiofs_fxdax::TestVirtiofsFxdax;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
+mod test_virtiofs_fxdax_volumes;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_virtiofs_fxdax_volumes::TestVirtiofsFxdaxVolumes;
+
+#[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
@@ -129,6 +134,8 @@ pub fn test_cases() -> Vec<TestCase> {
             "virtiofs-fxdax-nodax",
             Box::new(TestVirtiofsFxdax { dax: false }),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),

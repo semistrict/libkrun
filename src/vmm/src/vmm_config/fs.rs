@@ -11,6 +11,10 @@ pub enum FsSource {
     /// An fxdax (Fxfs) image file, with DAX support.
     #[cfg(feature = "fxdax")]
     FxdaxImage(String),
+    /// A volume of an fxdax (Fxfs) image file, created if it doesn't exist. Devices serving
+    /// volumes of the same image share it.
+    #[cfg(feature = "fxdax")]
+    FxdaxVolume { image: String, volume: String },
 }
 
 #[derive(Clone, Debug)]

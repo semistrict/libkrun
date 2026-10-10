@@ -13,6 +13,7 @@ pub struct TestVirtiofsFxdaxVolumes;
 const IN_A: &[u8] = b"written to volume a\n";
 const IN_B: &[u8] = b"written to volume b\n";
 /// Size of the image, which is sparse.
+#[cfg_attr(feature = "guest", allow(dead_code))]
 const IMAGE_SIZE: u64 = 256 << 20;
 
 #[host]

@@ -20,6 +20,7 @@ const HOST_CONTENT: &[u8] = b"written by the host\n";
 const WRITTEN: &[u8] = b"written through FUSE_WRITE\n";
 const EVICTED: &[u8] = b"written back when its inode is evicted\n";
 /// Size of the image, which is sparse.
+#[cfg_attr(feature = "guest", allow(dead_code))]
 const IMAGE_SIZE: u64 = 256 << 20;
 
 /// Content of the guest's mmapped file at `offset`.

@@ -46,6 +46,11 @@ mod test_virtiofs_fxdax_volumes;
 use test_virtiofs_fxdax_volumes::TestVirtiofsFxdaxVolumes;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
+mod test_fs_bench;
+#[cfg(any(feature = "host", target_os = "linux"))]
+use test_fs_bench::{Backend as BenchBackend, TestFsBench};
+
+#[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_misc;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_virtiofs_misc::TestVirtioFsMisc;
@@ -137,6 +142,34 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-fxdax-dax",
+            Box::new(TestFsBench {
+                backend: BenchBackend::FxdaxDax,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-fxdax-nodax",
+            Box::new(TestFsBench {
+                backend: BenchBackend::FxdaxNoDax,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-ext4",
+            Box::new(TestFsBench {
+                backend: BenchBackend::Ext4,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-passthrough",
+            Box::new(TestFsBench {
+                backend: BenchBackend::Passthrough,
+            }),
+        ),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
         TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),

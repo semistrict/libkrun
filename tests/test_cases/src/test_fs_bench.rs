@@ -1,0 +1,635 @@
+// Benchmark fxdax's virtio-fs device, with DAX and without, against the guest's own filesystem:
+// ext4 on a virtio-blk disk backed by a raw image file on the same host filesystem. libkrun's own
+// virtio-fs device, passing a host directory through, measures the transport they share.
+//
+// Each case boots an Alpine guest, with fio, a compiler and e2fsprogs, onto one filesystem
+// mounted at /mnt/bench, and runs the same workloads on it several times: sequential and
+// random reads and writes, cold and warm, fsync-heavy writes, I/O through mmap, metadata
+// operations on many small files, and a build. The guest prints a measurement per workload
+// and iteration, and the host reports their medians and spread. The workloads are sized for an
+// iteration of each case to take well under a minute.
+//
+// The cases only run when FXDAX_BENCH_ITERATIONS is set. With FXDAX_BENCH_RESULTS set to a
+// directory, the host also writes each case's measurements there as JSON, which
+// scripts/bench-report.py turns into tables comparing the filesystems.
+
+use macros::{guest, host};
+
+/// The filesystem a case benchmarks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// fxdax, with the guest mapping files into a DAX window.
+    FxdaxDax,
+    /// fxdax, with the guest caching files in its own page cache.
+    FxdaxNoDax,
+    /// ext4 on a virtio-blk disk.
+    Ext4,
+    /// libkrun's own virtio-fs device, passing a host directory through: the transport fxdax's
+    /// device shares, without fxdax.
+    Passthrough,
+}
+
+pub struct TestFsBench {
+    pub backend: Backend,
+}
+
+/// The size of the filesystems' images, which are sparse.
+#[cfg_attr(feature = "guest", allow(dead_code))]
+const IMAGE_SIZE: u64 = 8 << 30;
+
+/// The source tree the build workload untars and builds.
+#[cfg_attr(feature = "host", allow(dead_code))]
+const SOURCE_TARBALL: &str = "/opt/lua-5.4.7.tar.gz";
+
+#[host]
+mod host {
+    use super::*;
+
+    use crate::common::setup_rootfs;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
+    use futures::executor::block_on;
+    use fxdax::{Filesystem, Storage};
+    use krun_sys::*;
+    use nix::libc;
+    use std::collections::BTreeMap;
+    use std::ffi::{CString, c_char};
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr::null;
+
+    const CONTAINERFILE: &str = "\
+FROM alpine:3.22
+RUN apk add --no-cache fio gcc make musl-dev e2fsprogs
+RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
+    && echo '9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30  /opt/lua-5.4.7.tar.gz' \\
+    | sha256sum -c
+";
+
+    type KrunAddVirtiofsFxdaxFn = unsafe extern "C" fn(
+        ctx_id: u32,
+        c_tag: *const c_char,
+        c_image_path: *const c_char,
+        shm_size: u64,
+    ) -> i32;
+
+    fn get_krun_add_virtiofs_fxdax() -> KrunAddVirtiofsFxdaxFn {
+        let symbol = CString::new("krun_add_virtiofs_fxdax").unwrap();
+        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
+        assert!(!ptr.is_null(), "krun_add_virtiofs_fxdax not found");
+        unsafe { std::mem::transmute(ptr) }
+    }
+
+    fn iterations() -> Option<u32> {
+        std::env::var("FXDAX_BENCH_ITERATIONS").ok()?.parse().ok()
+    }
+
+    /// A workload's measurements, one per iteration.
+    #[derive(serde::Serialize)]
+    struct Measurements {
+        workload: String,
+        unit: String,
+        higher_is_better: bool,
+        values: Vec<f64>,
+    }
+
+    impl Measurements {
+        /// Returns the median, minimum and maximum.
+        fn summary(&self) -> (f64, f64, f64) {
+            let mut values = self.values.clone();
+            values.sort_by(f64::total_cmp);
+            let n = values.len();
+            let median = if n % 2 == 1 {
+                values[n / 2]
+            } else {
+                (values[n / 2 - 1] + values[n / 2]) / 2.0
+            };
+            (median, values[0], values[n - 1])
+        }
+    }
+
+    #[derive(Default, serde::Serialize)]
+    struct BenchReport {
+        case: String,
+        backend: String,
+        host_os: &'static str,
+        iterations: usize,
+        results: Vec<Measurements>,
+        /// How many iterations of each workload failed, which have no measurement.
+        failures: BTreeMap<String, u32>,
+        /// What the guest observed besides the workloads' measurements, per iteration.
+        observations: BTreeMap<String, Vec<f64>>,
+    }
+
+    /// Parses the guest's `RESULT <workload> <unit> <higher|lower> <value>`, `FAILED <workload>`
+    /// and `OBSERVED <name> <value>` lines.
+    fn parse(stdout: &str, report: &mut BenchReport) -> anyhow::Result<()> {
+        let results = &mut report.results;
+        let mut index = BTreeMap::new();
+        for line in stdout.lines() {
+            if let Some(workload) = line.strip_prefix("FAILED ") {
+                *report.failures.entry(workload.to_string()).or_default() += 1;
+                continue;
+            }
+            if let Some(observed) = line.strip_prefix("OBSERVED ") {
+                let Some((name, value)) = observed.split_once(' ') else {
+                    anyhow::bail!("malformed observation {line:?}");
+                };
+                report
+                    .observations
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(value.parse()?);
+                continue;
+            }
+            let Some(result) = line.strip_prefix("RESULT ") else {
+                continue;
+            };
+            let fields: Vec<&str> = result.split(' ').collect();
+            let [workload, unit, better, value] = fields[..] else {
+                anyhow::bail!("malformed result {line:?}");
+            };
+            let value: f64 = value.parse()?;
+            let i = *index.entry(workload.to_string()).or_insert_with(|| {
+                results.push(Measurements {
+                    workload: workload.to_string(),
+                    unit: unit.to_string(),
+                    higher_is_better: better == "higher",
+                    values: Vec::new(),
+                });
+                results.len() - 1
+            });
+            results[i].values.push(value);
+        }
+        anyhow::ensure!(!results.is_empty(), "no results");
+        report.iterations = results.iter().map(|m| m.values.len()).max().unwrap_or(0);
+        Ok(())
+    }
+
+    impl crate::ReportImpl for BenchReport {
+        fn fmt_text(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let i = f.width().unwrap_or(0);
+            writeln!(
+                f,
+                "{:i$}{} ({} iterations)\n",
+                "", self.backend, self.iterations
+            )?;
+            writeln!(
+                f,
+                "{:i$}{:<22} {:>12} {:>12} {:>12}  unit",
+                "", "workload", "median", "min", "max"
+            )?;
+            for m in &self.results {
+                let (median, min, max) = m.summary();
+                writeln!(
+                    f,
+                    "{:i$}{:<22} {:>12.1} {:>12.1} {:>12.1}  {}",
+                    "", m.workload, median, min, max, m.unit
+                )?;
+            }
+            for (workload, count) in &self.failures {
+                writeln!(f, "{:i$}{workload} failed {count} times", "")?;
+            }
+            for (name, values) in &self.observations {
+                writeln!(f, "{:i$}{name}: {values:?}", "")?;
+            }
+            Ok(())
+        }
+
+        fn fmt_gh_markdown(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            writeln!(f, "### {} ({} iterations)\n", self.backend, self.iterations)?;
+            writeln!(f, "| Workload | Median | Min | Max | Unit |")?;
+            write!(f, "|---|---|---|---|---|")?;
+            for m in &self.results {
+                let (median, min, max) = m.summary();
+                write!(
+                    f,
+                    "\n| {} | {median:.1} | {min:.1} | {max:.1} | {} |",
+                    m.workload, m.unit
+                )?;
+            }
+            for (workload, count) in &self.failures {
+                write!(f, "\n\n{workload} failed {count} times.")?;
+            }
+            Ok(())
+        }
+    }
+
+    impl TestFsBench {
+        fn name(&self) -> &'static str {
+            match self.backend {
+                Backend::FxdaxDax => "fxdax-dax",
+                Backend::FxdaxNoDax => "fxdax-nodax",
+                Backend::Ext4 => "ext4-virtio-blk",
+                Backend::Passthrough => "virtiofs-passthrough",
+            }
+        }
+    }
+
+    impl Test for TestFsBench {
+        fn should_run(&self) -> ShouldRun {
+            if iterations().is_none() {
+                return ShouldRun::No("FXDAX_BENCH_ITERATIONS not set");
+            }
+            let feature = match self.backend {
+                Backend::FxdaxDax | Backend::FxdaxNoDax => KRUN_FEATURE_FXDAX,
+                Backend::Ext4 => KRUN_FEATURE_BLK,
+                Backend::Passthrough => return ShouldRun::Yes,
+            };
+            if unsafe { krun_call_u32!(krun_has_feature(feature.into())) }.ok() != Some(1) {
+                return ShouldRun::No("libkrun compiled without the backend's feature");
+            }
+            ShouldRun::Yes
+        }
+
+        fn rootfs_image(&self) -> Option<&'static str> {
+            Some(CONTAINERFILE)
+        }
+
+        fn timeout_secs(&self) -> u64 {
+            1800 * u64::from(iterations().unwrap_or(1))
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            let root_dir = setup_rootfs(&test_setup)?;
+            let c_root = CString::new(root_dir.as_os_str().as_bytes())?;
+            let test_case = CString::new(test_setup.test_case.clone())?;
+            let iterations = CString::new(format!(
+                "FXDAX_BENCH_ITERATIONS={}",
+                iterations().unwrap_or(1)
+            ))?;
+
+            unsafe {
+                // Warnings only, whatever RUST_LOG says: logging every request costs time.
+                krun_call!(krun_init_log(
+                    KRUN_LOG_TARGET_DEFAULT,
+                    KRUN_LOG_LEVEL_WARN,
+                    KRUN_LOG_STYLE_NEVER,
+                    KRUN_LOG_OPTION_NO_ENV,
+                ))?;
+                let ctx = krun_call_u32!(krun_create_ctx())?;
+                krun_call!(krun_set_vm_config(ctx, 2, 2048))?;
+                krun_call!(krun_set_root(ctx, c_root.as_ptr()))?;
+                match self.backend {
+                    Backend::FxdaxDax | Backend::FxdaxNoDax => {
+                        let image = test_setup.tmp_dir.join("fxdax.img");
+                        block_on(async {
+                            let fs =
+                                Filesystem::format(Storage::create(&image, IMAGE_SIZE)?).await?;
+                            fs.close().await?;
+                            anyhow::Ok(())
+                        })?;
+                        let c_image = CString::new(image.as_os_str().as_bytes())?;
+                        let dax = self.backend == Backend::FxdaxDax;
+                        krun_call!(get_krun_add_virtiofs_fxdax()(
+                            ctx,
+                            c"bench".as_ptr(),
+                            c_image.as_ptr(),
+                            if dax { 1 << 31 } else { 0 },
+                        ))?;
+                    }
+                    Backend::Ext4 => {
+                        let image = test_setup.tmp_dir.join("ext4.img");
+                        std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
+                        let c_image = CString::new(image.as_os_str().as_bytes())?;
+                        // The defaults: the host's page cache, and flushes that reach the
+                        // host's disk cache on macOS, as libkrun recommends.
+                        krun_call!(krun_add_disk3(
+                            ctx,
+                            c"bench".as_ptr(),
+                            c_image.as_ptr(),
+                            KRUN_DISK_FORMAT_RAW,
+                            false,
+                            false,
+                            KRUN_SYNC_RELAXED,
+                        ))?;
+                    }
+                    Backend::Passthrough => {
+                        let dir = test_setup.tmp_dir.join("passthrough");
+                        std::fs::create_dir(&dir)?;
+                        let c_dir = CString::new(dir.as_os_str().as_bytes())?;
+                        krun_call!(krun_add_virtiofs(ctx, c"bench".as_ptr(), c_dir.as_ptr()))?;
+                    }
+                }
+                krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
+                let argv = [test_case.as_ptr(), null()];
+                // The compiler finds the assembler and linker through PATH.
+                let envp = [
+                    iterations.as_ptr(),
+                    c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_ptr(),
+                    c"HOME=/root".as_ptr(),
+                    null(),
+                ];
+                krun_call!(krun_set_exec(
+                    ctx,
+                    c"/guest-agent".as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                ))?;
+                krun_call!(krun_start_enter(ctx))?;
+            }
+            unreachable!()
+        }
+
+        fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
+            let stdout = String::from_utf8_lossy(&stdout);
+            if !stdout.lines().any(|line| line == "DONE") {
+                return TestOutcome::Fail(format!("the guest did not finish: {stdout}"));
+            }
+            let mut report = BenchReport {
+                case: test_setup.test_case.clone(),
+                backend: self.name().to_string(),
+                host_os: std::env::consts::OS,
+                ..BenchReport::default()
+            };
+            if let Err(err) = parse(&stdout, &mut report) {
+                return TestOutcome::Fail(format!("{err}: {stdout}"));
+            }
+            if let Some(dir) = std::env::var_os("FXDAX_BENCH_RESULTS") {
+                let path = std::path::Path::new(&dir).join(format!("{}.json", report.case));
+                let json = serde_json::to_string_pretty(&report).unwrap();
+                if let Err(err) = std::fs::write(&path, json) {
+                    return TestOutcome::Fail(format!("writing {}: {err}", path.display()));
+                }
+            }
+            TestOutcome::Report(Box::new(report))
+        }
+    }
+}
+
+#[guest]
+mod guest {
+    use super::*;
+    use crate::Test;
+
+    use nix::libc;
+    use std::ffi::CString;
+    use std::fs;
+    use std::io::Write;
+    use std::process::Command;
+    use std::time::Instant;
+
+    const MNT: &str = "/mnt/bench";
+    /// The file the I/O workloads use.
+    const DATA: &str = "/mnt/bench/data";
+    /// Small enough for fxdax's in-process kernel, of 1 GiB by default, to cache whole.
+    const DATA_SIZE: u64 = 256 << 20;
+    /// What the random I/O workloads that are not timed read or write, and the timed ones' time.
+    const RANDOM_SIZE: u64 = 16 << 20;
+    const RUNTIME: &str = "--runtime=2";
+    const MIB: f64 = (1 << 20) as f64;
+    /// The number of files the metadata workloads create, stat, list and remove.
+    const FILES: usize = 2_000;
+
+    fn run(program: &str, args: &[&str]) {
+        let status = Command::new(program)
+            .args(args)
+            .status()
+            .unwrap_or_else(|err| panic!("{program}: {err}"));
+        assert!(status.success(), "{program} {args:?}: {status}");
+    }
+
+    fn mount(source: &str, fstype: &str, options: &str) {
+        fs::create_dir_all(MNT).unwrap();
+        let source = CString::new(source).unwrap();
+        let target = CString::new(MNT).unwrap();
+        let fstype = CString::new(fstype).unwrap();
+        let options = CString::new(options).unwrap();
+        let ret = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                0,
+                options.as_ptr().cast(),
+            )
+        };
+        assert_eq!(ret, 0, "mount: {}", std::io::Error::last_os_error());
+    }
+
+    /// Writes back and drops the guest's caches, so that the next reads miss them.
+    fn drop_caches() {
+        unsafe { libc::sync() };
+        fs::write("/proc/sys/vm/drop_caches", b"3").unwrap();
+    }
+
+    fn result(workload: &str, unit: &str, higher_is_better: bool, value: f64) {
+        let better = if higher_is_better { "higher" } else { "lower" };
+        println!("RESULT {workload} {unit} {better} {value:.3}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    /// What fio measured of a job, and how long it took.
+    struct Fio {
+        /// The job's reads per second, and bytes read per second.
+        read_iops: f64,
+        read_bytes_per_sec: f64,
+        /// From starting fio to its exit, including a write job's final fsync.
+        secs: f64,
+    }
+
+    /// Runs fio on the data file.
+    fn fio(args: &[&str]) -> Fio {
+        let output = "/tmp/fio.json";
+        let size = format!("--size={DATA_SIZE}");
+        let mut all = vec![
+            "--name=bench",
+            "--filename",
+            DATA,
+            &size,
+            // fio would drop the file's cached pages before each job: drop_caches makes the cold
+            // jobs cold.
+            "--invalidate=0",
+            "--output-format=json",
+            "--output",
+            output,
+        ];
+        all.extend_from_slice(args);
+        let start = Instant::now();
+        run("fio", &all);
+        let secs = start.elapsed().as_secs_f64();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(output).unwrap()).expect("fio's JSON");
+        let read = &json["jobs"][0]["read"];
+        Fio {
+            read_iops: read["iops"].as_f64().expect("read iops"),
+            read_bytes_per_sec: read["bw_bytes"].as_f64().expect("read bw_bytes"),
+            secs,
+        }
+    }
+
+    /// Reports the rate of 4 KiB writes over `bytes` done in `secs`.
+    fn write_iops(workload: &str, bytes: u64, secs: f64) {
+        result(workload, "IOPS", true, (bytes / 4096) as f64 / secs);
+    }
+
+    /// Reads report fio's own rates, which leave out fio starting up. Writes are timed from
+    /// starting fio to its exit, so that they include the fsync that makes them durable.
+    fn io_workloads() {
+        let job = fio(&["--rw=write", "--bs=1M", "--end_fsync=1"]);
+        result(
+            "seq-write",
+            "MiB/s",
+            true,
+            DATA_SIZE as f64 / MIB / job.secs,
+        );
+
+        let random = format!("--io_size={RANDOM_SIZE}");
+        drop_caches();
+        let job = fio(&["--rw=randread", "--bs=4k", &random]);
+        result("rand-read-cold", "IOPS", true, job.read_iops);
+        drop_caches();
+        let job = fio(&["--rw=read", "--bs=1M"]);
+        result("seq-read-cold", "MiB/s", true, job.read_bytes_per_sec / MIB);
+        let job = fio(&["--rw=read", "--bs=1M"]);
+        result("seq-read-warm", "MiB/s", true, job.read_bytes_per_sec / MIB);
+        let job = fio(&["--rw=randread", "--bs=4k", "--time_based", RUNTIME]);
+        result("rand-read-warm", "IOPS", true, job.read_iops);
+
+        let job = fio(&["--rw=randwrite", "--bs=4k", &random, "--end_fsync=1"]);
+        write_iops("rand-write", RANDOM_SIZE, job.secs);
+
+        let job = fio(&[
+            "--ioengine=mmap",
+            "--rw=randread",
+            "--bs=4k",
+            "--time_based",
+            RUNTIME,
+        ]);
+        result("mmap-rand-read", "IOPS", true, job.read_iops);
+        let job = fio(&[
+            "--ioengine=mmap",
+            "--rw=randwrite",
+            "--bs=4k",
+            &random,
+            "--end_fsync=1",
+        ]);
+        write_iops("mmap-rand-write", RANDOM_SIZE, job.secs);
+        fs::remove_file(DATA).unwrap();
+
+        // A log: each 4 KiB append is fsynced.
+        let log = format!("{MNT}/log");
+        let appended = 1 << 20;
+        let start = Instant::now();
+        run(
+            "fio",
+            &[
+                "--name=log",
+                "--filename",
+                &log,
+                "--size=1M",
+                "--rw=write",
+                "--bs=4k",
+                "--fsync=1",
+                "--output=/dev/null",
+            ],
+        );
+        write_iops("fsync-append", appended, start.elapsed().as_secs_f64());
+        fs::remove_file(&log).unwrap();
+    }
+
+    /// Reports the rate of `FILES` operations done in `secs`.
+    fn ops(workload: &str, secs: f64) {
+        result(workload, "ops/s", true, FILES as f64 / secs);
+    }
+
+    fn metadata_workloads() {
+        let dir = format!("{MNT}/meta");
+        fs::create_dir(&dir).unwrap();
+        let paths: Vec<String> = (0..FILES).map(|i| format!("{dir}/file-{i}")).collect();
+
+        let start = Instant::now();
+        for path in &paths {
+            fs::write(path, b"a small file").unwrap();
+        }
+        ops("create", start.elapsed().as_secs_f64());
+
+        drop_caches();
+        let start = Instant::now();
+        for path in &paths {
+            fs::metadata(path).unwrap();
+        }
+        ops("stat-cold", start.elapsed().as_secs_f64());
+
+        let start = Instant::now();
+        let entries = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, FILES);
+        ops("readdir", start.elapsed().as_secs_f64());
+
+        let start = Instant::now();
+        for path in &paths {
+            fs::remove_file(path).unwrap();
+        }
+        ops("unlink", start.elapsed().as_secs_f64());
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// Observes how far ahead of the guest's clock a file it writes is timestamped, in
+    /// milliseconds: what `make` compares the guest's clock with.
+    fn observe_mtime() {
+        let path = format!("{MNT}/mtime");
+        fs::write(&path, b"now").unwrap();
+        let now = std::time::SystemTime::now();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let ahead = match modified.duration_since(now) {
+            Ok(ahead) => ahead.as_secs_f64(),
+            Err(behind) => -behind.duration().as_secs_f64(),
+        };
+        println!("OBSERVED mtime-ahead-of-guest-ms {:.3}", ahead * 1000.0);
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Untars and builds Lua: small files, short-lived processes and a compiler.
+    fn build_workload() {
+        let dir = format!("{MNT}/build");
+        fs::create_dir(&dir).unwrap();
+        let source = format!("{dir}/lua-5.4.7");
+        let timed = |workload: &str, program: &str, args: &[&str], cwd: &str| {
+            let start = Instant::now();
+            let status = Command::new(program)
+                .args(args)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|err| panic!("{program}: {err}"));
+            assert!(status.success(), "{program} {args:?}: {status}");
+            let secs = start.elapsed().as_secs_f64();
+            result(workload, "s", false, secs);
+            secs
+        };
+        let total = timed("untar", "tar", &["-xzf", SOURCE_TARBALL], &dir)
+            + timed("make", "make", &["-j2", "linux"], &source);
+        result("build-total", "s", false, total);
+        run("rm", &["-rf", &dir]);
+    }
+
+    impl Test for TestFsBench {
+        fn in_guest(self: Box<Self>) {
+            match self.backend {
+                Backend::FxdaxDax => mount("bench", "virtiofs", "dax=always"),
+                Backend::FxdaxNoDax | Backend::Passthrough => {
+                    mount("bench", "virtiofs", "dax=never")
+                }
+                Backend::Ext4 => {
+                    run("mkfs.ext4", &["-q", "-F", "/dev/vda"]);
+                    mount("/dev/vda", "ext4", "");
+                }
+            }
+            let iterations: u32 = std::env::var("FXDAX_BENCH_ITERATIONS")
+                .ok()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1);
+            for i in 0..iterations {
+                eprintln!("iteration {}/{iterations}", i + 1);
+                observe_mtime();
+                io_workloads();
+                metadata_workloads();
+                // A failed build is recorded, and the other iterations still run.
+                if std::panic::catch_unwind(build_workload).is_err() {
+                    println!("FAILED build");
+                    run("rm", &["-rf", &format!("{MNT}/build")]);
+                }
+                drop_caches();
+            }
+            println!("DONE");
+        }
+    }
+}

@@ -4,7 +4,7 @@ edition = "2024"
 
 [features]
 host = ["krun-sys", "fxdax", "futures", "serde", "serde_json"]
-guest = []
+guest = ["serde_json"]
 
 [lib]
 name = "test_cases"

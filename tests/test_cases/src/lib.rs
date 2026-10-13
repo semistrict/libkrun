@@ -35,6 +35,9 @@ use test_root_disk_remount::TestRootDiskRemount;
 mod test_pjdfstest;
 use test_pjdfstest::TestPjdfstest;
 
+mod test_fxfs_guest;
+use test_fxfs_guest::TestFxfsGuest;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_fxdax;
 #[cfg(any(feature = "host", target_os = "linux"))]
@@ -149,6 +152,7 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-memory", Box::new(TestVirtiofsFxdaxMemory)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
+        TestCase::new("fxfs-guest", Box::new(TestFxfsGuest)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(
             "bench-fs-fxdax-dax",

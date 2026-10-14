@@ -645,6 +645,7 @@ mod guest {
     /// sampled by perf throughout, whose report of the kernel's hottest symbols goes to the log
     /// (perf's own overhead is then in the measurement).
     fn timed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
+        let requests = device_requests();
         let profiler = Profiler::start();
         let start = Instant::now();
         let value = f();
@@ -652,7 +653,37 @@ mod guest {
         if let Some(profiler) = profiler {
             profiler.report(workload);
         }
+        if let (Some(before), Some(after)) = (requests, device_requests()) {
+            let per_op: Vec<String> = after
+                .iter()
+                .zip(&before)
+                .filter(|((_, after), (_, before))| after > before)
+                .map(|((kind, after), (_, before))| {
+                    format!("{kind} {:.2}", (after - before) as f64 / count as f64)
+                })
+                .collect();
+            eprintln!("REQUESTS {workload}: {} per operation", per_op.join(", "));
+        }
         value
+    }
+
+    /// The extent-store device's count of the requests it has taken, by type, if the guest's
+    /// filesystem is on one.
+    fn device_requests() -> Option<Vec<(String, u64)>> {
+        let device = fs::read_dir("/sys/bus/virtio/drivers/virtio_extent").ok()?.find_map(|entry| {
+            let path = entry.ok()?.path().join("requests");
+            path.exists().then_some(path)
+        })?;
+        let counts = fs::read_to_string(device).ok()?;
+        Some(
+            counts
+                .lines()
+                .filter_map(|line| {
+                    let (kind, count) = line.split_once(' ')?;
+                    Some((kind.to_string(), count.parse().ok()?))
+                })
+                .collect(),
+        )
     }
 
     /// perf, recording the whole guest into a tmpfs, enabled through its control FIFO once it is

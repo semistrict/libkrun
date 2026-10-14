@@ -37,6 +37,8 @@ use test_pjdfstest::TestPjdfstest;
 
 mod test_fxfs_guest;
 use test_fxfs_guest::TestFxfsGuest;
+mod test_extent_guest;
+use test_extent_guest::TestExtentGuest;
 
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_virtiofs_fxdax;
@@ -153,6 +155,7 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-fxdax-memory", Box::new(TestVirtiofsFxdaxMemory)),
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("fxfs-guest", Box::new(TestFxfsGuest)),
+        TestCase::new("extent-guest", Box::new(TestExtentGuest)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(
             "bench-fs-fxdax-dax",

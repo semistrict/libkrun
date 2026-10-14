@@ -198,8 +198,12 @@ mod guest {
     const MNT: &str = "/mnt/fxfs";
 
     fn mount(source: &str) -> std::io::Result<()> {
+        mount_at(source, MNT)
+    }
+
+    fn mount_at(source: &str, target: &str) -> std::io::Result<()> {
         let source = CString::new(source).unwrap();
-        let target = CString::new(MNT).unwrap();
+        let target = CString::new(target).unwrap();
         let fstype = CString::new("fxfs").unwrap();
         let ret = unsafe {
             libc::mount(
@@ -218,7 +222,11 @@ mod guest {
     }
 
     fn unmount() {
-        let target = CString::new(MNT).unwrap();
+        unmount_at(MNT)
+    }
+
+    fn unmount_at(target: &str) {
+        let target = CString::new(target).unwrap();
         let ret = unsafe { libc::umount(target.as_ptr()) };
         assert_eq!(ret, 0, "umount: {}", std::io::Error::last_os_error());
     }
@@ -354,6 +362,20 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
+
+            // The store mounted again, elsewhere, is the same filesystem.
+            const MNT2: &str = "/mnt/fxfs2";
+            fs::create_dir_all(MNT2).unwrap();
+            mount_at("extents", MNT2).unwrap();
+            assert_eq!(names(MNT2), names(MNT));
+            fs::write(format!("{MNT2}/shared"), b"through the second mount").unwrap();
+            assert_eq!(
+                fs::read(format!("{MNT}/shared")).unwrap(),
+                b"through the second mount"
+            );
+            fs::remove_file(format!("{MNT}/shared")).unwrap();
+            unmount_at(MNT2);
+
             unmount();
             mount("extents").unwrap();
             check_written(self.host_formats);

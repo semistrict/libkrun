@@ -1,11 +1,26 @@
 use macros::{guest, host};
 
-pub struct TestPjdfstest;
+pub struct TestPjdfstest {
+    /// fxdax's pjdfstest-fxfs-guest: whether to boot fxdax's guest kernel (FXDAX_GUEST_KERNEL)
+    /// and test its Fxfs, on an extent-store device on a new store, rather than the root.
+    pub guest_fxfs: bool,
+}
+
+/// Where the guest mounts its Fxfs.
+#[cfg_attr(feature = "host", allow(dead_code))]
+const FXFS_MNT: &str = "/mnt/fxfs";
+
+/// pjdfstest's tests Fxfs can't pass, and why.
+#[cfg_attr(feature = "host", allow(dead_code))]
+const FXFS_SKIPPED: &[(&str, &str)] = &[(
+    "symlink/03.t",
+    "symlinks of PATH_MAX - 1 bytes: Fxfs keeps a symlink's target in its record, of at most 256",
+)];
 
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter_with_env;
+    use crate::common::{add_extent_store, set_guest_kernel, setup_fs_and_enter_with_env};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use krun_sys::*;
     use std::ffi::CString;
@@ -33,6 +48,9 @@ mod host {
             {
                 return ShouldRun::No("PJDFSTEST_REPO/PJDFSTEST_COMMIT not set");
             }
+            if self.guest_fxfs && std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
+                return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
+            }
             ShouldRun::Yes
         }
 
@@ -54,6 +72,11 @@ mod host {
             unsafe {
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 1024))?;
+                if self.guest_fxfs {
+                    set_guest_kernel(ctx)?;
+                    let store = test_setup.tmp_dir.join("extents");
+                    add_extent_store(ctx, c"extents", &store, 1 << 30, 0)?;
+                }
                 setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_c_str()])?;
             }
             Ok(())
@@ -81,15 +104,62 @@ mod guest {
     use crate::Test;
     use std::process::Command;
 
+    /// Mounts the guest kernel's Fxfs, from the extent-store device tagged `extents`.
+    fn mount_fxfs() {
+        std::fs::create_dir_all(FXFS_MNT).unwrap();
+        let ret = unsafe {
+            nix::libc::mount(
+                c"extents".as_ptr(),
+                c"/mnt/fxfs".as_ptr(),
+                c"fxfs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(ret, 0, "mount: {}", std::io::Error::last_os_error());
+    }
+
     impl Test for TestPjdfstest {
         fn in_guest(self: Box<Self>) {
             // Create a test directory on the filesystem under test
-            std::fs::create_dir_all("/tmp/pjdfstest-work").expect("Failed to create test dir");
+            let work = if self.guest_fxfs {
+                mount_fxfs();
+                format!("{FXFS_MNT}/pjdfstest-work")
+            } else {
+                "/tmp/pjdfstest-work".to_owned()
+            };
+            std::fs::create_dir_all(&work).expect("Failed to create test dir");
 
-            let status = Command::new("/usr/bin/prove")
-                .arg("-rv")
-                .arg("/pjdfstest/tests")
-                .current_dir("/tmp/pjdfstest-work")
+            let mut prove = Command::new("/usr/bin/prove");
+            prove.arg("-rv");
+            if self.guest_fxfs {
+                // Each test but those skipped, in the order prove's -r would run them.
+                let mut tests = Vec::new();
+                for dir in std::fs::read_dir("/pjdfstest/tests").unwrap() {
+                    let dir = dir.unwrap().path();
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    for test in std::fs::read_dir(&dir).unwrap() {
+                        let test = test.unwrap().path();
+                        let name = test.strip_prefix("/pjdfstest/tests").unwrap();
+                        let name = name.to_str().unwrap().trim_start_matches('/');
+                        if !name.ends_with(".t") {
+                            continue;
+                        }
+                        match FXFS_SKIPPED.iter().find(|(skipped, _)| *skipped == name) {
+                            Some((_, why)) => eprintln!("skipped {name}: {why}"),
+                            None => tests.push(test),
+                        }
+                    }
+                }
+                tests.sort();
+                prove.args(tests);
+            } else {
+                prove.arg("/pjdfstest/tests");
+            }
+            let status = prove
+                .current_dir(&work)
                 .status()
                 .expect("Failed to run prove");
 

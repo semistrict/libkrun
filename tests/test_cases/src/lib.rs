@@ -162,7 +162,11 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-memory", Box::new(TestVirtiofsFxdaxMemory)),
-        TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
+        TestCase::new("pjdfstest", Box::new(TestPjdfstest { guest_fxfs: false })),
+        TestCase::new(
+            "pjdfstest-fxfs-guest",
+            Box::new(TestPjdfstest { guest_fxfs: true }),
+        ),
         TestCase::new("fxfs-guest", Box::new(TestFxfsGuest::host_formats())),
         TestCase::new("fxfs-guest-format", Box::new(TestFxfsGuest::guest_formats())),
         TestCase::new("fxfs-guest-crash", Box::new(TestFxfsGuest::crash())),

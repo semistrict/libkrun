@@ -204,7 +204,7 @@ mod guest {
     use crate::Test;
 
     use nix::libc;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::fs;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -344,6 +344,9 @@ mod guest {
         );
         fs::remove_file(&program).unwrap();
 
+        xattrs(dir);
+        exchange(dir);
+
         let statfs = nix::sys::statfs::statfs(MNT).unwrap();
         assert!(statfs.blocks_free() < statfs.blocks());
     }
@@ -373,6 +376,78 @@ mod guest {
         assert_eq!(names(MNT), ["dir"]);
     }
 
+    /// Extended attributes: set, created, replaced, listed, read, removed, and kept.
+    fn xattrs(dir: &str) {
+        let path = CString::new(format!("{dir}/renamed")).unwrap();
+        let set = |name: &CStr, value: &[u8], flags| unsafe {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), flags)
+        };
+        let get = |name: &CStr| {
+            let mut buf = [0u8; 256];
+            let len = unsafe {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+            };
+            if len < 0 {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                Ok(buf[..len as usize].to_vec())
+            }
+        };
+        assert_eq!(set(c"user.colour", b"blue", 0), 0);
+        assert_eq!(get(c"user.colour"), Ok(b"blue".to_vec()));
+        // Creating one that exists fails, and replacing one that doesn't.
+        assert_eq!(set(c"user.colour", b"red", libc::XATTR_CREATE), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(set(c"user.size", b"large", libc::XATTR_REPLACE), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENODATA));
+        assert_eq!(set(c"user.colour", b"green", libc::XATTR_REPLACE), 0);
+        assert_eq!(set(c"user.size", b"large", libc::XATTR_CREATE), 0);
+        assert_eq!(set(c"trusted.kept", b"", 0), 0);
+        assert_eq!(get(c"user.colour"), Ok(b"green".to_vec()));
+        assert_eq!(get(c"trusted.kept"), Ok(Vec::new()));
+        assert_eq!(get(c"user.absent"), Err(libc::ENODATA));
+
+        let mut list = [0u8; 256];
+        let len = unsafe { libc::listxattr(path.as_ptr(), list.as_mut_ptr().cast(), list.len()) };
+        assert!(len >= 0, "listxattr: {}", std::io::Error::last_os_error());
+        let mut names: Vec<&[u8]> = list[..len as usize]
+            .split(|&b| b == 0)
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort();
+        assert_eq!(names, [&b"trusted.kept"[..], b"user.colour", b"user.size"]);
+
+        assert_eq!(unsafe { libc::removexattr(path.as_ptr(), c"user.size".as_ptr()) }, 0);
+        assert_eq!(get(c"user.size"), Err(libc::ENODATA));
+    }
+
+    /// RENAME_EXCHANGE: a file and a directory swap names, across directories.
+    fn exchange(dir: &str) {
+        let (file, sub) = (format!("{dir}/swap-file"), format!("{MNT}/swap-dir"));
+        fs::write(&file, b"was a file").unwrap();
+        fs::create_dir(&sub).unwrap();
+        fs::write(format!("{sub}/inside"), b"in the directory").unwrap();
+        let (file_c, sub_c) = (CString::new(file.as_str()).unwrap(), CString::new(sub.as_str()).unwrap());
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                file_c.as_ptr(),
+                libc::AT_FDCWD,
+                sub_c.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        assert_eq!(ret, 0, "renameat2: {}", std::io::Error::last_os_error());
+        assert_eq!(fs::read(&sub).unwrap(), b"was a file");
+        assert_eq!(fs::read(format!("{file}/inside")).unwrap(), b"in the directory");
+        // The directories' links follow the directory that moved between them.
+        assert_eq!(fs::metadata(dir).unwrap().nlink(), 3);
+        fs::remove_file(format!("{file}/inside")).unwrap();
+        fs::remove_dir(&file).unwrap();
+        fs::remove_file(&sub).unwrap();
+    }
+
     /// What `write` made, after mounting again, beside what the host made, if it did.
     fn check_written(host_formats: bool) {
         let mut expected = vec!["guest-dir", "link", "symlink"];
@@ -391,6 +466,12 @@ mod guest {
             std::path::Path::new("guest-dir/renamed")
         );
         assert_eq!(fs::read(format!("{MNT}/link")).unwrap(), written());
+        let path = CString::new(format!("{MNT}/guest-dir/renamed")).unwrap();
+        let mut buf = [0u8; 16];
+        let len = unsafe {
+            libc::getxattr(path.as_ptr(), c"user.colour".as_ptr(), buf.as_mut_ptr().cast(), 16)
+        };
+        assert_eq!(&buf[..len.max(0) as usize], b"green");
     }
 
     /// Writes a file and fsyncs it and its directory, and writes more without, and leaves the

@@ -468,6 +468,44 @@ mod guest {
         panic!("reboot: {}", std::io::Error::last_os_error());
     }
 
+    /// The extent-store device's count of the requests it has taken, by type.
+    fn device_requests() -> String {
+        let devices: Vec<_> = fs::read_dir("/sys/bus/virtio/drivers/virtio_extent")
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("requests"))
+            .filter(|path| path.exists())
+            .collect();
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        fs::read_to_string(&devices[0]).unwrap()
+    }
+
+    /// Lookups, stats, creates, renames and unlinks of metadata in memory take no device requests.
+    fn metadata_cached() {
+        let dir = format!("{MNT}/cached");
+        fs::create_dir(&dir).unwrap();
+        // Read in what the operations will touch.
+        let _ = names(MNT);
+        let _ = fs::metadata(format!("{MNT}/guest-dir/renamed")).unwrap();
+        let before = device_requests();
+        for i in 0..20 {
+            let path = format!("{dir}/file-{i}");
+            fs::File::create(&path).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+            fs::rename(&path, format!("{dir}/moved-{i}")).unwrap();
+        }
+        assert_eq!(names(&dir).len(), 20);
+        let _ = fs::metadata(format!("{MNT}/guest-dir/renamed")).unwrap();
+        assert_eq!(
+            fs::metadata(format!("{MNT}/guest-dir/absent")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        for i in 0..20 {
+            fs::remove_file(format!("{dir}/moved-{i}")).unwrap();
+        }
+        assert_eq!(device_requests(), before);
+        fs::remove_dir(&dir).unwrap();
+    }
+
     /// The names in `dir`, sorted.
     fn names(dir: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
@@ -502,6 +540,7 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
+            metadata_cached();
 
             // The store mounted again, elsewhere, is the same filesystem.
             const MNT2: &str = "/mnt/fxfs2";

@@ -193,7 +193,13 @@ mod guest {
     use std::ffi::CString;
     use std::fs;
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// What the guest writes through a mapping: three pages and a bit.
+    fn mapped() -> Vec<u8> {
+        pattern(3 * 4096 + 100, 0xa5)
+    }
 
     const MNT: &str = "/mnt/fxfs";
 
@@ -284,6 +290,46 @@ mod guest {
         fs::remove_file(format!("{gone}/f")).unwrap();
         fs::remove_dir(&gone).unwrap();
 
+        // Written through a shared mapping, which writeback writes.
+        let mapped_path = format!("{dir}/mapped");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&mapped_path)
+            .unwrap();
+        let data = mapped();
+        file.set_len(data.len() as u64).unwrap();
+        unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            );
+            assert_ne!(addr, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr.cast(), data.len());
+            assert_eq!(libc::msync(addr, data.len(), libc::MS_SYNC), 0);
+            assert_eq!(libc::munmap(addr, data.len()), 0);
+        }
+        drop(file);
+        assert_eq!(fs::read(&mapped_path).unwrap(), data);
+
+        // A program run from the filesystem: this one, which fails without a test's name.
+        let program = format!("{dir}/program");
+        fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(&program).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Missing test name argument"),
+            "{output:?}"
+        );
+        fs::remove_file(&program).unwrap();
+
         let statfs = nix::sys::statfs::statfs(MNT).unwrap();
         assert!(statfs.blocks_free() < statfs.blocks());
     }
@@ -320,7 +366,8 @@ mod guest {
             expected.insert(0, "dir");
         }
         assert_eq!(names(MNT), expected);
-        assert_eq!(names(&format!("{MNT}/guest-dir")), ["renamed"]);
+        assert_eq!(names(&format!("{MNT}/guest-dir")), ["mapped", "renamed"]);
+        assert_eq!(fs::read(format!("{MNT}/guest-dir/mapped")).unwrap(), mapped());
         let renamed = fs::metadata(format!("{MNT}/guest-dir/renamed")).unwrap();
         assert_eq!(renamed.permissions().mode(), 0o100640);
         assert_eq!(renamed.nlink(), 2);

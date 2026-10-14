@@ -639,13 +639,13 @@ mod guest {
         });
     }
 
-    fn setxattr(path: &str, name: &str, value: &[u8]) {
+    fn setxattr(path: &str, name: &str, value: &[u8]) -> std::io::Result<()> {
         let path = CString::new(path).unwrap();
         let name = CString::new(name).unwrap();
         let ret = unsafe {
             libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0)
         };
-        assert_eq!(ret, 0, "setxattr: {}", std::io::Error::last_os_error());
+        if ret == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }
 
     /// Operations on the names and attributes of many small files in one directory.
@@ -692,11 +692,20 @@ mod guest {
                     .unwrap();
             }
         });
-        timed("setxattr", FILES, || {
-            for path in &paths {
-                setxattr(path, "user.bench", b"a value");
+        // A filesystem without extended attributes, such as fxdax's virtio-fs, fails the workload.
+        match setxattr(&paths[0], "user.bench", b"a value") {
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                println!("FAILED setxattr");
             }
-        });
+            first => {
+                first.unwrap();
+                timed("setxattr", FILES, || {
+                    for path in &paths {
+                        setxattr(path, "user.bench", b"a value").unwrap();
+                    }
+                });
+            }
+        }
         timed("link", FILES, || {
             for (i, path) in paths.iter().enumerate() {
                 fs::hard_link(path, format!("{dir}/link-{i}")).unwrap();

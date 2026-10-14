@@ -2,7 +2,8 @@
 // ext4 on a virtio-blk disk backed by a raw image file on the same host filesystem. libkrun's own
 // virtio-fs device, passing a host directory through, measures the transport they share. The
 // guest kernel's own Fxfs (fxdax's guest kernel, FXDAX_GUEST_KERNEL), on an extent-store device,
-// with a DAX window and without, compares with ext4 booted on the same kernel.
+// with a DAX window and without, compares with ext4 booted on the same kernel, on virtio-blk, and
+// with DAX on writable virtio-pmem, where file data and metadata are stored in place in memory.
 //
 // Each case boots an Alpine guest, with fio, a compiler and e2fsprogs, onto one filesystem
 // mounted at /mnt/bench, and runs the same workloads on it several times: sequential and
@@ -18,7 +19,9 @@
 // FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory,
 // or with `record:EVENTS` records the events, such as the scheduler's tracepoints, with stacks;
 // set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each 100 ms of the run,
-// into the case's log, where they line up with the guest's results.
+// into the case's log, where they line up with the guest's results. With FXDAX_BENCH_GUEST_PERF
+// set, perf in the guest samples its kernel through each metadata workload, and the case's log
+// says where each one's time went.
 
 use macros::{guest, host};
 
@@ -36,6 +39,8 @@ pub enum Backend {
     Passthrough,
     /// ext4 on a virtio-blk disk, with fxdax's guest kernel, which the guest's Fxfs compares with.
     Ext4GuestKernel,
+    /// ext4 with DAX on writable virtio-pmem, with fxdax's guest kernel: storage as memory.
+    Ext4DaxPmem,
     /// The guest kernel's Fxfs on an extent-store device, with files in the page cache.
     FxfsGuest,
     /// The guest kernel's Fxfs on an extent-store device, mapping files from its DAX window.
@@ -46,7 +51,13 @@ impl Backend {
     /// Whether the case boots fxdax's guest kernel.
     #[cfg_attr(feature = "guest", allow(dead_code))]
     fn guest_kernel(self) -> bool {
-        matches!(self, Backend::Ext4GuestKernel | Backend::FxfsGuest | Backend::FxfsGuestDax)
+        matches!(
+            self,
+            Backend::Ext4GuestKernel
+                | Backend::Ext4DaxPmem
+                | Backend::FxfsGuest
+                | Backend::FxfsGuestDax
+        )
     }
 }
 
@@ -79,7 +90,7 @@ mod host {
 
     const CONTAINERFILE: &str = "\
 FROM alpine:3.22
-RUN apk add --no-cache fio gcc make musl-dev e2fsprogs
+RUN apk add --no-cache fio gcc make musl-dev e2fsprogs perf
 RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
     && echo '9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30  /opt/lua-5.4.7.tar.gz' \\
     | sha256sum -c
@@ -242,6 +253,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 Backend::Ext4 => "ext4-virtio-blk",
                 Backend::Passthrough => "virtiofs-passthrough",
                 Backend::Ext4GuestKernel => "ext4-guest-kernel",
+                Backend::Ext4DaxPmem => "ext4-dax-pmem",
                 Backend::FxfsGuest => "fxfs-guest",
                 Backend::FxfsGuestDax => "fxfs-guest-dax",
             }
@@ -262,7 +274,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 | Backend::FxfsGuest
                 | Backend::FxfsGuestDax => KRUN_FEATURE_FXDAX,
                 Backend::Ext4 | Backend::Ext4GuestKernel => KRUN_FEATURE_BLK,
-                Backend::Passthrough => return ShouldRun::Yes,
+                Backend::Passthrough | Backend::Ext4DaxPmem => return ShouldRun::Yes,
             };
             if unsafe { krun_call_u32!(krun_has_feature(feature.into())) }.ok() != Some(1) {
                 return ShouldRun::No("libkrun compiled without the backend's feature");
@@ -289,6 +301,10 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             let groups = CString::new(format!(
                 "FXDAX_BENCH_GROUPS={}",
                 std::env::var("FXDAX_BENCH_GROUPS").unwrap_or_default()
+            ))?;
+            let guest_perf = CString::new(format!(
+                "FXDAX_BENCH_GUEST_PERF={}",
+                std::env::var("FXDAX_BENCH_GUEST_PERF").unwrap_or_default()
             ))?;
 
             // With FXDAX_BENCH_PERF set, this process, which becomes the VMM, runs again under
@@ -361,6 +377,12 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                         let window = if self.backend == Backend::FxfsGuestDax { 1 << 31 } else { 0 };
                         add_extent_store(ctx, c"bench", &store, IMAGE_SIZE, window)?;
                     }
+                    Backend::Ext4DaxPmem => {
+                        let image = test_setup.tmp_dir.join("pmem.img");
+                        std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
+                        let c_image = CString::new(image.as_os_str().as_bytes())?;
+                        krun_call!(krun_add_pmem(ctx, c"bench".as_ptr(), c_image.as_ptr(), false))?;
+                    }
                     Backend::Ext4 | Backend::Ext4GuestKernel => {
                         let image = test_setup.tmp_dir.join("ext4.img");
                         std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
@@ -390,6 +412,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 let envp = [
                     iterations.as_ptr(),
                     groups.as_ptr(),
+                    guest_perf.as_ptr(),
                     c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_ptr(),
                     c"HOME=/root".as_ptr(),
                     null(),
@@ -618,12 +641,103 @@ mod guest {
         result(workload, "ops/s", true, count as f64 / secs);
     }
 
-    /// Times `f`, which does `count` operations, as `workload`.
+    /// Times `f`, which does `count` operations, as `workload`: with FXDAX_BENCH_GUEST_PERF set,
+    /// sampled by perf throughout, whose report of the kernel's hottest symbols goes to the log
+    /// (perf's own overhead is then in the measurement).
     fn timed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
+        let profiler = Profiler::start();
         let start = Instant::now();
         let value = f();
         ops(workload, count, start.elapsed().as_secs_f64());
+        if let Some(profiler) = profiler {
+            profiler.report(workload);
+        }
         value
+    }
+
+    /// perf, recording the whole guest into a tmpfs, enabled through its control FIFO once it is
+    /// ready, so that it samples exactly what runs until `report`.
+    struct Profiler {
+        perf: std::process::Child,
+        control: fs::File,
+        ack: fs::File,
+    }
+
+    impl Profiler {
+        const DIR: &str = "/run/bench-perf";
+
+        fn start() -> Option<Self> {
+            if !std::env::var("FXDAX_BENCH_GUEST_PERF").is_ok_and(|v| !v.is_empty()) {
+                return None;
+            }
+            if !std::path::Path::new(Self::DIR).exists() {
+                fs::create_dir_all(Self::DIR).unwrap();
+                mount_tmpfs(Self::DIR);
+            }
+            let (control, ack) = (format!("{}/control", Self::DIR), format!("{}/ack", Self::DIR));
+            for fifo in [&control, &ack] {
+                let _ = fs::remove_file(fifo);
+                let c = CString::new(fifo.as_str()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {fifo}");
+            }
+            let data = format!("{}/perf.data", Self::DIR);
+            let _ = fs::remove_file(&data);
+            let perf = Command::new("perf")
+                .args(["record", "-a", "-g", "-F", "4999", "-D", "-1", "-q", "-o", &data])
+                .arg(format!("--control=fifo:{control},{ack}"))
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("perf record");
+            // Opening the FIFOs waits for perf to open them too.
+            let mut control = fs::OpenOptions::new().write(true).open(&control).unwrap();
+            let mut ack = fs::File::open(&ack).unwrap();
+            Self::command(&mut control, &mut ack, "enable");
+            Some(Self { perf, control, ack })
+        }
+
+        /// Sends perf `command`, and waits for it to acknowledge it.
+        fn command(control: &mut fs::File, ack: &mut fs::File, command: &str) {
+            use std::io::Read;
+            control.write_all(format!("{command}\n").as_bytes()).unwrap();
+            let mut reply = [0u8; 5];
+            ack.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"ack\n\0", "perf's reply to {command}");
+        }
+
+        fn report(mut self, workload: &str) {
+            Self::command(&mut self.control, &mut self.ack, "disable");
+            unsafe { libc::kill(self.perf.id() as i32, libc::SIGINT) };
+            self.perf.wait().expect("perf record");
+            let data = format!("{}/perf.data", Self::DIR);
+            let report = Command::new("perf")
+                .args([
+                    "report", "-i", &data, "--stdio", "--sort", "sym", "--no-children", "-g",
+                    "none", "--percent-limit", "1", "-q",
+                ])
+                .output()
+                .expect("perf report");
+            // And the functions the time is spent in, callees included.
+            let callers = Command::new("perf")
+                .args([
+                    "report", "-i", &data, "--stdio", "--sort", "sym", "--children", "-g", "none",
+                    "--percent-limit", "3", "-q",
+                ])
+                .output()
+                .expect("perf report");
+            eprintln!(
+                "PROFILE {workload}\n{}\nINCLUSIVE {workload}\n{}",
+                String::from_utf8_lossy(&report.stdout),
+                String::from_utf8_lossy(&callers.stdout)
+            );
+        }
+    }
+
+    fn mount_tmpfs(target: &str) {
+        let (source, target, fstype) = (c"tmpfs", CString::new(target).unwrap(), c"tmpfs");
+        let ret = unsafe {
+            libc::mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), 0, std::ptr::null())
+        };
+        assert_eq!(ret, 0, "mount tmpfs: {}", std::io::Error::last_os_error());
     }
 
     /// Runs `f(thread)` on `THREADS` threads at once, and times them all as `workload`, of `count`
@@ -929,6 +1043,10 @@ mod guest {
                     mount("/dev/vda", "ext4", "");
                 }
                 Backend::FxfsGuest | Backend::FxfsGuestDax => mount("bench", "fxfs", ""),
+                Backend::Ext4DaxPmem => {
+                    run("mkfs.ext4", &["-q", "-F", "/dev/pmem0"]);
+                    mount("/dev/pmem0", "ext4", "dax=always");
+                }
             }
             let iterations: u32 = std::env::var("FXDAX_BENCH_ITERATIONS")
                 .ok()

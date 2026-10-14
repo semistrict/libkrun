@@ -9,9 +9,10 @@
 // fxfs-guest: the host makes an fxdax filesystem on the store first, with a
 // file, and a directory holding a larger file, which the guest lists and reads.
 // fxfs-guest-format: the store holds nothing, and the guest's Fxfs formats it.
-// fxfs-guest-crash: the guest formats the store, writes a file it fsyncs and
-// files it doesn't, and stops without unmounting. The host checks the store's
-// filesystem (fsck), and finds the file the guest fsynced.
+// fxfs-guest-crash: the guest formats the store, fsyncs file after file,
+// reporting each once its fsync returns, while another thread does too, and
+// powers the VM off in the middle, without syncing. The host checks the store's
+// filesystem (fsck), and finds every file the guest reported, whole.
 
 use macros::{guest, host};
 
@@ -44,9 +45,10 @@ impl TestFxfsGuest {
     }
 }
 
-/// What the crash test's guest fsyncs.
-fn durable() -> Vec<u8> {
-    pattern((1 << 20) + 4321, 0x3c)
+/// The contents of the crash test's file `index`, of `writer`: of a size and pattern its name
+/// gives, which the host checks.
+fn durable(writer: u8, index: usize) -> Vec<u8> {
+    pattern(4096 * (index % 37) + 13 * index + 1, writer.wrapping_mul(31) ^ index as u8)
 }
 
 /// The small file's contents.
@@ -173,28 +175,43 @@ mod host {
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
             let output = String::from_utf8(stdout).unwrap();
-            if output != "OK\n" {
-                return TestOutcome::Fail(format!("expected exactly \"OK\\n\", got {output:?}"));
-            }
             let path = test_setup.tmp_dir.join("extents");
             if self.mode == Mode::Crash {
-                // The filesystem the guest left without unmounting is consistent, and holds
-                // what the guest fsynced.
+                // The guest stopped mid-workload: its filesystem is consistent, and holds every
+                // file whose fsync returned before it did.
+                let synced: Vec<(u8, usize)> = output
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("synced "))
+                    .map(|file| {
+                        let (writer, index) = file.split_once(' ').unwrap();
+                        (writer.parse().unwrap(), index.parse().unwrap())
+                    })
+                    .collect();
+                if synced.len() < 10 {
+                    return TestOutcome::Fail(format!("too few fsyncs returned: {output:?}"));
+                }
                 let storage = block_on(Storage::open(&path).unwrap().check()).unwrap();
                 let fs = block_on(Filesystem::mount(storage)).unwrap();
-                let file = block_on(fs.lookup(Inode::ROOT, b"durable")).unwrap();
-                assert_eq!(file.size, durable().len() as u64);
-                let mut contents = vec![0; durable().len()];
-                let mut read = 0;
-                while read < contents.len() {
-                    let n =
-                        block_on(fs.read(file.inode, read as u64, &mut contents[read..])).unwrap();
-                    assert_ne!(n, 0, "the file ends early, at {read}");
-                    read += n;
+                for (writer, index) in synced {
+                    let name = format!("synced-{writer}-{index}");
+                    let file = block_on(fs.lookup(Inode::ROOT, name.as_bytes())).unwrap();
+                    let expected = durable(writer, index);
+                    assert_eq!(file.size, expected.len() as u64, "{name}");
+                    let mut contents = vec![0; expected.len()];
+                    let mut read = 0;
+                    while read < contents.len() {
+                        let n = block_on(fs.read(file.inode, read as u64, &mut contents[read..]))
+                            .unwrap();
+                        assert_ne!(n, 0, "{name} ends early, at {read}");
+                        read += n;
+                    }
+                    assert!(contents == expected, "{name} holds other data");
                 }
-                assert_eq!(contents, durable());
                 block_on(fs.close()).unwrap();
                 return TestOutcome::Pass;
+            }
+            if output != "OK\n" {
+                return TestOutcome::Fail(format!("expected exactly \"OK\\n\", got {output:?}"));
             }
             // What the guest wrote is in the store, for the host's Fxfs as for the guest's.
             let fs = block_on(Filesystem::mount(Storage::open(&path).unwrap())).unwrap();
@@ -420,17 +437,35 @@ mod guest {
 
     /// Writes a file and fsyncs it and its directory, and writes more without, and leaves the
     /// filesystem mounted, for the VM to stop with.
-    fn crash() {
-        assert_eq!(names(MNT), Vec::<String>::new());
-        let mut file = fs::File::create(format!("{MNT}/durable")).unwrap();
-        file.write_all(&durable()).unwrap();
-        file.sync_all().unwrap();
-        fs::File::open(MNT).unwrap().sync_all().unwrap();
-        // Not synced: the filesystem may hold them or not, but is consistent either way.
-        for i in 0..16 {
-            fs::write(format!("{MNT}/pending-{i}"), pattern(100_000, i)).unwrap();
+    /// Writes and fsyncs file after file, and the directory, reporting each once both fsyncs
+    /// return, until the VM stops.
+    fn fsync_files(writer: u8) -> ! {
+        for index in 0.. {
+            let mut file = fs::File::create(format!("{MNT}/synced-{writer}-{index}")).unwrap();
+            file.write_all(&durable(writer, index)).unwrap();
+            file.sync_all().unwrap();
+            fs::File::open(MNT).unwrap().sync_all().unwrap();
+            // Each report a write of its own, as the VM may stop between writes.
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "synced {writer} {index}").unwrap();
+            stdout.flush().unwrap();
+            // Unsynced changes beside them, which the filesystem may hold or not.
+            fs::write(format!("{MNT}/pending-{writer}-{index}"), pattern(5000, writer)).unwrap();
+            if index % 3 == 0 {
+                let _ = fs::remove_file(format!("{MNT}/pending-{writer}-{}", index / 2));
+            }
         }
-        fs::remove_file(format!("{MNT}/pending-3")).unwrap();
+        unreachable!()
+    }
+
+    /// Stops the VM mid-workload: with two writers fsyncing, and without syncing.
+    fn crash() -> ! {
+        assert_eq!(names(MNT), Vec::<String>::new());
+        std::thread::spawn(|| fsync_files(1));
+        std::thread::spawn(|| fsync_files(2));
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        unsafe { libc::reboot(libc::RB_POWER_OFF) };
+        panic!("reboot: {}", std::io::Error::last_os_error());
     }
 
     /// The names in `dir`, sorted.
@@ -454,8 +489,6 @@ mod guest {
             mount("extents").unwrap();
             if self.mode == Mode::Crash {
                 crash();
-                println!("OK");
-                return;
             }
             let host_formats = self.mode == Mode::HostFormats;
             if host_formats {

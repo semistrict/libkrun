@@ -23,7 +23,7 @@ use std::result;
 use std::sync::Barrier;
 use std::sync::atomic::{Ordering, fence};
 use std::thread;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "fxdax"))]
 use std::time::Duration;
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};

@@ -985,7 +985,6 @@ dependencies = [
  "zerocopy",
  "zircon",
  "zx",
- "zx-status",
 ]
 
 [[package]]
@@ -1007,7 +1006,6 @@ dependencies = [
  "fscrypt",
  "fsverity_merkle",
  "fuchsia-async",
- "fuchsia-emulated-handle",
  "fuchsia-inspect",
  "fuchsia-sync",
  "fuchsia_merkle",

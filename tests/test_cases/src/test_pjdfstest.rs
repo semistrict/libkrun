@@ -4,6 +4,10 @@ pub struct TestPjdfstest {
     /// fxdax's pjdfstest-fxfs-guest: whether to boot fxdax's guest kernel (FXDAX_GUEST_KERNEL)
     /// and test its Fxfs, on an extent-store device on a new store, rather than the root.
     pub guest_fxfs: bool,
+    /// pjdfstest-fxfs-guest-dax: whether the device has a DAX window, which the guest's Fxfs maps
+    /// files' data from.
+    #[cfg_attr(feature = "guest", allow(dead_code))]
+    pub dax: bool,
 }
 
 /// Where the guest mounts its Fxfs.
@@ -72,7 +76,8 @@ mod host {
                 if self.guest_fxfs {
                     set_guest_kernel(ctx)?;
                     let store = test_setup.tmp_dir.join("extents");
-                    add_extent_store(ctx, c"extents", &store, 1 << 30, 0)?;
+                    let window = if self.dax { 1 << 28 } else { 0 };
+                    add_extent_store(ctx, c"extents", &store, 1 << 30, window)?;
                 }
                 setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_c_str()])?;
             }

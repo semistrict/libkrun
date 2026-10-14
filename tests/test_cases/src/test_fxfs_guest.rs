@@ -13,6 +13,9 @@
 // reporting each once its fsync returns, while another thread does too, and
 // powers the VM off in the middle, without syncing. The host checks the store's
 // filesystem (fsck), and finds every file the guest reported, whole.
+// fxfs-guest-dax and fxfs-guest-crash-dax: the same with a DAX window, which
+// the guest's Fxfs maps files' data from (on hosts whose pages are 4 KiB,
+// Fxfs's blocks): files are DAX, and reading one maps it rather than reading it.
 
 use macros::{guest, host};
 
@@ -26,24 +29,35 @@ enum Mode {
 
 pub struct TestFxfsGuest {
     mode: Mode,
+    /// Whether the device has a DAX window.
+    dax: bool,
 }
 
 impl TestFxfsGuest {
     /// fxfs-guest.
     pub fn host_formats() -> Self {
-        Self { mode: Mode::HostFormats }
+        Self { mode: Mode::HostFormats, dax: false }
     }
 
     /// fxfs-guest-format.
     pub fn guest_formats() -> Self {
-        Self { mode: Mode::GuestFormats }
+        Self { mode: Mode::GuestFormats, dax: false }
     }
 
     /// fxfs-guest-crash.
     pub fn crash() -> Self {
-        Self { mode: Mode::Crash }
+        Self { mode: Mode::Crash, dax: false }
+    }
+
+    /// The same test with a DAX window.
+    pub fn with_dax(self) -> Self {
+        Self { dax: true, ..self }
     }
 }
+
+/// The DAX window's size, when the device has one.
+#[cfg_attr(feature = "guest", allow(dead_code))]
+const WINDOW: u64 = 64 << 20;
 
 /// The contents of the crash test's file `index`, of `writer`: of a size and pattern its name
 /// gives, which the host checks.
@@ -125,7 +139,7 @@ mod host {
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 512))?;
                 set_guest_kernel(ctx)?;
-                add_extent_store(ctx, c"extents", &path, CAPACITY, 0)?;
+                add_extent_store(ctx, c"extents", &path, CAPACITY, if self.dax { WINDOW } else { 0 })?;
                 setup_fs_and_enter(ctx, test_setup)?;
             }
             unreachable!()
@@ -280,6 +294,14 @@ mod guest {
         assert_eq!(fs::read(&scratch).unwrap(), b"0123");
         file.set_len(6).unwrap();
         assert_eq!(fs::read(&scratch).unwrap(), b"0123\0\0");
+        // And with what the file held written back and dropped from memory in between, so that
+        // the zeros come from the filesystem.
+        file.sync_all().unwrap();
+        file.set_len(2).unwrap();
+        file.sync_all().unwrap();
+        fs::write("/proc/sys/vm/drop_caches", b"1").unwrap();
+        file.set_len(5).unwrap();
+        assert_eq!(fs::read(&scratch).unwrap(), b"01\0\0\0");
         drop(file);
         fs::remove_file(&scratch).unwrap();
         assert_eq!(
@@ -513,13 +535,65 @@ mod guest {
     }
 
     /// Stops the VM mid-workload: with two writers fsyncing, and without syncing.
-    fn crash() -> ! {
+    fn crash(dax: bool) -> ! {
         assert_eq!(names(MNT), Vec::<String>::new());
+        let probe = format!("{MNT}/probe");
+        fs::write(&probe, b"probe").unwrap();
+        assert_eq!(is_dax(&probe), dax, "the DAX attribute");
+        fs::remove_file(&probe).unwrap();
         std::thread::spawn(|| fsync_files(1));
         std::thread::spawn(|| fsync_files(2));
         std::thread::sleep(std::time::Duration::from_secs(2));
         unsafe { libc::reboot(libc::RB_POWER_OFF) };
         panic!("reboot: {}", std::io::Error::last_os_error());
+    }
+
+    /// Whether the kernel accesses `path` through the DAX window: STATX_ATTR_DAX.
+    fn is_dax(path: &str) -> bool {
+        const STATX_ATTR_DAX: u64 = 0x200000;
+        // struct statx: stx_attributes at byte 8, stx_attributes_mask at 56.
+        let mut buf = [0u64; 32];
+        let c_path = CString::new(path).unwrap();
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                0,
+                0x7ff, // STATX_BASIC_STATS
+                buf.as_mut_ptr(),
+            )
+        };
+        assert_eq!(ret, 0, "statx: {}", std::io::Error::last_os_error());
+        let (attributes, mask) = (buf[1], buf[7]);
+        assert_ne!(mask & STATX_ATTR_DAX, 0, "the kernel does not report DAX");
+        attributes & STATX_ATTR_DAX != 0
+    }
+
+    /// The device's count of the requests of `kind` (as `device_requests` names them).
+    fn requests(kind: &str) -> u64 {
+        device_requests()
+            .lines()
+            .find_map(|line| line.strip_prefix(kind)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("no count of {kind} requests"))
+    }
+
+    /// A file's data maps from the window: read in again after its inode is evicted, it takes a
+    /// MAP of each of its extents, and no READ. One write(2) of 3 MiB writes each 2 MiB chunk's
+    /// part in extents of at most 1.75 MiB (448 blocks, whose checksums fit Fxfs's records): two
+    /// for the first chunk, and one for the rest.
+    fn read_maps() {
+        let path = format!("{MNT}/mapped-read");
+        let data = pattern((3 << 20) + 5, 0x3c);
+        fs::write(&path, &data).unwrap();
+        assert!(is_dax(&path), "{path} is not DAX");
+        fs::File::open(&path).unwrap().sync_all().unwrap();
+        fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
+        let (reads, maps) = (requests("read"), requests("map"));
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(requests("read"), reads, "reading the file read from the device");
+        assert_eq!(requests("map"), maps + 3, "the file's extents' MAPs");
+        fs::remove_file(&path).unwrap();
     }
 
     /// The extent-store device's count of the requests it has taken, by type.
@@ -580,7 +654,7 @@ mod guest {
             );
             mount("extents").unwrap();
             if self.mode == Mode::Crash {
-                crash();
+                crash(self.dax);
             }
             let host_formats = self.mode == Mode::HostFormats;
             if host_formats {
@@ -594,7 +668,15 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
+            assert_eq!(
+                is_dax(&format!("{MNT}/guest-dir/renamed")),
+                self.dax,
+                "the DAX attribute"
+            );
             metadata_cached();
+            if self.dax {
+                read_maps();
+            }
 
             // The store mounted again, elsewhere, is the same filesystem.
             const MNT2: &str = "/mnt/fxfs2";

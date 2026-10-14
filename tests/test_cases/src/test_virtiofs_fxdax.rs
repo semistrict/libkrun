@@ -9,7 +9,9 @@
 //
 // fxfs-guest-checks boots fxdax's guest kernel (FXDAX_GUEST_KERNEL) instead,
 // with the image, an extent store, as an extent-store device, and the guest
-// mounts it with the kernel's Fxfs.
+// mounts it with the kernel's Fxfs; fxfs-guest-checks-dax with a DAX window,
+// which Fxfs maps files' data from (on hosts whose pages are 4 KiB, Fxfs's
+// blocks).
 
 use macros::{guest, host};
 
@@ -124,7 +126,8 @@ mod host {
                     let ctx = krun_call_u32!(krun_create_ctx())?;
                     krun_call!(krun_set_vm_config(ctx, 2, 512))?;
                     set_guest_kernel(ctx)?;
-                    add_extent_store(ctx, c"fxdax", &image, IMAGE_SIZE, 0)?;
+                    let window = if self.dax { 1 << 29 } else { 0 };
+                    add_extent_store(ctx, c"fxdax", &image, IMAGE_SIZE, window)?;
                     setup_fs_and_enter(ctx, test_setup)?;
                 }
                 unreachable!()

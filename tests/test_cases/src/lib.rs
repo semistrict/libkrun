@@ -162,10 +162,19 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-memory", Box::new(TestVirtiofsFxdaxMemory)),
-        TestCase::new("pjdfstest", Box::new(TestPjdfstest { guest_fxfs: false })),
+        TestCase::new(
+            "pjdfstest",
+            Box::new(TestPjdfstest {
+                guest_fxfs: false,
+                dax: false,
+            }),
+        ),
         TestCase::new(
             "pjdfstest-fxfs-guest",
-            Box::new(TestPjdfstest { guest_fxfs: true }),
+            Box::new(TestPjdfstest {
+                guest_fxfs: true,
+                dax: false,
+            }),
         ),
         TestCase::new("fxfs-guest", Box::new(TestFxfsGuest::host_formats())),
         TestCase::new("fxfs-guest-format", Box::new(TestFxfsGuest::guest_formats())),
@@ -176,6 +185,23 @@ pub fn test_cases() -> Vec<TestCase> {
             Box::new(TestVirtiofsFxdax {
                 dax: false,
                 guest_fxfs: true,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "fxfs-guest-checks-dax",
+            Box::new(TestVirtiofsFxdax {
+                dax: true,
+                guest_fxfs: true,
+            }),
+        ),
+        TestCase::new("fxfs-guest-dax", Box::new(TestFxfsGuest::host_formats().with_dax())),
+        TestCase::new("fxfs-guest-crash-dax", Box::new(TestFxfsGuest::crash().with_dax())),
+        TestCase::new(
+            "pjdfstest-fxfs-guest-dax",
+            Box::new(TestPjdfstest {
+                guest_fxfs: true,
+                dax: true,
             }),
         ),
         TestCase::new("extent-guest", Box::new(TestExtentGuest)),

@@ -631,7 +631,8 @@ pub fn build_microvm(
         guest_memory = restore_pages_img(snap_path, &meta.ram)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
         crate::timing_event("build_microvm.snapshot.ram.mapped");
-        for region in build_pmem_regions_for_guest(vm_resources, &arch_memory_info)?.0 {
+        for region in build_pmem_regions_for_guest(vm_resources, &arch_memory_info, &_shm_manager)?.0
+        {
             guest_memory = guest_memory
                 .insert_region(Arc::new(region))
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
@@ -1920,7 +1921,8 @@ pub fn create_guest_memory(
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
     };
 
-    let (pmem_mappings, pmem_regions) = build_pmem_regions_for_guest(vm_resources, &arch_mem_info)?;
+    let (pmem_mappings, pmem_regions) =
+        build_pmem_regions_for_guest(vm_resources, &arch_mem_info, &shm_manager)?;
     for region in pmem_mappings {
         guest_mem = guest_mem
             .insert_region(Arc::new(region))
@@ -1969,16 +1971,18 @@ pub fn create_guest_memory(
     ))
 }
 
+/// The pmem devices' regions, after the shared memory regions, which start where they would.
 fn build_pmem_regions_for_guest(
     vm_resources: &VmResources,
     arch_mem_info: &ArchMemoryInfo,
+    shm_manager: &ShmManager,
 ) -> std::result::Result<
     (Vec<vm_memory::mmap::GuestRegionMmap>, Vec<PmemRegionConfig>),
     StartMicrovmError,
 > {
     build_pmem_regions(
         vm_resources.pmem.list(),
-        arch_mem_info.shm_start_addr,
+        shm_manager.end(),
         arch_mem_info.page_size,
     )
     .map_err(StartMicrovmError::GuestMemoryMmap)

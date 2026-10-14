@@ -35,6 +35,11 @@ impl ShmManager {
         }
     }
 
+    /// The first guest address past the regions, where other regions may start.
+    pub fn end(&self) -> u64 {
+        self.next_guest_addr
+    }
+
     pub fn regions(&self) -> Vec<(GuestAddress, usize)> {
         let mut regions: Vec<(GuestAddress, usize)> = Vec::new();
 

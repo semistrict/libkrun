@@ -628,7 +628,8 @@ mod guest {
 
     /// A file's data maps from the window: read in again after its inode is evicted, it takes a
     /// MAP of each of its extents, and no READ. Written back a MiB at a time (FXFS_IO_MAX), 3 MiB
-    /// and a bit are in four extents: two in each 2 MiB chunk.
+    /// and a bit are in four extents: two in each 2 MiB chunk. Its window ranges outlive its
+    /// inode: evicted and read in again, it takes neither.
     fn read_maps() {
         let path = format!("{MNT}/mapped-read");
         let data = pattern((3 << 20) + 5, 0x3c);
@@ -641,6 +642,10 @@ mod guest {
         assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(requests("read"), reads, "reading the file read from the device");
         assert_eq!(requests("map"), maps + 4, "the file's extents' MAPs");
+        evict(&path);
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(requests("read"), reads, "reading the file again read from the device");
+        assert_eq!(requests("map"), maps + 4, "reading the file again mapped its extents");
         fs::remove_file(&path).unwrap();
     }
 

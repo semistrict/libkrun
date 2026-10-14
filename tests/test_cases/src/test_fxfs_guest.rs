@@ -82,40 +82,14 @@ fn written() -> Vec<u8> {
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
+    use crate::common::{add_extent_store, set_guest_kernel, setup_fs_and_enter};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use futures::executor::block_on;
     use fxdax::{Filesystem, Inode, Owner, Storage};
     use krun_sys::*;
-    use nix::libc;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::ptr::null;
-
-    /// The format libkrun loads the kernel in: an Image on arm64, an ELF vmlinux on x86-64.
-    const KERNEL_FORMAT: u32 = if cfg!(target_arch = "aarch64") {
-        KRUN_KERNEL_FORMAT_RAW
-    } else {
-        KRUN_KERNEL_FORMAT_ELF
-    };
 
     /// The store's capacity.
     const CAPACITY: u64 = 64 << 20;
-
-    type KrunAddExtentStoreFn = unsafe extern "C" fn(
-        ctx_id: u32,
-        c_tag: *const std::ffi::c_char,
-        c_path: *const std::ffi::c_char,
-        capacity: u64,
-        shm_size: u64,
-    ) -> i32;
-
-    fn get_krun_add_extent_store() -> KrunAddExtentStoreFn {
-        let symbol = CString::new("krun_add_extent_store").unwrap();
-        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-        assert!(!ptr.is_null(), "krun_add_extent_store not found");
-        unsafe { std::mem::transmute(ptr) }
-    }
 
     impl Test for TestFxfsGuest {
         fn should_run(&self) -> ShouldRun {
@@ -146,28 +120,12 @@ mod host {
                 })?;
             }
 
-            let krun_add_extent_store = get_krun_add_extent_store();
-            let kernel = CString::new(std::env::var("FXDAX_GUEST_KERNEL")?)?;
-            let store = CString::new(path.as_os_str().as_bytes())?;
             unsafe {
                 krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_WARN))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 512))?;
-                // libkrun's own command line, as with libkrunfw's kernel.
-                krun_call!(krun_set_kernel(
-                    ctx,
-                    kernel.as_ptr(),
-                    KERNEL_FORMAT,
-                    null(),
-                    null()
-                ))?;
-                krun_call!(krun_add_extent_store(
-                    ctx,
-                    c"extents".as_ptr(),
-                    store.as_ptr(),
-                    CAPACITY,
-                    0,
-                ))?;
+                set_guest_kernel(ctx)?;
+                add_extent_store(ctx, c"extents", &path, CAPACITY, 0)?;
                 setup_fs_and_enter(ctx, test_setup)?;
             }
             unreachable!()

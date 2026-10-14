@@ -1,16 +1,23 @@
-// Test the fxdax virtio-fs backend, with DAX and without.
+// Test the fxdax virtio-fs backend, with DAX and without, and the same checks
+// on the guest kernel's own Fxfs (fxfs-guest-checks).
 //
 // The host creates an fxdax image and exposes it with krun_add_virtiofs_fxdax.
 // The guest mounts it with dax=always or dax=never, checks whether files are
 // DAX-mapped, and exercises writes through mappings, regular writes and
 // namespace operations, and evicts a file to write it back. After the VM exits
 // the host reopens the image, checks it, and checks what the guest left behind.
+//
+// fxfs-guest-checks boots fxdax's guest kernel (FXDAX_GUEST_KERNEL) instead,
+// with the image, an extent store, as an extent-store device, and the guest
+// mounts it with the kernel's Fxfs.
 
 use macros::{guest, host};
 
 pub struct TestVirtiofsFxdax {
     /// Whether the device has a DAX window, and the guest maps files into it.
     pub dax: bool,
+    /// Whether the guest's kernel mounts the image with its own Fxfs, rather than virtio-fs.
+    pub guest_fxfs: bool,
 }
 
 /// Offset of the second 2 MiB DAX chunk.
@@ -32,7 +39,7 @@ fn pattern(offset: usize) -> u8 {
 mod host {
     use super::*;
 
-    use crate::common::setup_rootfs;
+    use crate::common::{add_extent_store, set_guest_kernel, setup_fs_and_enter, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use futures::executor::block_on;
     use fxdax::{Attr, Filesystem, Inode, Owner, Storage};
@@ -98,6 +105,9 @@ mod host {
             {
                 return ShouldRun::No("libkrun compiled without FXDAX");
             }
+            if self.guest_fxfs && std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
+                return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
+            }
             ShouldRun::Yes
         }
 
@@ -106,6 +116,20 @@ mod host {
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            if self.guest_fxfs {
+                let image = test_setup.tmp_dir.join("fxdax.img");
+                create_image(&image)?;
+                unsafe {
+                    krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_WARN))?;
+                    let ctx = krun_call_u32!(krun_create_ctx())?;
+                    krun_call!(krun_set_vm_config(ctx, 2, 512))?;
+                    set_guest_kernel(ctx)?;
+                    add_extent_store(ctx, c"fxdax", &image, IMAGE_SIZE, 0)?;
+                    setup_fs_and_enter(ctx, test_setup)?;
+                }
+                unreachable!()
+            }
+
             let krun_add_virtiofs_fxdax = get_krun_add_virtiofs_fxdax();
 
             let root_dir = setup_rootfs(&test_setup)?;
@@ -197,19 +221,25 @@ mod guest {
         format!("{MNT}/{name}")
     }
 
-    fn mount(dax: bool) {
+    /// Mounts the image: with virtio-fs, with DAX or without, or with the kernel's Fxfs.
+    fn mount(dax: bool, guest_fxfs: bool) {
         fs::create_dir_all(MNT).unwrap();
         let source = CString::new("fxdax").unwrap();
         let target = CString::new(MNT).unwrap();
-        let fstype = CString::new("virtiofs").unwrap();
+        let fstype = CString::new(if guest_fxfs { "fxfs" } else { "virtiofs" }).unwrap();
         let options = CString::new(if dax { "dax=always" } else { "dax=never" }).unwrap();
+        let options = if guest_fxfs {
+            std::ptr::null()
+        } else {
+            options.as_ptr()
+        };
         let ret = unsafe {
             libc::mount(
                 source.as_ptr(),
                 target.as_ptr(),
                 fstype.as_ptr(),
                 0,
-                options.as_ptr().cast(),
+                options.cast(),
             )
         };
         assert_eq!(ret, 0, "mount: {}", std::io::Error::last_os_error());
@@ -394,7 +424,7 @@ mod guest {
     impl Test for TestVirtiofsFxdax {
         fn in_guest(self: Box<Self>) {
             let dax = self.dax;
-            mount(dax);
+            mount(dax, self.guest_fxfs);
 
             let mmap_write = || test_mmap_write(dax);
             let tests: &[(&str, &dyn Fn())] = &[

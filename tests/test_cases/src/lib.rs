@@ -143,11 +143,20 @@ pub fn test_cases() -> Vec<TestCase> {
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-misc", Box::new(TestVirtioFsMisc)),
         #[cfg(any(feature = "host", target_os = "linux"))]
-        TestCase::new("virtiofs-fxdax", Box::new(TestVirtiofsFxdax { dax: true })),
+        TestCase::new(
+            "virtiofs-fxdax",
+            Box::new(TestVirtiofsFxdax {
+                dax: true,
+                guest_fxfs: false,
+            }),
+        ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(
             "virtiofs-fxdax-nodax",
-            Box::new(TestVirtiofsFxdax { dax: false }),
+            Box::new(TestVirtiofsFxdax {
+                dax: false,
+                guest_fxfs: false,
+            }),
         ),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new("virtiofs-fxdax-volumes", Box::new(TestVirtiofsFxdaxVolumes)),
@@ -157,6 +166,14 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("fxfs-guest", Box::new(TestFxfsGuest::host_formats())),
         TestCase::new("fxfs-guest-format", Box::new(TestFxfsGuest::guest_formats())),
         TestCase::new("fxfs-guest-crash", Box::new(TestFxfsGuest::crash())),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "fxfs-guest-checks",
+            Box::new(TestVirtiofsFxdax {
+                dax: false,
+                guest_fxfs: true,
+            }),
+        ),
         TestCase::new("extent-guest", Box::new(TestExtentGuest)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(

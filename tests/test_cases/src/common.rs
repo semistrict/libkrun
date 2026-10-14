@@ -66,3 +66,58 @@ pub fn setup_fs_and_enter_with_env(
     }
     unreachable!()
 }
+
+/// The format libkrun loads fxdax's guest kernel in: an Image on arm64, an ELF vmlinux on x86-64.
+const GUEST_KERNEL_FORMAT: u32 = if cfg!(target_arch = "aarch64") {
+    KRUN_KERNEL_FORMAT_RAW
+} else {
+    KRUN_KERNEL_FORMAT_ELF
+};
+
+/// Boots the kernel fxdax's scripts/build-guest-kernel.sh builds, which FXDAX_GUEST_KERNEL names,
+/// instead of libkrunfw's, with libkrun's own command line.
+pub fn set_guest_kernel(ctx: u32) -> anyhow::Result<()> {
+    let kernel = CString::new(std::env::var("FXDAX_GUEST_KERNEL")?)?;
+    unsafe {
+        krun_call!(krun_set_kernel(
+            ctx,
+            kernel.as_ptr(),
+            GUEST_KERNEL_FORMAT,
+            null(),
+            null()
+        ))
+    }
+}
+
+type KrunAddExtentStoreFn = unsafe extern "C" fn(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    capacity: u64,
+    shm_size: u64,
+) -> i32;
+
+/// Adds an extent-store device tagged `tag`, on the store at `path`, which it makes, holding at
+/// most `capacity` bytes, if it doesn't exist; with a DAX window of `shm_size` bytes if not 0.
+pub fn add_extent_store(
+    ctx: u32,
+    tag: &CStr,
+    path: &Path,
+    capacity: u64,
+    shm_size: u64,
+) -> anyhow::Result<()> {
+    let symbol = c"krun_add_extent_store";
+    let ptr = unsafe { nix::libc::dlsym(nix::libc::RTLD_DEFAULT, symbol.as_ptr()) };
+    anyhow::ensure!(!ptr.is_null(), "krun_add_extent_store not found");
+    let krun_add_extent_store: KrunAddExtentStoreFn = unsafe { std::mem::transmute(ptr) };
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    unsafe {
+        krun_call!(krun_add_extent_store(
+            ctx,
+            tag.as_ptr(),
+            path.as_ptr(),
+            capacity,
+            shm_size,
+        ))
+    }
+}

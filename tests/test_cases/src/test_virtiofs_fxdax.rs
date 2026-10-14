@@ -178,8 +178,15 @@ mod host {
 
             let mapped = read_path(&fs, "dax-mapped");
             assert_eq!(mapped.len(), MAPPED_SIZE, "host: dax-mapped size");
+            // The guest's Fxfs, with a window, wrote more once the file was read in as DAX.
+            let dax_writes = self.dax && self.guest_fxfs;
+            let after = CHUNK + 4096;
             for (offset, &byte) in mapped.iter().enumerate() {
-                let expected = if (CHUNK..CHUNK + WRITTEN.len()).contains(&offset) {
+                let expected = if dax_writes && offset < EVICTED.len() {
+                    EVICTED[offset]
+                } else if dax_writes && (after..after + WRITTEN.len()).contains(&offset) {
+                    WRITTEN[offset - after]
+                } else if (CHUNK..CHUNK + WRITTEN.len()).contains(&offset) {
                     WRITTEN[offset - CHUNK]
                 } else {
                     pattern(offset)
@@ -249,6 +256,18 @@ mod guest {
     }
 
     /// Whether the kernel accesses `path` through the DAX window.
+    /// Evicts `path`'s inode, for it to be read in again: written back, and its pages dropped,
+    /// as an inode that has any isn't evicted (dropping every cache would drop the filesystem's
+    /// metadata's too).
+    fn evict(path: &str) {
+        let file = fs::File::open(path).unwrap();
+        file.sync_all().unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
+        drop(file);
+        fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
+    }
+
     fn is_dax(path: &str) -> bool {
         const STATX_ATTR_DAX: u64 = 0x200000;
         // struct statx: stx_attributes at byte 8, stx_attributes_mask at 56
@@ -278,7 +297,7 @@ mod guest {
         assert_eq!(fs::read(path("from-host")).unwrap(), HOST_CONTENT);
     }
 
-    fn test_mmap_write(dax: bool) {
+    fn test_mmap_write(dax: bool, reloaded_dax: bool) {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -287,9 +306,11 @@ mod guest {
             .open(path("dax-mapped"))
             .unwrap();
         file.set_len(MAPPED_SIZE as u64).unwrap();
+        // The guest's Fxfs maps a file's data from the window only once its inode is read in
+        // again, large (`reloaded_dax`); virtio-fs as it is created.
         assert_eq!(
             is_dax(&path("dax-mapped")),
-            dax,
+            dax && !reloaded_dax,
             "dax-mapped's DAX attribute"
         );
 
@@ -330,6 +351,44 @@ mod guest {
         assert_eq!(unsafe { libc::msync(map, MAPPED_SIZE, libc::MS_SYNC) }, 0);
         assert_eq!(unsafe { libc::munmap(map, MAPPED_SIZE) }, 0);
         file.sync_all().unwrap();
+        drop(file);
+        if reloaded_dax {
+            evict(&path("dax-mapped"));
+            assert!(is_dax(&path("dax-mapped")), "dax-mapped isn't DAX once read in again");
+            let data = fs::read(path("dax-mapped")).unwrap();
+            assert_eq!(&data[CHUNK..CHUNK + WRITTEN.len()], WRITTEN);
+
+            // Writes to it, through a mapping and with write(2), go through the window.
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path("dax-mapped"))
+                .unwrap();
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    MAPPED_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(map, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+            let bytes = unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>(), MAPPED_SIZE) };
+            bytes[..EVICTED.len()].copy_from_slice(EVICTED);
+            let mut writer = &file;
+            writer.seek(SeekFrom::Start(CHUNK as u64 + 4096)).unwrap();
+            writer.write_all(WRITTEN).unwrap();
+            assert_eq!(&bytes[CHUNK + 4096..CHUNK + 4096 + WRITTEN.len()], WRITTEN);
+            assert_eq!(unsafe { libc::msync(map, MAPPED_SIZE, libc::MS_SYNC) }, 0);
+            assert_eq!(unsafe { libc::munmap(map, MAPPED_SIZE) }, 0);
+            file.sync_all().unwrap();
+            drop(file);
+            let data = fs::read(path("dax-mapped")).unwrap();
+            assert_eq!(&data[..EVICTED.len()], EVICTED);
+            assert_eq!(&data[CHUNK + 4096..CHUNK + 4096 + WRITTEN.len()], WRITTEN);
+        }
     }
 
     fn test_regular_write() {
@@ -429,7 +488,7 @@ mod guest {
             let dax = self.dax;
             mount(dax, self.guest_fxfs);
 
-            let mmap_write = || test_mmap_write(dax);
+            let mmap_write = || test_mmap_write(dax, dax && self.guest_fxfs);
             let tests: &[(&str, &dyn Fn())] = &[
                 ("host_file", &test_host_file),
                 ("mmap_write", &mmap_write),

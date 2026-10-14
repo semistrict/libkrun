@@ -231,6 +231,18 @@ mod guest {
 
     const MNT: &str = "/mnt/fxfs";
 
+    /// Evicts `path`'s inode, for it to be read in again: written back, and its pages dropped,
+    /// as an inode that has any isn't evicted (dropping every cache would drop the filesystem's
+    /// metadata's too).
+    fn evict(path: &str) {
+        let file = fs::File::open(path).unwrap();
+        file.sync_all().unwrap();
+        let fd = file.as_raw_fd();
+        assert_eq!(unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) }, 0);
+        drop(file);
+        fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
+    }
+
     fn mount(source: &str) -> std::io::Result<()> {
         mount_at(source, MNT)
     }
@@ -553,10 +565,17 @@ mod guest {
     /// doesn't).
     fn crash(dax: bool) -> ! {
         assert_eq!(names(MNT), Vec::<String>::new());
-        let probe = format!("{MNT}/probe");
-        fs::write(&probe, b"probe").unwrap();
+        // A file of 1 MiB or more maps its data from the window once read in again; a small one
+        // doesn't.
+        let (probe, small) = (format!("{MNT}/probe"), format!("{MNT}/small"));
+        fs::write(&probe, pattern(2 << 20, 1)).unwrap();
+        fs::write(&small, b"small").unwrap();
+        evict(&probe);
+        evict(&small);
         assert_eq!(is_dax(&probe), dax, "the DAX attribute");
+        assert!(!is_dax(&small), "a small file is DAX");
         fs::remove_file(&probe).unwrap();
+        fs::remove_file(&small).unwrap();
         std::thread::spawn(|| fsync_files(1));
         std::thread::spawn(|| fsync_files(2));
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -596,20 +615,18 @@ mod guest {
     }
 
     /// A file's data maps from the window: read in again after its inode is evicted, it takes a
-    /// MAP of each of its extents, and no READ. One write(2) of 3 MiB writes each 2 MiB chunk's
-    /// part in extents of at most 1.75 MiB (448 blocks, whose checksums fit Fxfs's records): two
-    /// for the first chunk, and one for the rest.
+    /// MAP of each of its extents, and no READ. Written back a MiB at a time (FXFS_IO_MAX), 3 MiB
+    /// and a bit are in four extents: two in each 2 MiB chunk.
     fn read_maps() {
         let path = format!("{MNT}/mapped-read");
         let data = pattern((3 << 20) + 5, 0x3c);
         fs::write(&path, &data).unwrap();
+        evict(&path);
         assert!(is_dax(&path), "{path} is not DAX");
-        fs::File::open(&path).unwrap().sync_all().unwrap();
-        fs::write("/proc/sys/vm/drop_caches", b"2").unwrap();
         let (reads, maps) = (requests("read"), requests("map"));
         assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(requests("read"), reads, "reading the file read from the device");
-        assert_eq!(requests("map"), maps + 3, "the file's extents' MAPs");
+        assert_eq!(requests("map"), maps + 4, "the file's extents' MAPs");
         fs::remove_file(&path).unwrap();
     }
 
@@ -685,11 +702,12 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
-            assert_eq!(
-                is_dax(&format!("{MNT}/guest-dir/renamed")),
-                self.dax,
-                "the DAX attribute"
-            );
+            // Files are in the page cache as written; read in again, one of 1 MiB or more maps
+            // its data from the window.
+            let renamed = format!("{MNT}/guest-dir/renamed");
+            assert!(!is_dax(&renamed), "a file written is DAX");
+            evict(&renamed);
+            assert_eq!(is_dax(&renamed), self.dax, "the DAX attribute");
             metadata_cached();
             if self.dax {
                 read_maps();

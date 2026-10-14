@@ -15,7 +15,7 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::worker::ExtentWorker;
 use super::{
     Config, MAX_EXTENT, MAX_ROOT, MAX_TRANSFER, NUM_QUEUES, QUEUE_CONFIG, QUEUE_SIZE, TYPE_EXTENT,
-    VIRTIO_EXTENT_F_DAX,
+    VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE,
 };
 #[cfg(target_os = "linux")]
 use crate::virtio::fs::PrefaultGuestMemory;
@@ -91,7 +91,8 @@ impl Extent {
     /// Makes `shm_region` the device's DAX window.
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
-        self.avail_features |= 1 << VIRTIO_EXTENT_F_DAX;
+        // The store maps open extents writably too (doc-4's DAX_WRITE).
+        self.avail_features |= (1 << VIRTIO_EXTENT_F_DAX) | (1 << VIRTIO_EXTENT_F_DAX_WRITE);
     }
 
     /// Has `prefault` map the DAX window's pages for the guest as the store

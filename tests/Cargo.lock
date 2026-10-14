@@ -302,7 +302,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cipher",
  "cpufeatures",
  "rand_core 0.10.1",
 ]
@@ -313,7 +312,6 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
- "block-buffer",
  "crypto-common",
  "inout",
 ]
@@ -799,7 +797,6 @@ dependencies = [
  "zerocopy",
  "zircon",
  "zx",
- "zx-status",
 ]
 
 [[package]]
@@ -821,7 +818,6 @@ dependencies = [
  "fscrypt",
  "fsverity_merkle",
  "fuchsia-async",
- "fuchsia-emulated-handle",
  "fuchsia-inspect",
  "fuchsia-sync",
  "fuchsia_merkle",
@@ -860,7 +856,6 @@ dependencies = [
  "async-trait",
  "byteorder",
  "cbc",
- "chacha20",
  "fidl-fuchsia-fxfs",
  "fprint",
  "fscrypt",

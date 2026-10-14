@@ -21,6 +21,8 @@ pub const TYPE_EXTENT: u32 = 0x4658;
 
 /// Shared memory region 0 is a DAX window, and `MAP`/`UNMAP` work.
 pub const VIRTIO_EXTENT_F_DAX: u32 = 0;
+/// `MAP` maps open extents writably.
+pub const VIRTIO_EXTENT_F_DAX_WRITE: u32 = 1;
 
 pub const VIRTIO_EXTENT_T_READ: u32 = 1;
 pub const VIRTIO_EXTENT_T_WRITE: u32 = 2;
@@ -36,8 +38,7 @@ pub const VIRTIO_EXTENT_WRITE_BARRIER: u32 = 1 << 0;
 /// A `COMMIT`'s flags: it completes once durable; it sets the root.
 pub const VIRTIO_EXTENT_COMMIT_DURABLE: u32 = 1 << 0;
 pub const VIRTIO_EXTENT_COMMIT_ROOT: u32 = 1 << 1;
-/// A `MAP`'s flag: writable, which needs `DAX_WRITE`, which the device
-/// doesn't offer.
+/// A `MAP`'s flag: writable, which needs `DAX_WRITE`.
 pub const VIRTIO_EXTENT_MAP_WRITE: u32 = 1 << 0;
 
 const NUM_QUEUES: usize = 1;
@@ -49,7 +50,7 @@ const MAX_TRANSFER: u32 = 8 << 20;
 /// The most bytes the root holds.
 const MAX_ROOT: u32 = 4096;
 /// The most bytes one extent holds.
-const MAX_EXTENT: u64 = 64 << 20;
+const MAX_EXTENT: u64 = fxdax::ExtentStore::MAX_EXTENT;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]

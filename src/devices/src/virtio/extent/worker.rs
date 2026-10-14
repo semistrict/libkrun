@@ -212,7 +212,7 @@ fn serve(
         }
         VIRTIO_EXTENT_T_MAP => {
             let args: MapArgs = reader.read_obj().map_err(invalid)?;
-            if flags & VIRTIO_EXTENT_MAP_WRITE != 0 {
+            if flags & !VIRTIO_EXTENT_MAP_WRITE != 0 {
                 return Err(Errno::EINVAL);
             }
             store.map(
@@ -220,6 +220,7 @@ fn serve(
                 u64::from_le(args.offset),
                 u64::from_le(args.len),
                 u64::from_le(args.window_offset),
+                flags & VIRTIO_EXTENT_MAP_WRITE != 0,
             )
         }
         VIRTIO_EXTENT_T_UNMAP => {
@@ -520,11 +521,18 @@ mod tests {
             request(&store, &[0; 4], RESPONSE).1,
             Errno::EINVAL.raw() as u32
         );
-        // Without a DAX window.
-        let map = bytes(VIRTIO_EXTENT_T_MAP, 0, Some(MapArgs::default()), &[]);
+        // Without a DAX window, writable or not; and a MAP flag the device doesn't know.
+        for flags in [0, VIRTIO_EXTENT_MAP_WRITE] {
+            let map = bytes(VIRTIO_EXTENT_T_MAP, flags, Some(MapArgs::default()), &[]);
+            assert_eq!(
+                request(&store, &map, RESPONSE).1,
+                Errno::ENOSYS.raw() as u32
+            );
+        }
+        let map = bytes(VIRTIO_EXTENT_T_MAP, 1 << 1, Some(MapArgs::default()), &[]);
         assert_eq!(
             request(&store, &map, RESPONSE).1,
-            Errno::ENOSYS.raw() as u32
+            Errno::EINVAL.raw() as u32
         );
     }
 }

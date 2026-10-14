@@ -156,6 +156,7 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("pjdfstest", Box::new(TestPjdfstest)),
         TestCase::new("fxfs-guest", Box::new(TestFxfsGuest::host_formats())),
         TestCase::new("fxfs-guest-format", Box::new(TestFxfsGuest::guest_formats())),
+        TestCase::new("fxfs-guest-crash", Box::new(TestFxfsGuest::crash())),
         TestCase::new("extent-guest", Box::new(TestExtentGuest)),
         #[cfg(any(feature = "host", target_os = "linux"))]
         TestCase::new(

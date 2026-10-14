@@ -9,24 +9,44 @@
 // fxfs-guest: the host makes an fxdax filesystem on the store first, with a
 // file, and a directory holding a larger file, which the guest lists and reads.
 // fxfs-guest-format: the store holds nothing, and the guest's Fxfs formats it.
+// fxfs-guest-crash: the guest formats the store, writes a file it fsyncs and
+// files it doesn't, and stops without unmounting. The host checks the store's
+// filesystem (fsck), and finds the file the guest fsynced.
 
 use macros::{guest, host};
 
+/// How a test makes and leaves the filesystem.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    HostFormats,
+    GuestFormats,
+    Crash,
+}
+
 pub struct TestFxfsGuest {
-    /// Whether the host makes the filesystem, rather than the guest.
-    host_formats: bool,
+    mode: Mode,
 }
 
 impl TestFxfsGuest {
     /// fxfs-guest.
     pub fn host_formats() -> Self {
-        Self { host_formats: true }
+        Self { mode: Mode::HostFormats }
     }
 
     /// fxfs-guest-format.
     pub fn guest_formats() -> Self {
-        Self { host_formats: false }
+        Self { mode: Mode::GuestFormats }
     }
+
+    /// fxfs-guest-crash.
+    pub fn crash() -> Self {
+        Self { mode: Mode::Crash }
+    }
+}
+
+/// What the crash test's guest fsyncs.
+fn durable() -> Vec<u8> {
+    pattern((1 << 20) + 4321, 0x3c)
 }
 
 /// The small file's contents.
@@ -110,7 +130,7 @@ mod host {
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let path = test_setup.tmp_dir.join("extents");
-            if self.host_formats {
+            if self.mode == Mode::HostFormats {
                 block_on(async {
                     let fs = Filesystem::format(Storage::create(&path, CAPACITY)?).await?;
                     let owner = Owner { uid: 0, gid: 0 };
@@ -156,8 +176,27 @@ mod host {
             if output != "OK\n" {
                 return TestOutcome::Fail(format!("expected exactly \"OK\\n\", got {output:?}"));
             }
-            // What the guest wrote is in the store, for the host's Fxfs as for the guest's.
             let path = test_setup.tmp_dir.join("extents");
+            if self.mode == Mode::Crash {
+                // The filesystem the guest left without unmounting is consistent, and holds
+                // what the guest fsynced.
+                let storage = block_on(Storage::open(&path).unwrap().check()).unwrap();
+                let fs = block_on(Filesystem::mount(storage)).unwrap();
+                let file = block_on(fs.lookup(Inode::ROOT, b"durable")).unwrap();
+                assert_eq!(file.size, durable().len() as u64);
+                let mut contents = vec![0; durable().len()];
+                let mut read = 0;
+                while read < contents.len() {
+                    let n =
+                        block_on(fs.read(file.inode, read as u64, &mut contents[read..])).unwrap();
+                    assert_ne!(n, 0, "the file ends early, at {read}");
+                    read += n;
+                }
+                assert_eq!(contents, durable());
+                block_on(fs.close()).unwrap();
+                return TestOutcome::Pass;
+            }
+            // What the guest wrote is in the store, for the host's Fxfs as for the guest's.
             let fs = block_on(Filesystem::mount(Storage::open(&path).unwrap())).unwrap();
             let lookup = |parent, name: &str| block_on(fs.lookup(parent, name.as_bytes())).unwrap();
             let dir = lookup(Inode::ROOT, "guest-dir");
@@ -379,6 +418,21 @@ mod guest {
         assert_eq!(fs::read(format!("{MNT}/link")).unwrap(), written());
     }
 
+    /// Writes a file and fsyncs it and its directory, and writes more without, and leaves the
+    /// filesystem mounted, for the VM to stop with.
+    fn crash() {
+        assert_eq!(names(MNT), Vec::<String>::new());
+        let mut file = fs::File::create(format!("{MNT}/durable")).unwrap();
+        file.write_all(&durable()).unwrap();
+        file.sync_all().unwrap();
+        fs::File::open(MNT).unwrap().sync_all().unwrap();
+        // Not synced: the filesystem may hold them or not, but is consistent either way.
+        for i in 0..16 {
+            fs::write(format!("{MNT}/pending-{i}"), pattern(100_000, i)).unwrap();
+        }
+        fs::remove_file(format!("{MNT}/pending-3")).unwrap();
+    }
+
     /// The names in `dir`, sorted.
     fn names(dir: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
@@ -398,7 +452,13 @@ mod guest {
                 Some(libc::ENOENT)
             );
             mount("extents").unwrap();
-            if self.host_formats {
+            if self.mode == Mode::Crash {
+                crash();
+                println!("OK");
+                return;
+            }
+            let host_formats = self.mode == Mode::HostFormats;
+            if host_formats {
                 read_hosts();
             } else {
                 assert_eq!(names(MNT), Vec::<String>::new());
@@ -425,7 +485,7 @@ mod guest {
 
             unmount();
             mount("extents").unwrap();
-            check_written(self.host_formats);
+            check_written(host_formats);
             unmount();
 
             println!("OK");

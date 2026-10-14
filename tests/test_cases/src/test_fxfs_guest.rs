@@ -483,6 +483,18 @@ mod guest {
 
         assert_eq!(unsafe { libc::removexattr(path.as_ptr(), c"user.size".as_ptr()) }, 0);
         assert_eq!(get(c"user.size"), Err(libc::ENODATA));
+        // Set and removed before the inode is written back.
+        assert_eq!(set(c"user.brief", b"gone", 0), 0);
+        assert_eq!(unsafe { libc::removexattr(path.as_ptr(), c"user.brief".as_ptr()) }, 0);
+        assert_eq!(unsafe { libc::removexattr(path.as_ptr(), c"user.brief".as_ptr()) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENODATA));
+
+        // Written back with the inode, and read in again.
+        evict(&format!("{dir}/renamed"));
+        assert_eq!(get(c"user.colour"), Ok(b"green".to_vec()));
+        assert_eq!(get(c"trusted.kept"), Ok(Vec::new()));
+        assert_eq!(get(c"user.size"), Err(libc::ENODATA));
+        assert_eq!(get(c"user.brief"), Err(libc::ENODATA));
     }
 
     /// RENAME_EXCHANGE: a file and a directory swap names, across directories.
@@ -621,6 +633,8 @@ mod guest {
         let path = format!("{MNT}/mapped-read");
         let data = pattern((3 << 20) + 5, 0x3c);
         fs::write(&path, &data).unwrap();
+        // In the page cache as written; read in again, from the window.
+        assert!(!is_dax(&path), "{path} is DAX as written");
         evict(&path);
         assert!(is_dax(&path), "{path} is not DAX");
         let (reads, maps) = (requests("read"), requests("map"));
@@ -702,10 +716,8 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
-            // Files are in the page cache as written; read in again, one of 1 MiB or more maps
-            // its data from the window.
+            // Read in again, a file of 1 MiB or more maps its data from the window.
             let renamed = format!("{MNT}/guest-dir/renamed");
-            assert!(!is_dax(&renamed), "a file written is DAX");
             evict(&renamed);
             assert_eq!(is_dax(&renamed), self.dax, "the DAX attribute");
             metadata_cached();

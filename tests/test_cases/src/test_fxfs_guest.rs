@@ -11,7 +11,7 @@
 // fxfs-guest-format: the store holds nothing, and the guest's Fxfs formats it.
 // fxfs-guest-crash: the guest formats the store, fsyncs file after file,
 // reporting each once its fsync returns, while another thread does too, and
-// powers the VM off in the middle, without syncing. The host checks the store's
+// resets the VM in the middle, without syncing. The host checks the store's
 // filesystem (fsck), and finds every file the guest reported, whole.
 // fxfs-guest-dax and fxfs-guest-crash-dax: the same with a DAX window, which
 // the guest's Fxfs maps files' data from (on hosts whose pages are 4 KiB,
@@ -330,6 +330,21 @@ mod guest {
         );
         fs::remove_file(format!("{dir}/long-link")).unwrap();
 
+        // A directory emptied while it is listed, as `rm -r` empties it: no entry is skipped,
+        // though removing those listed before it moves it, and each listing reads several.
+        let listed = format!("{dir}/listed");
+        fs::create_dir(&listed).unwrap();
+        for i in 0..2000 {
+            fs::write(format!("{listed}/entry-with-a-long-name-{i}"), b"").unwrap();
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&listed).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+            removed += 1;
+        }
+        assert_eq!(removed, 2000);
+        fs::remove_dir(&listed).unwrap();
+
         // A directory, removed once empty.
         let gone = format!("{dir}/gone");
         fs::create_dir(&gone).unwrap();
@@ -534,7 +549,8 @@ mod guest {
         unreachable!()
     }
 
-    /// Stops the VM mid-workload: with two writers fsyncing, and without syncing.
+    /// Stops the VM mid-workload: with two writers fsyncing, and without syncing (reboot(2)
+    /// doesn't).
     fn crash(dax: bool) -> ! {
         assert_eq!(names(MNT), Vec::<String>::new());
         let probe = format!("{MNT}/probe");
@@ -544,7 +560,8 @@ mod guest {
         std::thread::spawn(|| fsync_files(1));
         std::thread::spawn(|| fsync_files(2));
         std::thread::sleep(std::time::Duration::from_secs(2));
-        unsafe { libc::reboot(libc::RB_POWER_OFF) };
+        // A reset, which ends the VM on every architecture: x86's has no power-off.
+        unsafe { libc::reboot(libc::RB_AUTOBOOT) };
         panic!("reboot: {}", std::io::Error::last_os_error());
     }
 

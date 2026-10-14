@@ -20,6 +20,8 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub mod extent;
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
@@ -46,6 +48,8 @@ pub use self::balloon::*;
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
 pub use self::device::*;
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub use self::extent::Extent;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]

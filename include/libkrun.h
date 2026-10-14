@@ -414,6 +414,30 @@ int32_t krun_add_virtiofs_fxdax_volume(uint32_t ctx_id,
                                        uint64_t shm_size);
 
 /**
+ * Adds a virtio extent-store device with a tag: the store of extents that a guest
+ * running Fxfs itself keeps its filesystem in (fxdax's backlog doc-4). The store is
+ * an fxdax extent store in a directory, created holding at most "capacity" bytes if
+ * it doesn't exist. With a non-zero "shm_size", the device has a DAX window, which
+ * the guest maps sealed extents into. The store must not be used by anything else
+ * while the VM runs. Only available when libkrun is built with FXDAX=1.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_tag"          - tag to identify the filesystem in the guest, at most 36 bytes.
+ *  "c_path"         - full path to the extent store's directory in the host.
+ *  "capacity"       - the most bytes a store created here holds.
+ *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_extent_store(uint32_t ctx_id,
+                              const char *c_tag,
+                              const char *c_path,
+                              uint64_t capacity,
+                              uint64_t shm_size);
+
+/**
  * Sets how much memory fxdax keeps files' pages in, for every fxdax device in
  * the process: the most host memory their cached and dirty pages, and their
  * DAX windows' pages, take, 1 GiB unless set. As free memory runs low, fxdax

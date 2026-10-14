@@ -14,6 +14,8 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd};
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
@@ -195,6 +197,12 @@ pub enum StartMicrovmError {
     RegisterEvent(EventManagerError),
     /// Cannot initialize a MMIO Fs Device or add ad device to the MMIO Bus.
     RegisterFsDevice(device_manager::mmio::Error),
+    /// Cannot open the store of an extent-store device.
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    CreateExtentDevice(io::Error),
+    /// Cannot add an extent-store device to the MMIO Bus.
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    RegisterExtentDevice(device_manager::mmio::Error),
     // Cannot initialize a MMIO Fs Device or add ad device to the MMIO Bus.
     RegisterConsoleDevice(device_manager::mmio::Error),
     /// Cannot register SIGWINCH event file descriptor.
@@ -403,6 +411,17 @@ impl Display for StartMicrovmError {
                 write!(
                     f,
                     "Cannot initialize a MMIO Fs Device or add a device to the MMIO Bus. {err_msg}"
+                )
+            }
+            #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+            CreateExtentDevice(ref err) => {
+                write!(f, "Cannot create an extent-store device. {err}")
+            }
+            #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+            RegisterExtentDevice(ref err) => {
+                write!(
+                    f,
+                    "Cannot add an extent-store device to the MMIO Bus. {err}"
                 )
             }
             RegisterConsoleDevice(ref err) => {
@@ -1144,6 +1163,13 @@ pub fn build_microvm(
         vm_resources.vm_config().vcpu_count.unwrap(),
     )?;
     crate::timing_event("build_microvm.fs.attached");
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    attach_extent_devices(
+        &mut vmm,
+        &vm_resources.extent_devices,
+        &mut _shm_manager,
+        intc.clone(),
+    )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
     crate::timing_event("build_microvm.block.attached");
@@ -1808,6 +1834,14 @@ pub fn create_guest_memory(
                 .map_err(StartMicrovmError::ShmCreate)?;
         }
     }
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    for (index, device) in vm_resources.extent_devices.iter().enumerate() {
+        if let Some(shm_size) = device.shm_size {
+            shm_manager
+                .create_extent_region(index, shm_size)
+                .map_err(StartMicrovmError::ShmCreate)?;
+        }
+    }
     if vm_resources.gpu_virgl_flags.is_some() {
         let size = vm_resources.gpu_shm_size.unwrap_or(1 << 33);
         shm_manager
@@ -2395,6 +2429,38 @@ fn attach_fs_devices(
         attach_mmio_device(vmm, id, intc.clone(), fs).map_err(RegisterFsDevice)?;
     }
 
+    Ok(())
+}
+
+/// Attaches the extent-store devices `configs` describes, with their DAX
+/// windows in the shared memory regions `shm_manager` made for them.
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+fn attach_extent_devices(
+    vmm: &mut Vmm,
+    configs: &[crate::vmm_config::extent::ExtentDeviceConfig],
+    shm_manager: &mut ShmManager,
+    intc: IrqChip,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    for (index, config) in configs.iter().enumerate() {
+        let mut device =
+            devices::virtio::Extent::new(&config.tag, Path::new(&config.path), config.capacity)
+                .map_err(CreateExtentDevice)?;
+        if let Some(shm_region) = shm_manager.extent_region(index) {
+            device.set_shm_region(VirtioShmRegion {
+                host_addr: vmm
+                    .guest_memory
+                    .get_host_address(shm_region.guest_addr)
+                    .map_err(StartMicrovmError::ShmHostAddr)? as u64,
+                guest_addr: shm_region.guest_addr.raw_value(),
+                size: shm_region.size,
+            });
+        }
+        let device = Arc::new(Mutex::new(device));
+        attach_mmio_device(vmm, format!("virtio_extent{index}"), intc.clone(), device)
+            .map_err(RegisterExtentDevice)?;
+    }
     Ok(())
 }
 

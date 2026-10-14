@@ -80,11 +80,68 @@ fn open_volume(image: &Image, name: &str) -> Result<Filesystem, fxdax::Error> {
     }
 }
 
+/// What passes the guest's faults on a DAX window to it, while the guest may
+/// fault on it.
 #[cfg(target_os = "macos")]
-type DaxFaults = hvf::DemandPagedRegion;
+pub(crate) type DaxFaults = hvf::DemandPagedRegion;
 /// The filesystem serves the faults on the window's memory itself.
 #[cfg(target_os = "linux")]
-type DaxFaults = ();
+pub(crate) type DaxFaults = ();
+
+/// What a DAX window is created for: an fxdax filesystem, or an extent
+/// store, which map into it what the guest asks for.
+pub(crate) trait DaxOwner {
+    /// Creates the owner's window, for a hypervisor whose `second_stage` the
+    /// VMM maintains.
+    #[cfg(target_os = "macos")]
+    fn create_dax_window(
+        &self,
+        size: u64,
+        second_stage: Option<Arc<dyn fxdax::SecondStage>>,
+    ) -> Result<fxdax::DaxWindow, fxdax::Error>;
+
+    /// Creates the owner's window in host memory the hypervisor follows.
+    ///
+    /// # Safety
+    ///
+    /// As `Filesystem::create_dax_window_in_host_memory`'s.
+    #[cfg(target_os = "linux")]
+    unsafe fn create_dax_window_in_host_memory(
+        &self,
+        base: std::ptr::NonNull<u8>,
+        size: u64,
+        prefault: Option<Arc<dyn fxdax::Prefault>>,
+    ) -> Result<fxdax::DaxWindow, fxdax::Error>;
+}
+
+macro_rules! dax_owner {
+    ($owner:ty) => {
+        impl DaxOwner for $owner {
+            #[cfg(target_os = "macos")]
+            fn create_dax_window(
+                &self,
+                size: u64,
+                second_stage: Option<Arc<dyn fxdax::SecondStage>>,
+            ) -> Result<fxdax::DaxWindow, fxdax::Error> {
+                <$owner>::create_dax_window(self, size, second_stage)
+            }
+
+            #[cfg(target_os = "linux")]
+            unsafe fn create_dax_window_in_host_memory(
+                &self,
+                base: std::ptr::NonNull<u8>,
+                size: u64,
+                prefault: Option<Arc<dyn fxdax::Prefault>>,
+            ) -> Result<fxdax::DaxWindow, fxdax::Error> {
+                // SAFETY: The caller's guarantees are the owner's.
+                unsafe { <$owner>::create_dax_window_in_host_memory(self, base, size, prefault) }
+            }
+        }
+    };
+}
+
+dax_owner!(Filesystem);
+dax_owner!(fxdax::ExtentStore);
 
 impl FxdaxServer {
     /// Opens the fxdax image at `image`, and serves the filesystem on it, or
@@ -231,8 +288,8 @@ impl fxdax::Prefault for WindowPrefault {
 /// faults KVM takes on the rest. With `prefault`, KVM maps the pages for the
 /// guest as the window maps them.
 #[cfg(target_os = "linux")]
-fn dax_window(
-    fs: &Filesystem,
+pub(crate) fn dax_window(
+    fs: &impl DaxOwner,
     shm_region: &VirtioShmRegion,
     prefault: Option<Arc<dyn PrefaultGuestMemory>>,
 ) -> io::Result<DaxFaults> {
@@ -261,7 +318,10 @@ fn dax_error(err: fxdax::Error) -> io::Error {
 /// maps the window's pages into the guest's memory as it maps them into the
 /// window's host memory.
 #[cfg(target_os = "macos")]
-fn dax_window(fs: &Filesystem, shm_region: &VirtioShmRegion) -> io::Result<DaxFaults> {
+pub(crate) fn dax_window(
+    fs: &impl DaxOwner,
+    shm_region: &VirtioShmRegion,
+) -> io::Result<DaxFaults> {
     let guest_addr = shm_region.guest_addr;
     let size = shm_region.size as u64;
     let window = fs

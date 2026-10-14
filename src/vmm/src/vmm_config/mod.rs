@@ -18,6 +18,10 @@ pub mod external_kernel;
 #[cfg(not(feature = "tee"))]
 pub mod fs;
 
+/// Wrapper for configuring the extent-store devices attached to the microVM.
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub mod extent;
+
 /// Wrapper over the microVM general information attached to the microVM.
 pub mod instance_info;
 

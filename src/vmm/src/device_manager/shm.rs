@@ -20,6 +20,7 @@ pub struct ShmManager {
     next_guest_addr: u64,
     page_size: usize,
     fs_regions: BTreeMap<usize, ShmRegion>,
+    extent_regions: BTreeMap<usize, ShmRegion>,
     gpu_region: Option<ShmRegion>,
 }
 
@@ -29,6 +30,7 @@ impl ShmManager {
             next_guest_addr: info.shm_start_addr,
             page_size: info.page_size,
             fs_regions: BTreeMap::new(),
+            extent_regions: BTreeMap::new(),
             gpu_region: None,
         }
     }
@@ -38,6 +40,10 @@ impl ShmManager {
 
         for region in self.fs_regions.iter() {
             regions.push((region.1.guest_addr, region.1.size));
+        }
+
+        for region in self.extent_regions.values() {
+            regions.push((region.guest_addr, region.size));
         }
 
         if let Some(region) = &self.gpu_region {
@@ -50,6 +56,11 @@ impl ShmManager {
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub fn fs_region(&self, index: usize) -> Option<&ShmRegion> {
         self.fs_regions.get(&index)
+    }
+
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    pub fn extent_region(&self, index: usize) -> Option<&ShmRegion> {
+        self.extent_regions.get(&index)
     }
 
     #[cfg(feature = "gpu")]
@@ -86,6 +97,13 @@ impl ShmManager {
     pub fn create_fs_region(&mut self, index: usize, size: usize) -> Result<(), Error> {
         let region = self.create_region(size)?;
         self.fs_regions.insert(index, region);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    pub fn create_extent_region(&mut self, index: usize, size: usize) -> Result<(), Error> {
+        let region = self.create_region(size)?;
+        self.extent_regions.insert(index, region);
         Ok(())
     }
 }

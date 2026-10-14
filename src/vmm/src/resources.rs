@@ -164,6 +164,9 @@ pub struct VmResources {
     /// The fs device.
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
+    /// The extent-store devices.
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    pub extent_devices: Vec<crate::vmm_config::extent::ExtentDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
     /// The virtio-blk device.
@@ -347,6 +350,11 @@ impl VmResources {
         self.fs.push(config)
     }
 
+    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    pub fn add_extent_device(&mut self, config: crate::vmm_config::extent::ExtentDeviceConfig) {
+        self.extent_devices.push(config)
+    }
+
     #[cfg(feature = "blk")]
     pub fn add_block_device(&mut self, config: BlockDeviceConfig) -> Result<BlockConfigError> {
         self.block.insert(config)
@@ -436,6 +444,8 @@ mod tests {
             kernel_bundle: Default::default(),
             external_kernel: None,
             fs: Default::default(),
+            #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+            extent_devices: Vec::new(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]
             block: Default::default(),

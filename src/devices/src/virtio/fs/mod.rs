@@ -37,6 +37,8 @@ pub use self::filesystem::ExportTable;
 pub use self::fxdax::PrefaultGuestMemory;
 #[cfg(feature = "fxdax")]
 pub use self::fxdax::set_kernel_memory as set_fxdax_kernel_memory;
+#[cfg(feature = "fxdax")]
+pub(crate) use self::fxdax::{DaxFaults, dax_window};
 
 mod defs {
     use super::super::QueueConfig;

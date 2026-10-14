@@ -48,6 +48,8 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::{FsDeviceConfig, FsSource};
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+use vmm::vmm_config::extent::ExtentDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
@@ -789,6 +791,49 @@ pub unsafe extern "C" fn krun_add_virtiofs_fxdax_volume(
         volume: volume.to_string(),
     };
     add_fxdax_device(ctx_id, c_tag, source, shm_size)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+pub unsafe extern "C" fn krun_add_extent_store(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    capacity: u64,
+    shm_size: u64,
+) -> i32 {
+    if c_tag.is_null() || c_path.is_null() {
+        return -libc::EINVAL;
+    }
+    let (tag, path) = unsafe {
+        match (
+            CStr::from_ptr(c_tag).to_str(),
+            CStr::from_ptr(c_path).to_str(),
+        ) {
+            (Ok(tag), Ok(path)) if !tag.is_empty() && tag.len() <= 36 => (tag, path),
+            _ => return -libc::EINVAL,
+        }
+    };
+    let shm_size = match shm_size {
+        0 => None,
+        size => match size.try_into() {
+            Ok(size) => Some(size),
+            Err(_) => return -libc::EINVAL,
+        },
+    };
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().vmr.add_extent_device(ExtentDeviceConfig {
+                tag: tag.to_string(),
+                path: path.to_string(),
+                capacity,
+                shm_size,
+            });
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
 }
 
 #[unsafe(no_mangle)]

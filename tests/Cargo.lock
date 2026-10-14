@@ -459,6 +459,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "extent_store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "libc",
+ "log",
+ "rand 0.10.3",
+ "rapidhash",
+ "serde",
+ "storage_device",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -760,6 +774,7 @@ dependencies = [
  "async-trait",
  "bitflags",
  "event-listener",
+ "extent_store",
  "fidl",
  "fidl-fuchsia-fs-startup",
  "fidl-fuchsia-io",
@@ -770,6 +785,7 @@ dependencies = [
  "io-uring",
  "libc",
  "log",
+ "rand 0.10.3",
  "refaults_vmo",
  "storage_device",
  "tokio",
@@ -1639,12 +1655,14 @@ dependencies = [
  "async-trait",
  "block_protocol",
  "event-listener",
+ "fprint",
  "fuchsia-runtime",
  "fuchsia-sync",
  "futures",
  "log",
  "num",
  "rand 0.10.3",
+ "serde",
  "storage_ptr_slice",
  "zx",
 ]

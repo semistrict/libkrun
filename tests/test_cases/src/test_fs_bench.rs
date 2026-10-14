@@ -1,6 +1,8 @@
 // Benchmark fxdax's virtio-fs device, with DAX and without, against the guest's own filesystem:
 // ext4 on a virtio-blk disk backed by a raw image file on the same host filesystem. libkrun's own
-// virtio-fs device, passing a host directory through, measures the transport they share.
+// virtio-fs device, passing a host directory through, measures the transport they share. The
+// guest kernel's own Fxfs (fxdax's guest kernel, FXDAX_GUEST_KERNEL), on an extent-store device,
+// with a DAX window and without, compares with ext4 booted on the same kernel.
 //
 // Each case boots an Alpine guest, with fio, a compiler and e2fsprogs, onto one filesystem
 // mounted at /mnt/bench, and runs the same workloads on it several times: sequential and
@@ -32,6 +34,20 @@ pub enum Backend {
     /// libkrun's own virtio-fs device, passing a host directory through: the transport fxdax's
     /// device shares, without fxdax.
     Passthrough,
+    /// ext4 on a virtio-blk disk, with fxdax's guest kernel, which the guest's Fxfs compares with.
+    Ext4GuestKernel,
+    /// The guest kernel's Fxfs on an extent-store device, with files in the page cache.
+    FxfsGuest,
+    /// The guest kernel's Fxfs on an extent-store device, mapping files from its DAX window.
+    FxfsGuestDax,
+}
+
+impl Backend {
+    /// Whether the case boots fxdax's guest kernel.
+    #[cfg_attr(feature = "guest", allow(dead_code))]
+    fn guest_kernel(self) -> bool {
+        matches!(self, Backend::Ext4GuestKernel | Backend::FxfsGuest | Backend::FxfsGuestDax)
+    }
 }
 
 pub struct TestFsBench {
@@ -50,7 +66,7 @@ const SOURCE_TARBALL: &str = "/opt/lua-5.4.7.tar.gz";
 mod host {
     use super::*;
 
-    use crate::common::setup_rootfs;
+    use crate::common::{add_extent_store, set_guest_kernel, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use futures::executor::block_on;
     use fxdax::{Filesystem, Storage};
@@ -225,6 +241,9 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 Backend::FxdaxNoDax => "fxdax-nodax",
                 Backend::Ext4 => "ext4-virtio-blk",
                 Backend::Passthrough => "virtiofs-passthrough",
+                Backend::Ext4GuestKernel => "ext4-guest-kernel",
+                Backend::FxfsGuest => "fxfs-guest",
+                Backend::FxfsGuestDax => "fxfs-guest-dax",
             }
         }
     }
@@ -234,9 +253,15 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             if iterations().is_none() {
                 return ShouldRun::No("FXDAX_BENCH_ITERATIONS not set");
             }
+            if self.backend.guest_kernel() && std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
+                return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
+            }
             let feature = match self.backend {
-                Backend::FxdaxDax | Backend::FxdaxNoDax => KRUN_FEATURE_FXDAX,
-                Backend::Ext4 => KRUN_FEATURE_BLK,
+                Backend::FxdaxDax
+                | Backend::FxdaxNoDax
+                | Backend::FxfsGuest
+                | Backend::FxfsGuestDax => KRUN_FEATURE_FXDAX,
+                Backend::Ext4 | Backend::Ext4GuestKernel => KRUN_FEATURE_BLK,
                 Backend::Passthrough => return ShouldRun::Yes,
             };
             if unsafe { krun_call_u32!(krun_has_feature(feature.into())) }.ok() != Some(1) {
@@ -309,6 +334,9 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 2048))?;
                 krun_call!(krun_set_root(ctx, c_root.as_ptr()))?;
+                if self.backend.guest_kernel() {
+                    set_guest_kernel(ctx)?;
+                }
                 match self.backend {
                     Backend::FxdaxDax | Backend::FxdaxNoDax => {
                         let image = test_setup.tmp_dir.join("fxdax.img");
@@ -327,7 +355,13 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                             if dax { 1 << 31 } else { 0 },
                         ))?;
                     }
-                    Backend::Ext4 => {
+                    Backend::FxfsGuest | Backend::FxfsGuestDax => {
+                        // A new store, which the guest's Fxfs formats as it mounts it.
+                        let store = test_setup.tmp_dir.join("extents");
+                        let window = if self.backend == Backend::FxfsGuestDax { 1 << 31 } else { 0 };
+                        add_extent_store(ctx, c"bench", &store, IMAGE_SIZE, window)?;
+                    }
+                    Backend::Ext4 | Backend::Ext4GuestKernel => {
                         let image = test_setup.tmp_dir.join("ext4.img");
                         std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
                         let c_image = CString::new(image.as_os_str().as_bytes())?;
@@ -420,6 +454,15 @@ mod guest {
     const MIB: f64 = (1 << 20) as f64;
     /// The number of files the metadata workloads create, stat, list and remove.
     const FILES: usize = 2_000;
+    /// The files created and fsynced one at a time.
+    const FSYNCED: usize = 200;
+    /// The tree's directories, and the files in each.
+    const TREE_DIRS: usize = 50;
+    const TREE_FILES: usize = 40;
+    /// The files in the large directory.
+    const LARGE_DIR: usize = 20_000;
+    /// The threads of the concurrent workloads, each making `FILES` files.
+    const THREADS: usize = 4;
 
     fn run(program: &str, args: &[&str]) {
         let status = Command::new(program)
@@ -570,40 +613,236 @@ mod guest {
         fs::remove_file(&log).unwrap();
     }
 
-    /// Reports the rate of `FILES` operations done in `secs`.
-    fn ops(workload: &str, secs: f64) {
-        result(workload, "ops/s", true, FILES as f64 / secs);
+    /// Reports the rate of `count` operations done in `secs`.
+    fn ops(workload: &str, count: usize, secs: f64) {
+        result(workload, "ops/s", true, count as f64 / secs);
+    }
+
+    /// Times `f`, which does `count` operations, as `workload`.
+    fn timed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let value = f();
+        ops(workload, count, start.elapsed().as_secs_f64());
+        value
+    }
+
+    /// Runs `f(thread)` on `THREADS` threads at once, and times them all as `workload`, of `count`
+    /// operations in all.
+    fn parallel(workload: &str, count: usize, f: impl Fn(usize) + Sync) {
+        timed(workload, count, || {
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let f = &f;
+                    scope.spawn(move || f(thread));
+                }
+            })
+        });
+    }
+
+    fn setxattr(path: &str, name: &str, value: &[u8]) {
+        let path = CString::new(path).unwrap();
+        let name = CString::new(name).unwrap();
+        let ret = unsafe {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0)
+        };
+        assert_eq!(ret, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    /// Operations on the names and attributes of many small files in one directory.
+    fn files_workloads() {
+        let dir = format!("{MNT}/meta");
+        let other = format!("{MNT}/meta-other");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&other).unwrap();
+        let paths: Vec<String> = (0..FILES).map(|i| format!("{dir}/file-{i}")).collect();
+
+        timed("create", FILES, || {
+            for path in &paths {
+                fs::write(path, b"a small file").unwrap();
+            }
+        });
+        drop_caches();
+        timed("stat-cold", FILES, || {
+            for path in &paths {
+                fs::metadata(path).unwrap();
+            }
+        });
+        timed("stat-warm", FILES, || {
+            for path in &paths {
+                fs::metadata(path).unwrap();
+            }
+        });
+        timed("lookup-missing", FILES, || {
+            for i in 0..FILES {
+                assert!(fs::metadata(format!("{dir}/missing-{i}")).is_err());
+            }
+        });
+        timed("readdir", FILES, || {
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), FILES);
+        });
+        drop_caches();
+        timed("read-small-cold", FILES, || {
+            for path in &paths {
+                assert_eq!(fs::read(path).unwrap().len(), 12);
+            }
+        });
+        timed("chmod", FILES, || {
+            for path in &paths {
+                fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                    .unwrap();
+            }
+        });
+        timed("setxattr", FILES, || {
+            for path in &paths {
+                setxattr(path, "user.bench", b"a value");
+            }
+        });
+        timed("link", FILES, || {
+            for (i, path) in paths.iter().enumerate() {
+                fs::hard_link(path, format!("{dir}/link-{i}")).unwrap();
+            }
+        });
+        timed("rename", FILES, || {
+            for i in 0..FILES {
+                fs::rename(format!("{dir}/link-{i}"), format!("{dir}/renamed-{i}")).unwrap();
+            }
+        });
+        timed("rename-across", FILES, || {
+            for i in 0..FILES {
+                fs::rename(format!("{dir}/renamed-{i}"), format!("{other}/moved-{i}")).unwrap();
+            }
+        });
+        timed("unlink", FILES, || {
+            for path in &paths {
+                fs::remove_file(path).unwrap();
+            }
+        });
+        for i in 0..FILES {
+            fs::remove_file(format!("{other}/moved-{i}")).unwrap();
+        }
+        fs::remove_dir(&dir).unwrap();
+        fs::remove_dir(&other).unwrap();
+    }
+
+    /// Small files created and fsynced one at a time, each with its directory, as a database or
+    /// a mail server makes them durable.
+    fn fsync_workloads() {
+        let dir = format!("{MNT}/fsynced");
+        fs::create_dir(&dir).unwrap();
+        let handle = fs::File::open(&dir).unwrap();
+        timed("create-fsync", FSYNCED, || {
+            for i in 0..FSYNCED {
+                let mut file = fs::File::create(format!("{dir}/file-{i}")).unwrap();
+                file.write_all(b"a small file").unwrap();
+                file.sync_all().unwrap();
+                handle.sync_all().unwrap();
+            }
+        });
+        run("rm", &["-rf", &dir]);
+    }
+
+    /// A tree of directories, made, walked cold, and removed.
+    fn tree_workloads() {
+        let root = format!("{MNT}/tree");
+        let entries = TREE_DIRS * (TREE_FILES + 1);
+        timed("mkdir-tree", entries, || {
+            fs::create_dir(&root).unwrap();
+            for d in 0..TREE_DIRS {
+                let dir = format!("{root}/dir-{d}");
+                fs::create_dir(&dir).unwrap();
+                for f in 0..TREE_FILES {
+                    fs::write(format!("{dir}/file-{f}"), b"x").unwrap();
+                }
+            }
+        });
+        drop_caches();
+        timed("find-cold", entries, || {
+            let mut found = 0;
+            for dir in fs::read_dir(&root).unwrap() {
+                let dir = dir.unwrap().path();
+                fs::symlink_metadata(&dir).unwrap();
+                for file in fs::read_dir(&dir).unwrap() {
+                    fs::symlink_metadata(file.unwrap().path()).unwrap();
+                    found += 1;
+                }
+                found += 1;
+            }
+            assert_eq!(found, entries);
+        });
+        timed("rm-tree", entries, || run("rm", &["-rf", &root]));
+    }
+
+    /// One large directory.
+    fn large_dir_workloads() {
+        let dir = format!("{MNT}/large");
+        fs::create_dir(&dir).unwrap();
+        timed("large-dir-create", LARGE_DIR, || {
+            for i in 0..LARGE_DIR {
+                fs::File::create(format!("{dir}/f{i}")).unwrap();
+            }
+        });
+        drop_caches();
+        timed("large-dir-stat-cold", LARGE_DIR, || {
+            for i in 0..LARGE_DIR {
+                fs::metadata(format!("{dir}/f{i}")).unwrap();
+            }
+        });
+        timed("large-dir-unlink", LARGE_DIR, || {
+            for i in 0..LARGE_DIR {
+                fs::remove_file(format!("{dir}/f{i}")).unwrap();
+            }
+        });
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    /// `THREADS` threads creating, statting and removing files at once: each in a directory of its
+    /// own, and all in one.
+    fn concurrent_workloads() {
+        let count = THREADS * FILES;
+        let own = |thread: usize| format!("{MNT}/thread-{thread}");
+        for thread in 0..THREADS {
+            fs::create_dir(own(thread)).unwrap();
+        }
+        parallel("create-parallel", count, |thread| {
+            for i in 0..FILES {
+                fs::File::create(format!("{}/f{i}", own(thread))).unwrap();
+            }
+        });
+        parallel("stat-parallel", count, |thread| {
+            for i in 0..FILES {
+                fs::metadata(format!("{}/f{i}", own(thread))).unwrap();
+            }
+        });
+        parallel("unlink-parallel", count, |thread| {
+            for i in 0..FILES {
+                fs::remove_file(format!("{}/f{i}", own(thread))).unwrap();
+            }
+        });
+        for thread in 0..THREADS {
+            fs::remove_dir(own(thread)).unwrap();
+        }
+
+        let shared = format!("{MNT}/shared");
+        fs::create_dir(&shared).unwrap();
+        parallel("create-shared-dir", count, |thread| {
+            for i in 0..FILES {
+                fs::File::create(format!("{shared}/t{thread}-f{i}")).unwrap();
+            }
+        });
+        parallel("unlink-shared-dir", count, |thread| {
+            for i in 0..FILES {
+                fs::remove_file(format!("{shared}/t{thread}-f{i}")).unwrap();
+            }
+        });
+        fs::remove_dir(&shared).unwrap();
     }
 
     fn metadata_workloads() {
-        let dir = format!("{MNT}/meta");
-        fs::create_dir(&dir).unwrap();
-        let paths: Vec<String> = (0..FILES).map(|i| format!("{dir}/file-{i}")).collect();
-
-        let start = Instant::now();
-        for path in &paths {
-            fs::write(path, b"a small file").unwrap();
-        }
-        ops("create", start.elapsed().as_secs_f64());
-
-        drop_caches();
-        let start = Instant::now();
-        for path in &paths {
-            fs::metadata(path).unwrap();
-        }
-        ops("stat-cold", start.elapsed().as_secs_f64());
-
-        let start = Instant::now();
-        let entries = fs::read_dir(&dir).unwrap().count();
-        assert_eq!(entries, FILES);
-        ops("readdir", start.elapsed().as_secs_f64());
-
-        let start = Instant::now();
-        for path in &paths {
-            fs::remove_file(path).unwrap();
-        }
-        ops("unlink", start.elapsed().as_secs_f64());
-        fs::remove_dir(&dir).unwrap();
+        files_workloads();
+        fsync_workloads();
+        tree_workloads();
+        large_dir_workloads();
+        concurrent_workloads();
     }
 
     /// Observes how far ahead of the guest's clock a file it writes is timestamped, in
@@ -645,17 +884,42 @@ mod guest {
         run("rm", &["-rf", &dir]);
     }
 
+    /// Prints the kernel's messages, from /dev/kmsg, to say what a filesystem logged when a
+    /// workload fails.
+    fn print_kernel_log() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Ok(mut kmsg) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/kmsg")
+        else {
+            return;
+        };
+        let mut record = [0u8; 8192];
+        // Each read is a record, until there are no more.
+        while let Ok(n) = kmsg.read(&mut record) {
+            eprint!("kernel: {}", String::from_utf8_lossy(&record[..n]));
+        }
+    }
+
     impl Test for TestFsBench {
         fn in_guest(self: Box<Self>) {
+            let default_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                default_hook(info);
+                print_kernel_log();
+            }));
             match self.backend {
                 Backend::FxdaxDax => mount("bench", "virtiofs", "dax=always"),
                 Backend::FxdaxNoDax | Backend::Passthrough => {
                     mount("bench", "virtiofs", "dax=never")
                 }
-                Backend::Ext4 => {
+                Backend::Ext4 | Backend::Ext4GuestKernel => {
                     run("mkfs.ext4", &["-q", "-F", "/dev/vda"]);
                     mount("/dev/vda", "ext4", "");
                 }
+                Backend::FxfsGuest | Backend::FxfsGuestDax => mount("bench", "fxfs", ""),
             }
             let iterations: u32 = std::env::var("FXDAX_BENCH_ITERATIONS")
                 .ok()

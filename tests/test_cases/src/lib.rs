@@ -233,6 +233,27 @@ pub fn test_cases() -> Vec<TestCase> {
                 backend: BenchBackend::Passthrough,
             }),
         ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-ext4-guest-kernel",
+            Box::new(TestFsBench {
+                backend: BenchBackend::Ext4GuestKernel,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-fxfs-guest",
+            Box::new(TestFsBench {
+                backend: BenchBackend::FxfsGuest,
+            }),
+        ),
+        #[cfg(any(feature = "host", target_os = "linux"))]
+        TestCase::new(
+            "bench-fs-fxfs-guest-dax",
+            Box::new(TestFsBench {
+                backend: BenchBackend::FxfsGuestDax,
+            }),
+        ),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
         TestCase::new("perf-net-tap-tx", Box::new(TestNetPerf::new_tap_tx())),

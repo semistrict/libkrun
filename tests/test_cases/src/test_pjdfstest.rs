@@ -10,12 +10,9 @@ pub struct TestPjdfstest {
 #[cfg_attr(feature = "host", allow(dead_code))]
 const FXFS_MNT: &str = "/mnt/fxfs";
 
-/// pjdfstest's tests Fxfs can't pass, and why.
+/// pjdfstest's tests Fxfs can't pass, and why: none.
 #[cfg_attr(feature = "host", allow(dead_code))]
-const FXFS_SKIPPED: &[(&str, &str)] = &[(
-    "symlink/03.t",
-    "symlinks of PATH_MAX - 1 bytes: Fxfs keeps a symlink's target in its record, of at most 256",
-)];
+const FXFS_SKIPPED: &[(&str, &str)] = &[];
 
 #[host]
 mod host {

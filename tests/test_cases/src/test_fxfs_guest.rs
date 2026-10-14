@@ -292,6 +292,21 @@ mod guest {
         assert_eq!(fs::metadata(&path).unwrap().nlink(), 2);
         fs::rename(&path, format!("{dir}/renamed")).unwrap();
         std::os::unix::fs::symlink("guest-dir/renamed", format!("{MNT}/symlink")).unwrap();
+        // A target as long as Linux's PATH_MAX - 1, which Fxfs keeps outside the symlink's
+        // record, and one longer, which it refuses.
+        let long_target = "a/".repeat(2047) + "z";
+        std::os::unix::fs::symlink(&long_target, format!("{dir}/long-link")).unwrap();
+        assert_eq!(
+            fs::read_link(format!("{dir}/long-link")).unwrap(),
+            std::path::Path::new(&long_target)
+        );
+        assert_eq!(
+            std::os::unix::fs::symlink(long_target + "z", format!("{dir}/longer-link"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENAMETOOLONG)
+        );
+        fs::remove_file(format!("{dir}/long-link")).unwrap();
 
         // A directory, removed once empty.
         let gone = format!("{dir}/gone");

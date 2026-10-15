@@ -142,6 +142,10 @@ mod host {
             assert!(block_on(fs.lookup(Inode::ROOT, b"unlinked")).is_err());
             // Never fsynced: only removing the mapping wrote it back
             assert_eq!(read_path(&fs, "evicted"), EVICTED);
+            // Made with O_TMPFILE, then named.
+            assert_eq!(read_path(&fs, "tmpfile-linked"), b"unnamed, then linked");
+            assert_eq!(lookup_path(&fs, "tmpfile-linked").nlink, 1);
+            assert_eq!(read_path(&fs, "fallocated"), vec![0; 8192]);
 
             TestOutcome::Pass
         }
@@ -409,6 +413,146 @@ mod guest {
         assert_eq!(fs::read(path("evicted")).unwrap(), EVICTED);
     }
 
+    /// O_TMPFILE: an unnamed file, which a link names, or which goes as it is closed.
+    fn test_tmpfile() {
+        let open_unnamed = || {
+            let dir = CString::new(MNT).unwrap();
+            let fd = unsafe { libc::open(dir.as_ptr(), libc::O_TMPFILE | libc::O_RDWR, 0o600) };
+            assert!(fd >= 0, "O_TMPFILE: {}", std::io::Error::last_os_error());
+            unsafe { <fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) }
+        };
+        let mut file = open_unnamed();
+        assert_eq!(file.metadata().unwrap().nlink(), 0);
+        file.write_all(b"unnamed, then linked").unwrap();
+        let from = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        let to = CString::new(path("tmpfile-linked")).unwrap();
+        let ret = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        assert_eq!(ret, 0, "linkat: {}", std::io::Error::last_os_error());
+        assert_eq!(file.metadata().unwrap().nlink(), 1);
+        drop(file);
+        assert_eq!(fs::read(path("tmpfile-linked")).unwrap(), b"unnamed, then linked");
+
+        // Never named: freed as it is closed.
+        let mut file = open_unnamed();
+        file.write_all(&[7; 10000]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(read, vec![7; 10000]);
+        drop(file);
+    }
+
+    /// fallocate: mode 0 grows the file, FALLOC_FL_KEEP_SIZE doesn't, other modes aren't
+    /// supported.
+    fn test_fallocate() {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("fallocated"))
+            .unwrap();
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::fallocate(fd, 0, 0, 8192) };
+        assert_eq!(ret, 0, "fallocate: {}", std::io::Error::last_os_error());
+        assert_eq!(file.metadata().unwrap().len(), 8192);
+        assert_eq!(unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, 1 << 20) }, 0);
+        assert_eq!(file.metadata().unwrap().len(), 8192);
+        assert_eq!(fs::read(path("fallocated")).unwrap(), vec![0; 8192]);
+        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        assert_eq!(unsafe { libc::fallocate(fd, punch, 0, 4096) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EOPNOTSUPP));
+        file.sync_all().unwrap();
+    }
+
+    /// A POSIX ACL xattr's value: its version, then each entry's tag, permissions and id.
+    fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            value.extend(tag.to_le_bytes());
+            value.extend(perm.to_le_bytes());
+            value.extend(id.to_le_bytes());
+        }
+        value
+    }
+
+    fn set_xattr(path: &str, name: &str, value: &[u8]) {
+        let (path, name) = (CString::new(path).unwrap(), CString::new(name).unwrap());
+        let ret = unsafe {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0)
+        };
+        assert_eq!(ret, 0, "setxattr: {}", std::io::Error::last_os_error());
+    }
+
+    fn get_xattr(path: &str, name: &str) -> Vec<u8> {
+        let (path, name) = (CString::new(path).unwrap(), CString::new(name).unwrap());
+        let mut value = vec![0u8; 256];
+        let len = unsafe {
+            libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len())
+        };
+        assert!(len >= 0, "getxattr: {}", std::io::Error::last_os_error());
+        value.truncate(len as usize);
+        value
+    }
+
+    /// POSIX ACLs: set and read back, the mode following them, and a directory's default ACL
+    /// inherited, in place of the umask, which applies without one.
+    fn test_acls() {
+        const USER_OBJ: u16 = 0x01;
+        const USER: u16 = 0x02;
+        const GROUP_OBJ: u16 = 0x04;
+        const MASK: u16 = 0x10;
+        const OTHER: u16 = 0x20;
+        const UNDEFINED: u32 = u32::MAX;
+
+        fs::write(path("acl-file"), b"acl").unwrap();
+        let access = acl(&[
+            (USER_OBJ, 6, UNDEFINED),
+            (USER, 6, 1234),
+            (GROUP_OBJ, 4, UNDEFINED),
+            (MASK, 6, UNDEFINED),
+            (OTHER, 0, UNDEFINED),
+        ]);
+        set_xattr(&path("acl-file"), "system.posix_acl_access", &access);
+        assert_eq!(get_xattr(&path("acl-file"), "system.posix_acl_access"), access);
+        // The group's bits are the mask's.
+        assert_eq!(fs::metadata(path("acl-file")).unwrap().mode() & 0o777, 0o660);
+
+        let old_umask = unsafe { libc::umask(0o077) };
+        fs::create_dir(path("acl-dir")).unwrap();
+        let default =
+            acl(&[(USER_OBJ, 7, UNDEFINED), (GROUP_OBJ, 5, UNDEFINED), (OTHER, 5, UNDEFINED)]);
+        set_xattr(&path("acl-dir"), "system.posix_acl_default", &default);
+        fs::write(path("acl-dir/inherits"), b"x").unwrap();
+        fs::write(path("umasked"), b"x").unwrap();
+        unsafe { libc::umask(old_umask) };
+        // The default ACL, not the umask, limits the new file's mode.
+        assert_eq!(fs::metadata(path("acl-dir/inherits")).unwrap().mode() & 0o777, 0o644);
+        // Without one, the umask does.
+        assert_eq!(fs::metadata(path("umasked")).unwrap().mode() & 0o777, 0o600);
+    }
+
+    /// Freezing the filesystem and thawing it (FIFREEZE, FITHAW).
+    fn test_freeze() {
+        const FIFREEZE: libc::c_ulong = 0xc0045877;
+        const FITHAW: libc::c_ulong = 0xc0045878;
+        let dir = fs::File::open(MNT).unwrap();
+        let ret = unsafe { libc::ioctl(dir.as_raw_fd(), FIFREEZE as _, 0) };
+        assert_eq!(ret, 0, "FIFREEZE: {}", std::io::Error::last_os_error());
+        let ret = unsafe { libc::ioctl(dir.as_raw_fd(), FITHAW as _, 0) };
+        assert_eq!(ret, 0, "FITHAW: {}", std::io::Error::last_os_error());
+        fs::write(path("thawed"), b"writes go on").unwrap();
+        assert_eq!(fs::read(path("thawed")).unwrap(), b"writes go on");
+    }
+
     impl Test for TestFxfsGuestChecks {
         fn in_guest(self: Box<Self>) {
             let dax = self.dax;
@@ -422,6 +566,10 @@ mod guest {
                 ("namespace", &test_namespace),
                 ("truncate_mapped", &test_truncate_mapped),
                 ("eviction_writes_back", &test_eviction_writes_back),
+                ("tmpfile", &test_tmpfile),
+                ("fallocate", &test_fallocate),
+                ("acls", &test_acls),
+                ("freeze", &test_freeze),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {

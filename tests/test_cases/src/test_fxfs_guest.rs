@@ -635,8 +635,9 @@ mod guest {
     }
 
     /// Small files are DAX, and share an extent, which the window maps once for them all: as the
-    /// files' blocks are handed out, further each time, doubling (1, 2, 4... pages), so 32 files of
-    /// a block take 6 MAPs, and no READ. Evicted and read in again, they take neither.
+    /// files' blocks are handed out, further each time, doubling (1, 2, 4... pages), a step ahead
+    /// of them once they reach the second half of what is mapped, so 32 files of a block take 7
+    /// MAPs (to 64 pages), and no READ. Evicted and read in again, they take neither.
     fn small_files_share() {
         let dir = format!("{MNT}/small");
         fs::create_dir(&dir).unwrap();
@@ -649,7 +650,7 @@ mod guest {
         for (path, data) in &files {
             fs::write(path, data).unwrap();
         }
-        assert_eq!(requests("map"), maps + 6, "the small files' MAPs");
+        assert_eq!(requests("map"), maps + 7, "the small files' MAPs");
         assert_eq!(requests("read"), reads, "writing small files read from the device");
         assert!(is_dax(&files[0].0), "a small file is not DAX");
         for (path, _) in &files {

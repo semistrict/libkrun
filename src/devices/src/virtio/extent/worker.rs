@@ -5,8 +5,10 @@
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 use fxdax::{Errno, RemoteExtentStore, VolatileSlice, VolatileSliceMut};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -27,6 +29,75 @@ use crate::virtio::{DescriptorChain, InterruptTransport};
 
 /// How many requests the worker serves at once: as many as the daemon does for a connection.
 const SERVERS: usize = 8;
+
+/// The requests served, and the time serving them took, by type, logged as the worker stops:
+/// against what the guest waits for a request (its driver's request_ns), what the transport
+/// costs.
+#[derive(Default)]
+struct Served {
+    count: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
+    nanos: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
+}
+
+impl Served {
+    fn add(&self, type_: Option<u32>, nanos: u64) {
+        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_INFO) {
+            self.count[type_ as usize].fetch_add(1, Ordering::Relaxed);
+            self.nanos[type_ as usize].fetch_add(nanos, Ordering::Relaxed);
+        }
+    }
+
+    fn log(&self) {
+        for type_ in 0..=VIRTIO_EXTENT_T_INFO as usize {
+            let count = self.count[type_].load(Ordering::Relaxed);
+            if count > 0 {
+                let mean = self.nanos[type_].load(Ordering::Relaxed) as f64 / count as f64;
+                info!(
+                    "extent device: served {count} requests of type {type_}, {:.1} us each",
+                    mean / 1000.0
+                );
+            }
+        }
+    }
+}
+
+/// The type of the request `chain` holds, from its header.
+fn request_type(mem: &GuestMemoryMmap, chain: &DescriptorChain) -> Option<u32> {
+    use vm_memory::Bytes;
+    mem.read_obj::<u32>(chain.addr).ok().map(u32::from_le)
+}
+
+/// Whether a request of `type_` is quick to serve: the thread taking it off the queue serves it
+/// itself when it is alone, rather than handing it to a server, a thread's wake-up more.
+fn quick(type_: Option<u32>) -> bool {
+    matches!(
+        type_,
+        Some(
+            VIRTIO_EXTENT_T_MAP
+                | VIRTIO_EXTENT_T_UNMAP
+                | VIRTIO_EXTENT_T_FREE
+                | VIRTIO_EXTENT_T_ROOT
+                | VIRTIO_EXTENT_T_INFO
+        )
+    )
+}
+
+/// Serves the request in `chain` and returns it to the driver.
+fn serve_one(
+    queue: &Mutex<DeviceQueue>,
+    interrupt: &InterruptTransport,
+    mem: &GuestMemoryMmap,
+    store: &RemoteExtentStore,
+    served: &Served,
+    chain: DescriptorChain,
+) {
+    let index = chain.index;
+    let type_ = request_type(mem, &chain);
+    let start = Instant::now();
+    let len = handle(store, mem, chain);
+    served.add(type_, start.elapsed().as_nanos() as u64);
+    complete(&mut queue.lock().unwrap(), interrupt, mem, index, len);
+}
 
 pub struct ExtentWorker {
     queue: DeviceQueue,
@@ -70,38 +141,40 @@ impl ExtentWorker {
             stop_fd,
         } = self;
         let queue = Mutex::new(queue);
+        let served = Served::default();
         let (requests, received) = mpsc::channel::<DescriptorChain>();
         let received = Mutex::new(received);
         thread::scope(|scope| {
             for server in 0..SERVERS {
-                let (queue, interrupt, mem, store, received) =
-                    (&queue, &interrupt, &mem, &store, &received);
+                let (queue, interrupt, mem, store, received, served) =
+                    (&queue, &interrupt, &mem, &store, &received, &served);
                 thread::Builder::new()
                     .name(format!("extent server {server}"))
                     .spawn_scoped(scope, move || loop {
                         let Ok(chain) = received.lock().unwrap().recv() else {
                             return;
                         };
-                        let index = chain.index;
-                        let len = handle(store, mem, chain);
-                        complete(&mut queue.lock().unwrap(), interrupt, mem, index, len);
+                        serve_one(queue, interrupt, mem, store, served, chain);
                     })
                     .unwrap();
             }
             // Once stopped, the servers finish what they took and return as the channel closes.
-            take_requests(&queue, &mem, &stop_fd, requests);
+            let inline = |chain| serve_one(&queue, &interrupt, &mem, &store, &served, chain);
+            take_requests(&queue, &mem, &stop_fd, requests, inline);
         });
+        served.log();
         queue.into_inner().unwrap()
     }
 }
 
 /// Takes the requests off `queue` as the driver notifies it, and sends them to `requests`, until
-/// `stop_fd` is written.
+/// `stop_fd` is written: but serves one quick request alone itself (`inline`).
 fn take_requests<'a>(
     queue: &Mutex<DeviceQueue>,
     mem: &'a GuestMemoryMmap,
     stop_fd: &EventFd,
     requests: mpsc::Sender<DescriptorChain<'a>>,
+    inline: impl Fn(DescriptorChain<'a>),
 ) {
     let queue_fd = queue.lock().unwrap().event.as_raw_fd();
     let stop_raw_fd = stop_fd.as_raw_fd();
@@ -130,20 +203,30 @@ fn take_requests<'a>(
                 return;
             }
             if event.fd() == queue_fd {
-                let mut queue = queue.lock().unwrap();
-                if let Err(err) = queue.event.read() {
-                    error!("extent worker: queue event: {err}");
+                let mut taken = Vec::new();
+                {
+                    let mut queue = queue.lock().unwrap();
+                    if let Err(err) = queue.event.read() {
+                        error!("extent worker: queue event: {err}");
+                        continue;
+                    }
+                    loop {
+                        queue.queue.disable_notification(mem).unwrap();
+                        while let Some(chain) = queue.queue.pop(mem) {
+                            taken.push(chain);
+                        }
+                        if !queue.queue.enable_notification(mem).unwrap() {
+                            break;
+                        }
+                    }
+                }
+                if taken.len() == 1 && quick(request_type(mem, &taken[0])) {
+                    inline(taken.pop().unwrap());
                     continue;
                 }
-                loop {
-                    queue.queue.disable_notification(mem).unwrap();
-                    while let Some(chain) = queue.queue.pop(mem) {
-                        // The servers outlive this sender.
-                        requests.send(chain).unwrap();
-                    }
-                    if !queue.queue.enable_notification(mem).unwrap() {
-                        break;
-                    }
+                for chain in taken {
+                    // The servers outlive this sender.
+                    requests.send(chain).unwrap();
                 }
             }
         }

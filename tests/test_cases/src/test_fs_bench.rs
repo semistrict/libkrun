@@ -429,7 +429,9 @@ mod guest {
     /// Small enough for fxdax's extent daemon, of 1 GiB by default, to cache whole.
     const DATA_SIZE: u64 = 256 << 20;
     /// What the random I/O workloads that are not timed read or write, and the timed ones' time.
-    const RANDOM_SIZE: u64 = 16 << 20;
+    /// What the random writes write: 16384 writes, which take seconds, as their time is measured
+    /// to a quarter of a second (fio's exit).
+    const RANDOM_SIZE: u64 = 64 << 20;
     const RUNTIME: &str = "--runtime=2";
     const MIB: f64 = (1 << 20) as f64;
     /// The number of files the metadata workloads create, stat, list and remove.

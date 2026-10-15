@@ -1149,6 +1149,10 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
+    // fxdax's DAX windows have KVM map their pages for the guest as they map
+    // them, with a vCPU of their own, whose id follows the guest's vCPUs'.
+    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+    let mut prefault = FxdaxPrefault::new(vm_resources.vm_config().vcpu_count.unwrap());
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
@@ -1161,7 +1165,7 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
         #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
-        vm_resources.vm_config().vcpu_count.unwrap(),
+        &mut prefault,
     )?;
     crate::timing_event("build_microvm.fs.attached");
     #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
@@ -1170,6 +1174,8 @@ pub fn build_microvm(
         &vm_resources.extent_devices,
         &mut _shm_manager,
         intc.clone(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        &mut prefault,
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
@@ -2368,14 +2374,10 @@ fn attach_fs_devices(
     intc: IrqChip,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
-    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))] vcpu_count: u8,
+    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+    prefault: &mut FxdaxPrefault,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
-
-    // fxdax's DAX windows have KVM map their pages for the guest as they map
-    // them, with a vCPU of their own, whose id follows the guest's vCPUs'.
-    #[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
-    let mut prefault: Option<Option<Arc<crate::linux::prefault::KvmPrefault>>> = None;
 
     for (i, config) in fs_devs.iter().enumerate() {
         let fs = Arc::new(Mutex::new(
@@ -2405,17 +2407,7 @@ fn attach_fs_devices(
                 config.source,
                 FsSource::FxdaxImage(_) | FsSource::FxdaxVolume { .. }
             ) {
-                let prefault = match &prefault {
-                    Some(prefault) => prefault.clone(),
-                    None => prefault
-                        .insert(
-                            crate::linux::prefault::KvmPrefault::new(&vmm.vm, vcpu_count.into())
-                                .map_err(FxdaxPrefault)?
-                                .map(Arc::new),
-                        )
-                        .clone(),
-                };
-                if let Some(prefault) = prefault {
+                if let Some(prefault) = prefault.get(vmm)? {
                     fs.lock().unwrap().set_prefault(prefault);
                 }
             }
@@ -2436,6 +2428,40 @@ fn attach_fs_devices(
     Ok(())
 }
 
+/// The vCPU that maps fxdax's DAX windows' pages for the guest ahead of its
+/// accesses (`KVM_PRE_FAULT_MEMORY`), made for the first window that needs it.
+#[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+struct FxdaxPrefault {
+    /// Its id, which follows the guest's vCPUs'.
+    id: u8,
+    /// It, once made, or none if KVM cannot pre-fault.
+    prefault: Option<Option<Arc<crate::linux::prefault::KvmPrefault>>>,
+}
+
+#[cfg(all(feature = "fxdax", target_os = "linux", target_arch = "x86_64"))]
+impl FxdaxPrefault {
+    fn new(vcpu_count: u8) -> Self {
+        Self {
+            id: vcpu_count,
+            prefault: None,
+        }
+    }
+
+    /// The vCPU, made now if it is not yet, or none if KVM cannot pre-fault.
+    fn get(
+        &mut self,
+        vmm: &Vmm,
+    ) -> std::result::Result<Option<Arc<crate::linux::prefault::KvmPrefault>>, StartMicrovmError>
+    {
+        if self.prefault.is_none() {
+            let prefault = crate::linux::prefault::KvmPrefault::new(&vmm.vm, self.id.into())
+                .map_err(StartMicrovmError::FxdaxPrefault)?;
+            self.prefault = Some(prefault.map(Arc::new));
+        }
+        Ok(self.prefault.clone().flatten())
+    }
+}
+
 /// Attaches the extent-store devices `configs` describes, with their DAX
 /// windows in the shared memory regions `shm_manager` made for them.
 #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
@@ -2444,6 +2470,7 @@ fn attach_extent_devices(
     configs: &[crate::vmm_config::extent::ExtentDeviceConfig],
     shm_manager: &mut ShmManager,
     intc: IrqChip,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))] prefault: &mut FxdaxPrefault,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
@@ -2460,6 +2487,10 @@ fn attach_extent_devices(
                 guest_addr: shm_region.guest_addr.raw_value(),
                 size: shm_region.size,
             });
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if let Some(prefault) = prefault.get(vmm)? {
+                device.set_prefault(prefault);
+            }
         }
         let device = Arc::new(Mutex::new(device));
         attach_mmio_device(vmm, format!("virtio_extent{index}"), intc.clone(), device)

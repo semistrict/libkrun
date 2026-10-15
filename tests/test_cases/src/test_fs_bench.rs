@@ -618,19 +618,27 @@ mod guest {
     /// sampled by perf throughout, whose report goes to the log, and with the extent-store
     /// device's requests per operation logged.
     fn observed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
-        let requests = device_requests();
+        let requests = device_requests().zip(device_request_ns());
         let profiler = Profiler::start();
         let value = f();
         if let Some(profiler) = profiler {
             profiler.report(workload);
         }
-        if let (Some(before), Some(after)) = (requests, device_requests()) {
+        if let (Some((before, before_ns)), Some(after), Some(after_ns)) =
+            (requests, device_requests(), device_request_ns())
+        {
             let per_op: Vec<String> = after
                 .iter()
                 .zip(&before)
-                .filter(|((_, after), (_, before))| after > before)
-                .map(|((kind, after), (_, before))| {
-                    format!("{kind} {:.2}", (after - before) as f64 / count as f64)
+                .zip(after_ns.iter().zip(&before_ns))
+                .filter(|(((_, after), (_, before)), _)| after > before)
+                .map(|(((kind, after), (_, before)), ((_, after_ns), (_, before_ns)))| {
+                    let requests = after - before;
+                    format!(
+                        "{kind} {:.2} ({:.0} µs each)",
+                        requests as f64 / count as f64,
+                        (after_ns - before_ns) as f64 / requests as f64 / 1000.0
+                    )
                 })
                 .collect();
             eprintln!("REQUESTS {workload}: {} per operation", per_op.join(", "));
@@ -641,8 +649,19 @@ mod guest {
     /// The extent-store device's count of the requests it has taken, by type, if the guest's
     /// filesystem is on one.
     fn device_requests() -> Option<Vec<(String, u64)>> {
+        device_request_counters("requests")
+    }
+
+    /// The time the extent-store device's requests took, queued to completed, by type, in
+    /// nanoseconds.
+    fn device_request_ns() -> Option<Vec<(String, u64)>> {
+        device_request_counters("request_ns")
+    }
+
+    /// The extent-store device's attribute `name`: a counter for each type of request.
+    fn device_request_counters(name: &str) -> Option<Vec<(String, u64)>> {
         let device = fs::read_dir("/sys/bus/virtio/drivers/virtio_extent").ok()?.find_map(|entry| {
-            let path = entry.ok()?.path().join("requests");
+            let path = entry.ok()?.path().join(name);
             path.exists().then_some(path)
         })?;
         let counts = fs::read_to_string(device).ok()?;

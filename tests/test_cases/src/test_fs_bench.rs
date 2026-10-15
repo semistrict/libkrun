@@ -529,7 +529,9 @@ mod guest {
     /// Reads report fio's own rates, which leave out fio starting up. Writes are timed from
     /// starting fio to its exit, so that they include the fsync that makes them durable.
     fn io_workloads() {
-        let job = fio(&["--rw=write", "--bs=1M", "--end_fsync=1"]);
+        let blocks = (DATA_SIZE / 4096) as usize;
+        let random_blocks = (RANDOM_SIZE / 4096) as usize;
+        let job = observed("seq-write", blocks, || fio(&["--rw=write", "--bs=1M", "--end_fsync=1"]));
         result(
             "seq-write",
             "MiB/s",
@@ -539,7 +541,9 @@ mod guest {
 
         let random = format!("--io_size={RANDOM_SIZE}");
         drop_caches();
-        let job = fio(&["--rw=randread", "--bs=4k", &random]);
+        let job = observed("rand-read-cold", random_blocks, || {
+            fio(&["--rw=randread", "--bs=4k", &random])
+        });
         result("rand-read-cold", "IOPS", true, job.read_iops);
         drop_caches();
         let job = fio(&["--rw=read", "--bs=1M"]);
@@ -551,7 +555,9 @@ mod guest {
         let job = fio(&["--rw=randread", "--bs=4k", "--time_based", RUNTIME]);
         result("rand-read-warm", "IOPS", true, job.read_iops);
 
-        let job = fio(&["--rw=randwrite", "--bs=4k", &random, "--end_fsync=1"]);
+        let job = observed("rand-write", random_blocks, || {
+            fio(&["--rw=randwrite", "--bs=4k", &random, "--end_fsync=1"])
+        });
         write_iops("rand-write", RANDOM_SIZE, job.secs);
 
         let job = fio(&[
@@ -562,13 +568,9 @@ mod guest {
             RUNTIME,
         ]);
         result("mmap-rand-read", "IOPS", true, job.read_iops);
-        let job = fio(&[
-            "--ioengine=mmap",
-            "--rw=randwrite",
-            "--bs=4k",
-            &random,
-            "--end_fsync=1",
-        ]);
+        let job = observed("mmap-rand-write", random_blocks, || {
+            fio(&["--ioengine=mmap", "--rw=randwrite", "--bs=4k", &random, "--end_fsync=1"])
+        });
         write_iops("mmap-rand-write", RANDOM_SIZE, job.secs);
         fs::remove_file(DATA).unwrap();
 
@@ -576,19 +578,21 @@ mod guest {
         let log = format!("{MNT}/log");
         let appended = 1 << 20;
         let start = Instant::now();
-        run(
-            "fio",
-            &[
-                "--name=log",
-                "--filename",
-                &log,
-                "--size=1M",
-                "--rw=write",
-                "--bs=4k",
-                "--fsync=1",
-                "--output=/dev/null",
-            ],
-        );
+        observed("fsync-append", (appended / 4096) as usize, || {
+            run(
+                "fio",
+                &[
+                    "--name=log",
+                    "--filename",
+                    &log,
+                    "--size=1M",
+                    "--rw=write",
+                    "--bs=4k",
+                    "--fsync=1",
+                    "--output=/dev/null",
+                ],
+            )
+        });
         write_iops("fsync-append", appended, start.elapsed().as_secs_f64());
         fs::remove_file(&log).unwrap();
     }
@@ -602,11 +606,21 @@ mod guest {
     /// sampled by perf throughout, whose report of the kernel's hottest symbols goes to the log
     /// (perf's own overhead is then in the measurement).
     fn timed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
+        observed(workload, count, || {
+            let start = Instant::now();
+            let value = f();
+            ops(workload, count, start.elapsed().as_secs_f64());
+            value
+        })
+    }
+
+    /// Runs `f`, which does `count` operations, as `workload`: with FXDAX_BENCH_GUEST_PERF set,
+    /// sampled by perf throughout, whose report goes to the log, and with the extent-store
+    /// device's requests per operation logged.
+    fn observed<T>(workload: &str, count: usize, f: impl FnOnce() -> T) -> T {
         let requests = device_requests();
         let profiler = Profiler::start();
-        let start = Instant::now();
         let value = f();
-        ops(workload, count, start.elapsed().as_secs_f64());
         if let Some(profiler) = profiler {
             profiler.report(workload);
         }

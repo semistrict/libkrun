@@ -28,6 +28,12 @@ const EVICTED: &[u8] = b"written back when its inode is evicted\n";
 #[cfg_attr(feature = "guest", allow(dead_code))]
 const IMAGE_SIZE: u64 = 256 << 20;
 
+/// What fxfs-guest-checks' "punched" holds, `len` long: ones, but for the hole punched and zeros
+/// from `zeroed` on.
+fn punched_contents(len: usize, zeroed: usize) -> Vec<u8> {
+    (0..len).map(|i| u8::from(!(1000..9000).contains(&i) && i < zeroed)).collect()
+}
+
 /// Content of the guest's mmapped file at `offset`.
 fn pattern(offset: usize) -> u8 {
     (offset % 251) as u8
@@ -146,6 +152,7 @@ mod host {
             assert_eq!(read_path(&fs, "tmpfile-linked"), b"unnamed, then linked");
             assert_eq!(lookup_path(&fs, "tmpfile-linked").nlink, 1);
             assert_eq!(read_path(&fs, "fallocated"), vec![0; 8192]);
+            assert_eq!(read_path(&fs, "punched"), punched_contents(16000, 12000));
             // Unlinked, later, in batches, before the fsync of their directory.
             assert!(block_on(fs.lookup(Inode::ROOT, b"delayed")).is_err(), "delayed/ remains");
             assert_eq!(read_path(&fs, "delayed-kept/again"), b"recreated");
@@ -472,10 +479,32 @@ mod guest {
         assert_eq!(unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, 1 << 20) }, 0);
         assert_eq!(file.metadata().unwrap().len(), 8192);
         assert_eq!(fs::read(path("fallocated")).unwrap(), vec![0; 8192]);
-        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-        assert_eq!(unsafe { libc::fallocate(fd, punch, 0, 4096) }, -1);
+        let collapse = libc::FALLOC_FL_COLLAPSE_RANGE;
+        assert_eq!(unsafe { libc::fallocate(fd, collapse, 0, 4096) }, -1);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EOPNOTSUPP));
         file.sync_all().unwrap();
+
+        // A hole punched through parts of three pages, then a range zeroed past the end.
+        let mut punched = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("punched"))
+            .unwrap();
+        punched.write_all(&[1; 12288]).unwrap();
+        let fd = punched.as_raw_fd();
+        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        let ret = unsafe { libc::fallocate(fd, punch, 1000, 8000) };
+        assert_eq!(ret, 0, "punch: {}", std::io::Error::last_os_error());
+        assert_eq!(punched.metadata().unwrap().len(), 12288);
+        assert_eq!(fs::read(path("punched")).unwrap(), punched_contents(12288, 12288));
+        // The page wholly within the hole is one.
+        assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_HOLE) }, 4096);
+        let ret = unsafe { libc::fallocate(fd, libc::FALLOC_FL_ZERO_RANGE, 12000, 4000) };
+        assert_eq!(ret, 0, "zero range: {}", std::io::Error::last_os_error());
+        assert_eq!(fs::read(path("punched")).unwrap(), punched_contents(16000, 12000));
+        punched.sync_all().unwrap();
     }
 
     /// A POSIX ACL xattr's value: its version, then each entry's tag, permissions and id.

@@ -653,6 +653,47 @@ mod guest {
         file.sync_all().unwrap();
     }
 
+    /// File handles: name_to_handle_at, and open_by_handle_at with the inode cached and evicted.
+    fn test_file_handles() {
+        fs::write(path("handled"), b"by handle").unwrap();
+        // struct file_handle: handle_bytes, handle_type, then the handle.
+        let mut handle = vec![0u32; 2 + 32];
+        handle[0] = 128;
+        let mut mount_id = 0i32;
+        let name = CString::new(path("handled")).unwrap();
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                handle.as_mut_ptr(),
+                &mut mount_id,
+                0,
+            )
+        };
+        assert_eq!(ret, 0, "name_to_handle_at: {}", std::io::Error::last_os_error());
+        let open_by_handle = |handle: &mut Vec<u32>| {
+            let mount = fs::File::open(MNT).unwrap();
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_open_by_handle_at,
+                    mount.as_raw_fd(),
+                    handle.as_mut_ptr(),
+                    libc::O_RDONLY,
+                )
+            };
+            assert!(fd >= 0, "open_by_handle_at: {}", std::io::Error::last_os_error());
+            let mut file =
+                unsafe { <fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd as i32) };
+            let mut read = Vec::new();
+            file.read_to_end(&mut read).unwrap();
+            read
+        };
+        assert_eq!(open_by_handle(&mut handle), b"by handle");
+        evict(&path("handled"));
+        assert_eq!(open_by_handle(&mut handle), b"by handle");
+    }
+
     impl Test for TestFxfsGuestChecks {
         fn in_guest(self: Box<Self>) {
             let dax = self.dax;
@@ -672,6 +713,7 @@ mod guest {
                 ("freeze", &test_freeze),
                 ("delayed_unlinks", &test_delayed_unlinks),
                 ("sparse", &test_sparse),
+                ("file_handles", &test_file_handles),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {

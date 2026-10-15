@@ -22,7 +22,7 @@
 // set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each 100 ms of the run,
 // into the case's log, where they line up with the guest's results. With FXDAX_BENCH_GUEST_PERF
 // set, perf in the guest samples its kernel through each metadata workload, and the case's log
-// says where each one's time went.
+// says where each one's time went; set to `record:EVENTS`, it samples the events instead.
 
 use macros::{guest, host};
 
@@ -714,8 +714,17 @@ mod guest {
             }
             let data = format!("{}/perf.data", Self::DIR);
             let _ = fs::remove_file(&data);
+            // `record:EVENTS` samples the events, such as the scheduler's wakeups, rather than
+            // the time.
+            let setting = std::env::var("FXDAX_BENCH_GUEST_PERF").unwrap();
+            let events = match setting.strip_prefix("record:") {
+                Some(events) => vec!["-e".to_string(), events.to_string()],
+                None => vec!["-F".to_string(), "4999".to_string()],
+            };
             let perf = Command::new("perf")
-                .args(["record", "-a", "-g", "-F", "4999", "-D", "-1", "-q", "-o", &data])
+                .args(["record", "-a", "-g"])
+                .args(&events)
+                .args(["-D", "-1", "-q", "-o", &data])
                 .arg(format!("--control=fifo:{control},{ack}"))
                 .stdout(std::process::Stdio::null())
                 .spawn()
@@ -748,18 +757,29 @@ mod guest {
                 ])
                 .output()
                 .expect("perf report");
-            // And the functions the time is spent in, callees included.
+            // And the functions the time is spent in, callees included, by thread: the workload's
+            // own apart from the kernel's workers'.
             let callers = Command::new("perf")
                 .args([
-                    "report", "-i", &data, "--stdio", "--sort", "sym", "--children", "-g", "none",
-                    "--percent-limit", "3", "-q",
+                    "report", "-i", &data, "--stdio", "--sort", "comm,sym", "--children", "-g",
+                    "none", "--percent-limit", "1.5", "-q",
+                ])
+                .output()
+                .expect("perf report");
+            // And what calls the functions taking the most time themselves.
+            let chains = Command::new("perf")
+                .args([
+                    "report", "-i", &data, "--stdio", "--sort", "sym", "--no-children", "-g",
+                    "caller,2,callee,function,percent", "--max-stack", "24", "--percent-limit",
+                    "4", "-q",
                 ])
                 .output()
                 .expect("perf report");
             eprintln!(
-                "PROFILE {workload}\n{}\nINCLUSIVE {workload}\n{}",
+                "PROFILE {workload}\n{}\nINCLUSIVE {workload}\n{}\nCALLERS {workload}\n{}",
                 String::from_utf8_lossy(&report.stdout),
-                String::from_utf8_lossy(&callers.stdout)
+                String::from_utf8_lossy(&callers.stdout),
+                String::from_utf8_lossy(&chains.stdout)
             );
         }
     }

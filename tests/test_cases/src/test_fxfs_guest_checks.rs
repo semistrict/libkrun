@@ -507,6 +507,62 @@ mod guest {
         punched.sync_all().unwrap();
     }
 
+    /// A file's pages dirtied through a mapping, their extent sealed by another file's fsync (which
+    /// writes back nothing of this file's), then partly zeroed, by a hole punched and by a
+    /// truncation, which move them: what they hold reads the same through the mapping and through
+    /// reads.
+    fn test_zero_mapped() {
+        const SIZE: usize = 8192;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("zero-mapped"))
+            .unwrap();
+        (&file).write_all(&[1; SIZE]).unwrap();
+        file.sync_all().unwrap();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+        let bytes = unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>(), SIZE) };
+        let seal = || {
+            fs::write(path("zero-mapped-other"), b"other").unwrap();
+            fs::File::open(path("zero-mapped-other")).unwrap().sync_all().unwrap();
+        };
+        let mut expected = vec![1; SIZE];
+
+        bytes[100] = 2;
+        bytes[5000] = 3;
+        (expected[100], expected[5000]) = (2, 3);
+        seal();
+        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        let ret = unsafe { libc::fallocate(file.as_raw_fd(), punch, 1000, 1000) };
+        assert_eq!(ret, 0, "punch: {}", std::io::Error::last_os_error());
+        expected[1000..2000].fill(0);
+        assert_eq!(&bytes[..], &expected[..]);
+        assert_eq!(fs::read(path("zero-mapped")).unwrap(), expected);
+
+        bytes[5500] = 4;
+        expected[5500] = 4;
+        seal();
+        file.set_len(6000).unwrap();
+        expected.truncate(6000);
+        assert_eq!(&bytes[..6000], &expected[..]);
+        assert_eq!(fs::read(path("zero-mapped")).unwrap(), expected);
+
+        assert_eq!(unsafe { libc::munmap(map, SIZE) }, 0);
+        file.sync_all().unwrap();
+    }
+
     /// A POSIX ACL xattr's value: its version, then each entry's tag, permissions and id.
     fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
         let mut value = 2u32.to_le_bytes().to_vec();
@@ -765,6 +821,7 @@ mod guest {
                 ("eviction_writes_back", &test_eviction_writes_back),
                 ("tmpfile", &test_tmpfile),
                 ("fallocate", &test_fallocate),
+                ("zero_mapped", &test_zero_mapped),
                 ("acls", &test_acls),
                 ("freeze", &test_freeze),
                 ("delayed_unlinks", &test_delayed_unlinks),

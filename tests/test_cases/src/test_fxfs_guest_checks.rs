@@ -606,6 +606,53 @@ mod guest {
         fsync_dir(MNT);
     }
 
+    /// SEEK_DATA, SEEK_HOLE and FS_IOC_FIEMAP on a sparse file: data at its start and at 1 MiB.
+    fn test_sparse() {
+        const MIB: u64 = 1 << 20;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("sparse"))
+            .unwrap();
+        file.write_all(&[1; 4096]).unwrap();
+        file.seek(SeekFrom::Start(MIB)).unwrap();
+        file.write_all(&[2; 4096]).unwrap();
+        file.set_len(2 * MIB).unwrap();
+        let fd = file.as_raw_fd();
+        let seek = |offset: u64, whence| unsafe { libc::lseek(fd, offset as i64, whence) };
+        assert_eq!(seek(0, libc::SEEK_DATA), 0);
+        assert_eq!(seek(0, libc::SEEK_HOLE), 4096);
+        assert_eq!(seek(4096, libc::SEEK_DATA), MIB as i64);
+        assert_eq!(seek(MIB, libc::SEEK_HOLE), (MIB + 4096) as i64);
+        assert_eq!(seek(MIB + 4096, libc::SEEK_DATA), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENXIO));
+
+        // struct fiemap, then its extents: 56 bytes each.
+        const FS_IOC_FIEMAP: libc::c_ulong = 0xc020660b;
+        const FIEMAP_EXTENT_LAST: u32 = 0x1;
+        const EXTENTS: usize = 8;
+        let mut buf = vec![0u64; 4 + EXTENTS * 7];
+        buf[0] = 0; // fm_start
+        buf[1] = u64::MAX; // fm_length
+        // fm_flags 0, fm_mapped_extents 0; fm_extent_count, fm_reserved.
+        buf[3] = EXTENTS as u64;
+        let ret = unsafe { libc::ioctl(fd, FS_IOC_FIEMAP as _, buf.as_mut_ptr()) };
+        assert_eq!(ret, 0, "FS_IOC_FIEMAP: {}", std::io::Error::last_os_error());
+        let mapped = (buf[2] >> 32) as usize;
+        let extents: Vec<(u64, u64, u32)> = (0..mapped)
+            .map(|i| {
+                let e = &buf[4 + i * 7..4 + (i + 1) * 7];
+                (e[0], e[2], e[5] as u32)
+            })
+            .collect();
+        let logical: Vec<(u64, u64)> = extents.iter().map(|&(l, len, _)| (l, len)).collect();
+        assert_eq!(logical, [(0, 4096), (MIB, 4096)]);
+        assert_eq!(extents[1].2 & FIEMAP_EXTENT_LAST, FIEMAP_EXTENT_LAST);
+        file.sync_all().unwrap();
+    }
+
     impl Test for TestFxfsGuestChecks {
         fn in_guest(self: Box<Self>) {
             let dax = self.dax;
@@ -624,6 +671,7 @@ mod guest {
                 ("acls", &test_acls),
                 ("freeze", &test_freeze),
                 ("delayed_unlinks", &test_delayed_unlinks),
+                ("sparse", &test_sparse),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {

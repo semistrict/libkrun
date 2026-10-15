@@ -1766,6 +1766,36 @@ pub struct PayloadConfig {
     ram_ranges: Vec<(u64, u64)>,
 }
 
+/// Has the host back the guest's RAM, all but the shared memory regions
+/// `shm`, with transparent huge pages where it can, as QEMU does: the guest's
+/// TLB misses then walk fewer levels of its host's page tables, which nested
+/// virtualization makes costly.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(guest_mem: &GuestMemoryMmap, shm: &[(GuestAddress, usize)]) {
+    use vm_memory::GuestMemoryRegion;
+    for region in guest_mem.iter() {
+        if shm.iter().any(|(addr, _)| *addr == region.start_addr()) {
+            continue;
+        }
+        // SAFETY: Advises the kernel on the region's own mapping, which it
+        // backs as it did, with larger pages.
+        let ret = unsafe {
+            libc::madvise(
+                region.as_ptr().cast(),
+                region.len() as usize,
+                libc::MADV_HUGEPAGE,
+            )
+        };
+        if ret != 0 {
+            warn!(
+                "advising huge pages for guest memory at {:#x}: {}",
+                region.start_addr().raw_value(),
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 pub fn create_guest_memory(
     mem_size: usize,
     vm_resources: &VmResources,
@@ -1923,8 +1953,11 @@ pub fn create_guest_memory(
         #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
         unreachable!()
     } else {
-        GuestMemoryMmap::from_ranges(&arch_mem_regions)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
+        let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        #[cfg(target_os = "linux")]
+        advise_huge_pages(&guest_mem, &shm_manager.regions());
+        guest_mem
     };
 
     let (pmem_mappings, pmem_regions) =

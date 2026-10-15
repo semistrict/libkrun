@@ -563,6 +563,76 @@ mod guest {
         file.sync_all().unwrap();
     }
 
+    /// write(2)s and stores through a mapping to the same pages of a file, while another file's
+    /// fsyncs seal its extents again and again: as the pages move, a write(2) in the device's gate
+    /// invalidates their DAX entries, which a fault holding an entry must not wait for the gate
+    /// with (the seal waits for the write(2), the write(2) for the fault): a deadlock, which the
+    /// test's timeout catches. Then each byte holds what was written last, by each in turn alone.
+    fn test_seal_race() {
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const SIZE: usize = 64 << 10;
+        const PAGE: usize = 4096;
+        const ROUNDS: usize = 200;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path("seal-race"))
+            .unwrap();
+        (&file).write_all(&[0; SIZE]).unwrap();
+        file.sync_all().unwrap();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+        let mapped = map as usize;
+        let store = move |round: usize| {
+            for page in (0..SIZE).step_by(PAGE) {
+                unsafe { ((mapped + page + 1) as *mut u8).write_volatile(round as u8) };
+            }
+        };
+        let write = |round: usize| {
+            for page in (0..SIZE).step_by(PAGE) {
+                file.write_all_at(&[round as u8], page as u64).unwrap();
+            }
+        };
+        let sealing = AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while sealing.load(Ordering::Relaxed) {
+                    fs::write(path("seal-race-other"), b"other").unwrap();
+                    fs::File::open(path("seal-race-other")).unwrap().sync_all().unwrap();
+                }
+            });
+            let storer = scope.spawn(move || (0..ROUNDS).for_each(store));
+            (0..ROUNDS).for_each(write);
+            storer.join().unwrap();
+            sealing.store(false, Ordering::Relaxed);
+        });
+
+        write(ROUNDS);
+        store(ROUNDS);
+        let mut expected = vec![0; SIZE];
+        for page in (0..SIZE).step_by(PAGE) {
+            (expected[page], expected[page + 1]) = (ROUNDS as u8, ROUNDS as u8);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), SIZE) };
+        assert_eq!(bytes, &expected[..]);
+        assert_eq!(fs::read(path("seal-race")).unwrap(), expected);
+        assert_eq!(unsafe { libc::munmap(map, SIZE) }, 0);
+        file.sync_all().unwrap();
+    }
+
     /// A POSIX ACL xattr's value: its version, then each entry's tag, permissions and id.
     fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
         let mut value = 2u32.to_le_bytes().to_vec();
@@ -822,6 +892,7 @@ mod guest {
                 ("tmpfile", &test_tmpfile),
                 ("fallocate", &test_fallocate),
                 ("zero_mapped", &test_zero_mapped),
+                ("seal_race", &test_seal_race),
                 ("acls", &test_acls),
                 ("freeze", &test_freeze),
                 ("delayed_unlinks", &test_delayed_unlinks),

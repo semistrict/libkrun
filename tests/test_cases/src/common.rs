@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null;
 
-use crate::{TestSetup, krun_call};
+use crate::{ShouldRun, TestSetup, krun_call, krun_call_u32};
 use krun_sys::*;
 
 fn copy_guest_agent(dir: &Path) -> anyhow::Result<()> {
@@ -95,10 +95,28 @@ type KrunAddExtentStoreFn = unsafe extern "C" fn(
     c_path: *const c_char,
     capacity: u64,
     shm_size: u64,
+    c_extentd: *const c_char,
 ) -> i32;
 
+/// Whether a test of fxdax's guest kernel's Fxfs runs: libkrun has the extent device, and
+/// FXDAX_GUEST_KERNEL names the kernel, and FXDAX_EXTENTD the socket of the extent daemon that
+/// serves the device's store (as fxdax's scripts/test-e2e.sh has them).
+pub fn fxdax_guest_should_run() -> ShouldRun {
+    if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_FXDAX.into())) }.ok() != Some(1) {
+        return ShouldRun::No("libkrun compiled without FXDAX, or not on Linux");
+    }
+    if std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
+        return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
+    }
+    if std::env::var_os("FXDAX_EXTENTD").is_none() {
+        return ShouldRun::No("FXDAX_EXTENTD does not name the extent daemon's socket");
+    }
+    ShouldRun::Yes
+}
+
 /// Adds an extent-store device tagged `tag`, on the store at `path`, which it makes, holding at
-/// most `capacity` bytes, if it doesn't exist; with a DAX window of `shm_size` bytes if not 0.
+/// most `capacity` bytes, if it doesn't exist; with a DAX window of `shm_size` bytes if not 0. The
+/// extent daemon at FXDAX_EXTENTD serves the store.
 pub fn add_extent_store(
     ctx: u32,
     tag: &CStr,
@@ -111,6 +129,8 @@ pub fn add_extent_store(
     anyhow::ensure!(!ptr.is_null(), "krun_add_extent_store not found");
     let krun_add_extent_store: KrunAddExtentStoreFn = unsafe { std::mem::transmute(ptr) };
     let path = CString::new(path.as_os_str().as_bytes())?;
+    let extentd = std::env::var_os("FXDAX_EXTENTD").context("FXDAX_EXTENTD not set")?;
+    let extentd = CString::new(extentd.as_bytes())?;
     unsafe {
         krun_call!(krun_add_extent_store(
             ctx,
@@ -118,6 +138,7 @@ pub fn add_extent_store(
             path.as_ptr(),
             capacity,
             shm_size,
+            extentd.as_ptr(),
         ))
     }
 }

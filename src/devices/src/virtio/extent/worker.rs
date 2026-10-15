@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
-use fxdax::{Errno, Extents, VolatileSlice, VolatileSliceMut};
+use fxdax::{Errno, RemoteExtentStore, VolatileSlice, VolatileSliceMut};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -26,7 +26,7 @@ pub struct ExtentWorker {
     queue: DeviceQueue,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
-    store: Arc<Extents>,
+    store: Arc<RemoteExtentStore>,
     stop_fd: EventFd,
 }
 
@@ -35,7 +35,7 @@ impl ExtentWorker {
         queue: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        store: Arc<Extents>,
+        store: Arc<RemoteExtentStore>,
         stop_fd: EventFd,
     ) -> Self {
         Self {
@@ -119,7 +119,7 @@ impl ExtentWorker {
 /// Serves the request in `chain` with `store`, and returns the length of what
 /// the device writes to it: its writable buffers, whose last bytes hold the
 /// response.
-pub fn handle(store: &Extents, mem: &GuestMemoryMmap, chain: DescriptorChain) -> u32 {
+pub fn handle(store: &RemoteExtentStore, mem: &GuestMemoryMmap, chain: DescriptorChain) -> u32 {
     let (mut reader, mut writer) = match (Reader::new(mem, chain.clone()), Writer::new(mem, chain))
     {
         (Ok(reader), Ok(writer)) => (reader, writer),
@@ -167,7 +167,7 @@ fn invalid(_: io::Error) -> Errno {
 /// Serves the request `reader` holds, appending what it returns to `out`,
 /// which the driver gave `room` bytes for.
 fn serve(
-    store: &Extents,
+    store: &RemoteExtentStore,
     reader: &mut Reader,
     room: usize,
     out: &mut Vec<u8>,
@@ -310,12 +310,14 @@ mod tests {
         }
     }
 
-    fn store() -> (Extents, TestDir) {
+    /// A store of 1 MiB, which an extent daemon of the test's serves.
+    fn store() -> (RemoteExtentStore, TestDir) {
         let dir = TestDir::new();
-        (
-            Extents::Local(ExtentStore::create(dir.0.join("store"), 1 << 20).unwrap()),
-            dir,
-        )
+        let socket = dir.0.join("extentd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        thread::spawn(move || fxdax::extentd::serve(listener));
+        let store = RemoteExtentStore::connect(&socket, &dir.0.join("store"), 1 << 20).unwrap();
+        (store, dir)
     }
 
     /// The bytes of `request`'s header and arguments, followed by `data`.
@@ -336,7 +338,7 @@ mod tests {
     /// Serves a request of `readable` bytes, with `writable` bytes for the
     /// device to write, the response included, and returns what the device
     /// wrote, the response apart, and the response's status.
-    fn request(store: &Extents, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
+    fn request(store: &RemoteExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         mem.write_slice(readable, BUFFERS).unwrap();
         let chain = create_descriptor_chain(
@@ -367,7 +369,7 @@ mod tests {
         (written, response.status)
     }
 
-    fn io(store: &Extents, sequence: u64, offset: u64, len: usize) -> IoArgs {
+    fn io(store: &RemoteExtentStore, sequence: u64, offset: u64, len: usize) -> IoArgs {
         IoArgs {
             id: ExtentIdLe {
                 branch: store.branch(),

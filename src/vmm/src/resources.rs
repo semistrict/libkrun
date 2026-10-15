@@ -165,7 +165,11 @@ pub struct VmResources {
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
     /// The extent-store devices.
-    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    #[cfg(all(
+        feature = "fxdax",
+        target_os = "linux",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
     pub extent_devices: Vec<crate::vmm_config::extent::ExtentDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
@@ -350,7 +354,11 @@ impl VmResources {
         self.fs.push(config)
     }
 
-    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    #[cfg(all(
+        feature = "fxdax",
+        target_os = "linux",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
     pub fn add_extent_device(&mut self, config: crate::vmm_config::extent::ExtentDeviceConfig) {
         self.extent_devices.push(config)
     }
@@ -444,7 +452,11 @@ mod tests {
             kernel_bundle: Default::default(),
             external_kernel: None,
             fs: Default::default(),
-            #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+            #[cfg(all(
+                feature = "fxdax",
+                target_os = "linux",
+                not(any(feature = "tee", feature = "aws-nitro"))
+            ))]
             extent_devices: Vec::new(),
             vsock: Default::default(),
             #[cfg(feature = "blk")]

@@ -1,9 +1,9 @@
-// Benchmark fxdax's virtio-fs device, with DAX and without, against the guest's own filesystem:
-// ext4 on a virtio-blk disk backed by a raw image file on the same host filesystem. libkrun's own
-// virtio-fs device, passing a host directory through, measures the transport they share. The
-// guest kernel's own Fxfs (fxdax's guest kernel, FXDAX_GUEST_KERNEL), on an extent-store device,
-// with a DAX window and without, compares with ext4 booted on the same kernel, on virtio-blk, and
-// with DAX on writable virtio-pmem, where file data and metadata are stored in place in memory.
+// Benchmark the guest kernel's own Fxfs (fxdax's guest kernel, FXDAX_GUEST_KERNEL), on an
+// extent-store device that fxdax's extent daemon serves, with a DAX window and without, against
+// ext4 booted on the same kernel, on virtio-blk, and with DAX on writable virtio-pmem, where file
+// data and metadata are stored in place in memory; and the default kernel's ext4 on a virtio-blk
+// disk backed by a raw image file on the same host filesystem, and libkrun's own virtio-fs device,
+// passing a host directory through.
 //
 // Each case boots an Alpine guest, with fio, a compiler and e2fsprogs, onto one filesystem
 // mounted at /mnt/bench, and runs the same workloads on it several times: sequential and
@@ -29,14 +29,9 @@ use macros::{guest, host};
 /// The filesystem a case benchmarks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// fxdax, with the guest mapping files into a DAX window.
-    FxdaxDax,
-    /// fxdax, with the guest caching files in its own page cache.
-    FxdaxNoDax,
     /// ext4 on a virtio-blk disk.
     Ext4,
-    /// libkrun's own virtio-fs device, passing a host directory through: the transport fxdax's
-    /// device shares, without fxdax.
+    /// libkrun's own virtio-fs device, passing a host directory through.
     Passthrough,
     /// ext4 on a virtio-blk disk, with fxdax's guest kernel, which the guest's Fxfs compares with.
     Ext4GuestKernel,
@@ -78,14 +73,11 @@ const SOURCE_TARBALL: &str = "/opt/lua-5.4.7.tar.gz";
 mod host {
     use super::*;
 
-    use crate::common::{add_extent_store, set_guest_kernel, setup_rootfs};
+    use crate::common::{add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use futures::executor::block_on;
-    use fxdax::{Filesystem, Storage};
     use krun_sys::*;
-    use nix::libc;
     use std::collections::BTreeMap;
-    use std::ffi::{CString, c_char};
+    use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::ptr::null;
 
@@ -96,20 +88,6 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
     && echo '9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30  /opt/lua-5.4.7.tar.gz' \\
     | sha256sum -c
 ";
-
-    type KrunAddVirtiofsFxdaxFn = unsafe extern "C" fn(
-        ctx_id: u32,
-        c_tag: *const c_char,
-        c_image_path: *const c_char,
-        shm_size: u64,
-    ) -> i32;
-
-    fn get_krun_add_virtiofs_fxdax() -> KrunAddVirtiofsFxdaxFn {
-        let symbol = CString::new("krun_add_virtiofs_fxdax").unwrap();
-        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
-        assert!(!ptr.is_null(), "krun_add_virtiofs_fxdax not found");
-        unsafe { std::mem::transmute(ptr) }
-    }
 
     fn iterations() -> Option<u32> {
         std::env::var("FXDAX_BENCH_ITERATIONS").ok()?.parse().ok()
@@ -249,8 +227,6 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
     impl TestFsBench {
         fn name(&self) -> &'static str {
             match self.backend {
-                Backend::FxdaxDax => "fxdax-dax",
-                Backend::FxdaxNoDax => "fxdax-nodax",
                 Backend::Ext4 => "ext4-virtio-blk",
                 Backend::Passthrough => "virtiofs-passthrough",
                 Backend::Ext4GuestKernel => "ext4-guest-kernel",
@@ -270,10 +246,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
             }
             let feature = match self.backend {
-                Backend::FxdaxDax
-                | Backend::FxdaxNoDax
-                | Backend::FxfsGuest
-                | Backend::FxfsGuestDax => KRUN_FEATURE_FXDAX,
+                Backend::FxfsGuest | Backend::FxfsGuestDax => return fxdax_guest_should_run(),
                 Backend::Ext4 | Backend::Ext4GuestKernel => KRUN_FEATURE_BLK,
                 Backend::Passthrough | Backend::Ext4DaxPmem => return ShouldRun::Yes,
             };
@@ -355,23 +328,6 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                     set_guest_kernel(ctx)?;
                 }
                 match self.backend {
-                    Backend::FxdaxDax | Backend::FxdaxNoDax => {
-                        let image = test_setup.tmp_dir.join("fxdax.img");
-                        block_on(async {
-                            let fs =
-                                Filesystem::format(Storage::create(&image, IMAGE_SIZE)?).await?;
-                            fs.close().await?;
-                            anyhow::Ok(())
-                        })?;
-                        let c_image = CString::new(image.as_os_str().as_bytes())?;
-                        let dax = self.backend == Backend::FxdaxDax;
-                        krun_call!(get_krun_add_virtiofs_fxdax()(
-                            ctx,
-                            c"bench".as_ptr(),
-                            c_image.as_ptr(),
-                            if dax { 1 << 31 } else { 0 },
-                        ))?;
-                    }
                     Backend::FxfsGuest | Backend::FxfsGuestDax => {
                         // A new store, which the guest's Fxfs formats as it mounts it.
                         let store = test_setup.tmp_dir.join("extents");
@@ -470,7 +426,7 @@ mod guest {
     const MNT: &str = "/mnt/bench";
     /// The file the I/O workloads use.
     const DATA: &str = "/mnt/bench/data";
-    /// Small enough for fxdax's in-process kernel, of 1 GiB by default, to cache whole.
+    /// Small enough for fxdax's extent daemon, of 1 GiB by default, to cache whole.
     const DATA_SIZE: u64 = 256 << 20;
     /// What the random I/O workloads that are not timed read or write, and the timed ones' time.
     const RANDOM_SIZE: u64 = 16 << 20;
@@ -858,7 +814,7 @@ mod guest {
                     .unwrap();
             }
         });
-        // A filesystem without extended attributes, such as fxdax's virtio-fs, fails the workload.
+        // A filesystem without extended attributes fails the workload.
         match setxattr(&paths[0], "user.bench", b"a value") {
             Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
                 println!("FAILED setxattr");
@@ -1095,10 +1051,7 @@ mod guest {
                 print_kernel_log();
             }));
             match self.backend {
-                Backend::FxdaxDax => mount("bench", "virtiofs", "dax=always"),
-                Backend::FxdaxNoDax | Backend::Passthrough => {
-                    mount("bench", "virtiofs", "dax=never")
-                }
+                Backend::Passthrough => mount("bench", "virtiofs", "dax=never"),
                 Backend::Ext4 | Backend::Ext4GuestKernel => {
                     run("mkfs.ext4", &["-q", "-F", "/dev/vda"]);
                     mount("/dev/vda", "ext4", "");

@@ -10,4 +10,6 @@ pub struct ExtentDeviceConfig {
     pub capacity: u64,
     /// The size of the DAX window, if it has one.
     pub shm_size: Option<usize>,
+    /// The socket of fxdax's extent daemon, which serves the store.
+    pub extentd: String,
 }

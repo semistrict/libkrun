@@ -21,7 +21,9 @@ const FXFS_SKIPPED: &[(&str, &str)] = &[];
 #[host]
 mod host {
     use super::*;
-    use crate::common::{add_extent_store, set_guest_kernel, setup_fs_and_enter_with_env};
+    use crate::common::{
+        add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_fs_and_enter_with_env,
+    };
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use krun_sys::*;
     use std::ffi::CString;
@@ -49,8 +51,8 @@ mod host {
             {
                 return ShouldRun::No("PJDFSTEST_REPO/PJDFSTEST_COMMIT not set");
             }
-            if self.guest_fxfs && std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
-                return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
+            if self.guest_fxfs {
+                return fxdax_guest_should_run();
             }
             ShouldRun::Yes
         }

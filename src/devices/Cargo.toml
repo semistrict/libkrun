@@ -20,7 +20,7 @@ virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
 vhost-user = ["vhost", "vmm-sys-util"]
-fxdax = ["dep:fxdax", "dep:futures", "dep:tokio"]
+fxdax = ["dep:fxdax"]
 
 [dependencies]
 bitflags = "1.2.0"
@@ -46,11 +46,6 @@ utils = { package = "krun-utils", version = "=0.1.0-1.18.0", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-1.18.0", path = "../polly" }
 rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-1.18.0", path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
 imago = { version = "0.2.2", features = ["sync-wrappers", "vm-memory"] }
-# The fxdax repository that vendors this libkrun
-fxdax = { path = "../../../../crates/fxdax", optional = true }
-futures = { version = "0.3.34", optional = true }
-# The tokio of fxdax's executor, which the device's loop runs on.
-tokio = { version = "1", default-features = false, features = ["net", "rt"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }
@@ -61,6 +56,9 @@ rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-1.18.0", path 
 caps = "0.5.5"
 kvm-bindings = { version = "0.12", features = ["fam-wrappers"] }
 kvm-ioctls = "0.22"
+# The fxdax repository that vendors this libkrun: the extent device's client of
+# its extent daemon.
+fxdax = { path = "../../../../crates/fxdax", optional = true }
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"

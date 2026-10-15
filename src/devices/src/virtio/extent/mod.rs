@@ -3,13 +3,16 @@
 // A guest that runs Fxfs itself stores its filesystem through this device,
 // as extents its Fxfs names: immutable pieces of data, written once and
 // sealed by the next commit, freed whole, and a root naming where the
-// filesystem starts. The host keeps them in an fxdax extent store
-// (`fxdax::ExtentStore`) on local disk, and maps sealed extents into the
-// device's DAX window from fxdax's cache of their pages.
+// filesystem starts. fxdax's extent daemon, which the device connects to,
+// keeps them in an fxdax extent store (`fxdax::ExtentStore`) on local disk,
+// and maps sealed extents into the device's DAX window from its cache of their
+// pages, which the host's VMs share.
 
+mod dax;
 mod device;
 mod worker;
 
+pub use self::dax::PrefaultGuestMemory;
 pub use self::device::Extent;
 
 use vm_memory::ByteValued;

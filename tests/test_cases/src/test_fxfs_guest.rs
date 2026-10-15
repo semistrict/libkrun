@@ -96,7 +96,9 @@ fn written() -> Vec<u8> {
 mod host {
     use super::*;
 
-    use crate::common::{add_extent_store, set_guest_kernel, setup_fs_and_enter};
+    use crate::common::{
+        add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_fs_and_enter,
+    };
     use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
     use futures::executor::block_on;
     use fxdax::{Filesystem, Inode, Owner, Storage};
@@ -107,15 +109,7 @@ mod host {
 
     impl Test for TestFxfsGuest {
         fn should_run(&self) -> ShouldRun {
-            if unsafe { krun_call_u32!(krun_has_feature(KRUN_FEATURE_FXDAX.into())) }.ok()
-                != Some(1)
-            {
-                return ShouldRun::No("libkrun compiled without FXDAX");
-            }
-            if std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
-                return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
-            }
-            ShouldRun::Yes
+            fxdax_guest_should_run()
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {

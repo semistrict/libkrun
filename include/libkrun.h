@@ -369,57 +369,14 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
                            bool read_only);
 
 /**
- * Adds an independent virtio-fs device serving an fxdax (Fxfs) image with a tag. With a
- * non-zero "shm_size", the guest may map file pages directly through a DAX window
- * (mount with "-o dax"). The image must not be used by anything else while the VM
- * runs. Only available when libkrun is built with FXDAX=1.
- *
- * Arguments:
- *  "ctx_id"         - the configuration context ID.
- *  "c_tag"          - tag to identify the filesystem in the guest.
- *  "c_image_path"   - full path to the fxdax image in the host.
- *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_add_virtiofs_fxdax(uint32_t ctx_id,
-                                const char *c_tag,
-                                const char *c_image_path,
-                                uint64_t shm_size);
-
-/**
- * Adds an independent virtio-fs device serving one volume of an fxdax (Fxfs) image with a
- * tag, creating the volume if the image has none of that name. Devices serving volumes of the
- * same image share it: each volume is a filesystem of its own, and they share the image's
- * journal and space. An image's filesystem, as krun_add_virtiofs_fxdax serves it, is its
- * volume "default". With a non-zero "shm_size", the guest may map file pages directly through a
- * DAX window (mount with "-o dax"). The image must not be used by anything else while the VM
- * runs. Only available when libkrun is built with FXDAX=1.
- *
- * Arguments:
- *  "ctx_id"         - the configuration context ID.
- *  "c_tag"          - tag to identify the filesystem in the guest.
- *  "c_image_path"   - full path to the fxdax image in the host.
- *  "c_volume"       - the name of the volume.
- *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_add_virtiofs_fxdax_volume(uint32_t ctx_id,
-                                       const char *c_tag,
-                                       const char *c_image_path,
-                                       const char *c_volume,
-                                       uint64_t shm_size);
-
-/**
  * Adds a virtio extent-store device with a tag: the store of extents that a guest
- * running Fxfs itself keeps its filesystem in (fxdax's backlog doc-4). The store is
- * an fxdax extent store in a directory, created holding at most "capacity" bytes if
- * it doesn't exist. With a non-zero "shm_size", the device has a DAX window, which
- * the guest maps sealed extents into. The store must not be used by anything else
- * while the VM runs. Only available when libkrun is built with FXDAX=1.
+ * running Fxfs itself keeps its filesystem in (fxdax's backlog doc-4). fxdax's extent
+ * daemon, listening at "c_extentd", serves the store, an fxdax extent store in a
+ * directory, created holding at most "capacity" bytes if it doesn't exist, and shares
+ * the pages of the extents it caches with the host's other VMs. With a non-zero
+ * "shm_size", the device has a DAX window, which the guest maps extents into. The store
+ * must not be used by anything else while the VM runs. Only available on Linux, when
+ * libkrun is built with FXDAX=1.
  *
  * Arguments:
  *  "ctx_id"         - the configuration context ID.
@@ -427,6 +384,7 @@ int32_t krun_add_virtiofs_fxdax_volume(uint32_t ctx_id,
  *  "c_path"         - full path to the extent store's directory in the host.
  *  "capacity"       - the most bytes a store created here holds.
  *  "shm_size"       - size of the DAX SHM window in bytes, or 0 for no DAX.
+ *  "c_extentd"      - path of the extent daemon's (fxdax-extentd's) socket.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -435,25 +393,8 @@ int32_t krun_add_extent_store(uint32_t ctx_id,
                               const char *c_tag,
                               const char *c_path,
                               uint64_t capacity,
-                              uint64_t shm_size);
-
-/**
- * Sets how much memory fxdax keeps files' pages in, for every fxdax device in
- * the process: the most host memory their cached and dirty pages, and their
- * DAX windows' pages, take, 1 GiB unless set. As free memory runs low, fxdax
- * writes dirty pages back sooner, and drops clean ones; its thresholds for
- * that scale with the memory. May be called once, before the first fxdax
- * device starts, which is when a VM with one starts. Only available when
- * libkrun is built with FXDAX=1.
- *
- * Arguments:
- *  "memory_bytes"   - the memory, in bytes.
- *
- * Returns:
- *  Zero on success, -EBUSY if already set or once an fxdax device has started,
- *  or -EINVAL for too little memory.
- */
-int32_t krun_set_fxdax_memory(uint64_t memory_bytes);
+                              uint64_t shm_size,
+                              const char *c_extentd);
 
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */

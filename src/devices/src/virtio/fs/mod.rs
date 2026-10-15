@@ -8,8 +8,6 @@ mod inode_alloc;
 mod multikey;
 mod null_fs;
 mod read_only;
-#[cfg(feature = "fxdax")]
-mod fxdax;
 mod server;
 pub mod virtual_entry;
 mod worker;
@@ -31,14 +29,8 @@ use super::bindings;
 use super::descriptor_utils;
 
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
-pub use self::device::{Fs, FsBackend};
+pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
-#[cfg(all(feature = "fxdax", target_os = "linux"))]
-pub use self::fxdax::PrefaultGuestMemory;
-#[cfg(feature = "fxdax")]
-pub use self::fxdax::set_kernel_memory as set_fxdax_kernel_memory;
-#[cfg(feature = "fxdax")]
-pub(crate) use self::fxdax::{DaxFaults, dax_window};
 
 mod defs {
     use super::super::QueueConfig;

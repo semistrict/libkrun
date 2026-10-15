@@ -21,7 +21,7 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -128,7 +128,6 @@ const EC_AA64_HVC: u64 = 0x16;
 const EC_AA64_SMC: u64 = 0x17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
-const EC_INSTABORT: u64 = 0x20;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
 
@@ -138,11 +137,9 @@ pub enum Error {
     FindSymbol(libloading::Error),
     GetIpaSize,
     MemoryMap,
-    MemoryProtect,
     MemoryUnmap,
     NestedCheck,
     SetIpaSize(u32),
-    UnresolvedFault(u64, bool),
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -165,17 +162,12 @@ impl Display for Error {
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             GetIpaSize => write!(f, "Error getting maximum HVF IPA size"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
-            MemoryProtect => write!(f, "Error changing the protection of memory in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
                 "Nested virtualization was requested but it's not support in this system"
             ),
             SetIpaSize(ipa_size) => write!(f, "Error setting HVF IPA size to {ipa_size} bits"),
-            UnresolvedFault(pa, write) => write!(
-                f,
-                "Unresolved guest fault at {pa:#x} (write: {write}) in demand-paged memory"
-            ),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -490,111 +482,6 @@ fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
     Ok(false)
 }
 
-/// Resolves the guest's fault at an offset into a demand-paged region, a write or a read, by
-/// mapping the page with [`map_guest_memory`]. Returns whether it did.
-pub type DemandFaultHandler = Arc<dyn Fn(u64, bool) -> bool + Send + Sync>;
-
-struct DemandPagedRange {
-    guest_addr: u64,
-    size: u64,
-    handler: DemandFaultHandler,
-}
-
-static DEMAND_PAGED: RwLock<Vec<DemandPagedRange>> = RwLock::new(Vec::new());
-
-/// Guest physical memory whose pages the VMM maps as the guest faults on them, such as a virtio-fs
-/// DAX window whose files' pages a pager supplies. Faults on its unmapped pages go to its handler,
-/// rather than to MMIO devices, until it is dropped; a fault the handler cannot resolve stops the
-/// vCPU.
-pub struct DemandPagedRegion {
-    guest_addr: u64,
-}
-
-impl DemandPagedRegion {
-    /// Makes the `size` bytes of guest memory at `guest_addr` demand paged, unmapping the memory
-    /// the VMM mapped there.
-    pub fn new(guest_addr: u64, size: u64, handler: DemandFaultHandler) -> Result<Self, Error> {
-        let ret = unsafe { hv_vm_unmap(guest_addr, size as usize) };
-        if ret != HV_SUCCESS {
-            return Err(Error::MemoryUnmap);
-        }
-        DEMAND_PAGED.write().unwrap().push(DemandPagedRange {
-            guest_addr,
-            size,
-            handler,
-        });
-        Ok(Self { guest_addr })
-    }
-}
-
-impl Drop for DemandPagedRegion {
-    fn drop(&mut self) {
-        DEMAND_PAGED
-            .write()
-            .unwrap()
-            .retain(|range| range.guest_addr != self.guest_addr);
-    }
-}
-
-/// Passes the guest's fault at `pa` to the handler of the demand-paged region it is in, and returns
-/// whether it is in one. A fault the handler cannot resolve is an error, as the guest cannot go on.
-fn handle_demand_fault(pa: u64, write: bool) -> Result<bool, Error> {
-    let Some((offset, handler)) = DEMAND_PAGED.read().unwrap().iter().find_map(|range| {
-        let offset = pa.checked_sub(range.guest_addr)?;
-        (offset < range.size).then(|| (offset, range.handler.clone()))
-    }) else {
-        return Ok(false);
-    };
-    if !handler(offset, write) {
-        return Err(Error::UnresolvedFault(pa, write));
-    }
-    Ok(true)
-}
-
-/// Maps the `size` bytes of host memory at `host_addr` at `guest_addr`, where nothing is mapped,
-/// with `flags` (`HV_MEMORY_*`).
-pub fn map_guest_memory(
-    host_addr: u64,
-    guest_addr: u64,
-    size: u64,
-    flags: hv_memory_flags_t,
-) -> Result<(), Error> {
-    let ret = unsafe {
-        hv_vm_map(
-            host_addr as *mut core::ffi::c_void,
-            guest_addr,
-            size as usize,
-            flags,
-        )
-    };
-    if ret != HV_SUCCESS {
-        return Err(Error::MemoryMap);
-    }
-    Ok(())
-}
-
-/// Changes the protection of the mapped `size` bytes of guest memory at `guest_addr` to `flags`.
-pub fn protect_guest_memory(
-    guest_addr: u64,
-    size: u64,
-    flags: hv_memory_flags_t,
-) -> Result<(), Error> {
-    let ret = unsafe { hv_vm_protect(guest_addr, size as usize, flags) };
-    if ret != HV_SUCCESS {
-        return Err(Error::MemoryProtect);
-    }
-    Ok(())
-}
-
-/// Unmaps the mapped `size` bytes of guest memory at `guest_addr`.
-pub fn unmap_guest_memory(guest_addr: u64, size: u64) -> Result<(), Error> {
-    let ret = unsafe { hv_vm_unmap(guest_addr, size as usize) };
-    if ret != HV_SUCCESS {
-        return Err(Error::MemoryUnmap);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,8 +585,6 @@ pub enum VcpuExit<'a> {
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
     DirtyMemory,
-    /// A fault on demand-paged memory was resolved (see [`DemandPagedRegion`]).
-    DemandPagedMemory,
     PsciHandled,
     SecureMonitorCall,
     Shutdown,
@@ -1056,11 +941,6 @@ impl HvfVcpu<'_> {
 
                 let pa = self.vcpu_exit.exception.physical_address;
 
-                if handle_demand_fault(pa, iswrite)? {
-                    self.pending_advance_pc = false;
-                    return Ok(VcpuExit::DemandPagedMemory);
-                }
-
                 if iswrite {
                     if dirty_tracking_handle_write_fault(pa)? {
                         self.pending_advance_pc = false;
@@ -1161,12 +1041,6 @@ impl HvfVcpu<'_> {
                 let timeout =
                     Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq));
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
-            }
-            EC_INSTABORT
-                if handle_demand_fault(self.vcpu_exit.exception.physical_address, false)? =>
-            {
-                self.pending_advance_pc = false;
-                Ok(VcpuExit::DemandPagedMemory)
             }
             EC_AA64_HVC => self.handle_psci_request(),
             EC_AA64_SMC => {

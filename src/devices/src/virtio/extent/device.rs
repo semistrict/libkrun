@@ -7,36 +7,32 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use fxdax::{ExtentStore, Extents};
+use fxdax::{ExtentStore, RemoteExtentStore};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+use super::dax::{PrefaultGuestMemory, create_dax_window};
 use super::worker::ExtentWorker;
 use super::{
     Config, MAX_EXTENT, MAX_ROOT, MAX_TRANSFER, NUM_QUEUES, QUEUE_CONFIG, QUEUE_SIZE, TYPE_EXTENT,
     VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE,
 };
-#[cfg(target_os = "linux")]
-use crate::virtio::fs::PrefaultGuestMemory;
-use crate::virtio::fs::{DaxFaults, dax_window};
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
     VirtioDevice, VirtioShmRegion,
 };
 
 pub struct Extent {
-    store: Arc<Extents>,
+    store: Arc<RemoteExtentStore>,
     config: Config,
     avail_features: u64,
     acked_features: u64,
     device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
-    /// What passes the guest's faults on the DAX window to the store, once
-    /// the window is created, which it is on the first activation.
-    dax_faults: Option<DaxFaults>,
+    /// Whether the DAX window is created, which it is on the first activation.
+    dax_window: bool,
     /// Maps the DAX window's pages for the guest as the store maps them.
-    #[cfg(target_os = "linux")]
     prefault: Option<Arc<dyn PrefaultGuestMemory>>,
     worker: Option<JoinHandle<DeviceQueue>>,
     worker_stopfd: EventFd,
@@ -44,14 +40,16 @@ pub struct Extent {
 
 impl Extent {
     /// A device tagged `tag` serving the extent store at `path`, which is
-    /// created, holding at most `capacity` bytes, if it doesn't exist: in this
-    /// process, or, where FXDAX_EXTENTD names its socket, in fxdax's extent
-    /// daemon, which shares its memory with the host's other VMs.
-    pub fn new(tag: &str, path: &Path, capacity: u64) -> io::Result<Self> {
-        let daemon = std::env::var_os("FXDAX_EXTENTD").filter(|socket| !socket.is_empty());
-        let store = Extents::open_or_create(path, capacity, daemon.as_deref().map(Path::new))
-        .map_err(|err| {
-            io::Error::other(format!("opening extent store {}: {err:#}", path.display()))
+    /// created, holding at most `capacity` bytes, if it doesn't exist, in
+    /// fxdax's extent daemon listening at `extentd`, which shares its memory
+    /// with the host's other VMs.
+    pub fn new(tag: &str, path: &Path, capacity: u64, extentd: &Path) -> io::Result<Self> {
+        let store = RemoteExtentStore::connect(extentd, path, capacity).map_err(|err| {
+            io::Error::other(format!(
+                "opening extent store {} in {}: {err:#}",
+                path.display(),
+                extentd.display()
+            ))
         })?;
         let mut config = Config {
             tag: [0; 36],
@@ -79,8 +77,7 @@ impl Extent {
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
-            dax_faults: None,
-            #[cfg(target_os = "linux")]
+            dax_window: false,
             prefault: None,
             worker: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
@@ -96,7 +93,6 @@ impl Extent {
 
     /// Has `prefault` map the DAX window's pages for the guest as the store
     /// maps them, rather than the guest faulting on each.
-    #[cfg(target_os = "linux")]
     pub fn set_prefault(&mut self, prefault: Arc<dyn PrefaultGuestMemory>) {
         self.prefault = Some(prefault);
     }
@@ -107,13 +103,9 @@ impl Extent {
         let Some(shm_region) = &self.shm_region else {
             return Ok(());
         };
-        if self.dax_faults.is_none() {
-            self.dax_faults = Some(dax_window(
-                &*self.store,
-                shm_region,
-                #[cfg(target_os = "linux")]
-                self.prefault.clone(),
-            )?);
+        if !self.dax_window {
+            create_dax_window(&self.store, shm_region, self.prefault.clone())?;
+            self.dax_window = true;
         }
         Ok(())
     }

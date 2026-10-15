@@ -47,8 +47,12 @@ use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
 #[cfg(not(feature = "tee"))]
-use vmm::vmm_config::fs::{FsDeviceConfig, FsSource};
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+use vmm::vmm_config::fs::FsDeviceConfig;
+#[cfg(all(
+    feature = "fxdax",
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 use vmm::vmm_config::extent::ExtentDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -386,10 +390,7 @@ impl TryFrom<ContextConfig> for NitroEnclave {
         };
 
         let rootfs = if let Some(path) = &ctx.vmr.fs.first() {
-            match &path.source {
-                FsSource::Directory(dir) => Some(dir.clone()),
-                _ => None,
-            }
+            path.shared_dir.clone()
         } else {
             error!("rootfs path required");
             return Err(-libc::EINVAL);
@@ -631,13 +632,14 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
         };
 
         let fs_id = "/dev/root".to_string();
+        let shared_dir = root_path.to_string();
 
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
                 cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id,
-                    source: FsSource::Directory(root_path.to_string()),
+                    shared_dir: Some(shared_dir),
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
@@ -728,7 +730,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 }
                 cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: tag.to_string(),
-                    source: path.map_or(FsSource::Virtual, |p| FsSource::Directory(p.to_string())),
+                    shared_dir: path.map(|p| p.to_string()),
                     shm_size: shm,
                     read_only,
                     virtual_entries,
@@ -743,75 +745,31 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
-pub unsafe extern "C" fn krun_add_virtiofs_fxdax(
-    ctx_id: u32,
-    c_tag: *const c_char,
-    c_image_path: *const c_char,
-    shm_size: u64,
-) -> i32 {
-    if c_image_path.is_null() {
-        return -libc::EINVAL;
-    }
-    let Ok(image_path) = (unsafe { CStr::from_ptr(c_image_path) }).to_str() else {
-        return -libc::EINVAL;
-    };
-    add_fxdax_device(
-        ctx_id,
-        c_tag,
-        FsSource::FxdaxImage(image_path.to_string()),
-        shm_size,
-    )
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
-pub unsafe extern "C" fn krun_add_virtiofs_fxdax_volume(
-    ctx_id: u32,
-    c_tag: *const c_char,
-    c_image_path: *const c_char,
-    c_volume: *const c_char,
-    shm_size: u64,
-) -> i32 {
-    if c_image_path.is_null() || c_volume.is_null() {
-        return -libc::EINVAL;
-    }
-    let (image, volume) = unsafe {
-        match (
-            CStr::from_ptr(c_image_path).to_str(),
-            CStr::from_ptr(c_volume).to_str(),
-        ) {
-            (Ok(image), Ok(volume)) if !volume.is_empty() => (image, volume),
-            _ => return -libc::EINVAL,
-        }
-    };
-    let source = FsSource::FxdaxVolume {
-        image: image.to_string(),
-        volume: volume.to_string(),
-    };
-    add_fxdax_device(ctx_id, c_tag, source, shm_size)
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+#[cfg(all(
+    feature = "fxdax",
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 pub unsafe extern "C" fn krun_add_extent_store(
     ctx_id: u32,
     c_tag: *const c_char,
     c_path: *const c_char,
     capacity: u64,
     shm_size: u64,
+    c_extentd: *const c_char,
 ) -> i32 {
-    if c_tag.is_null() || c_path.is_null() {
+    if c_tag.is_null() || c_path.is_null() || c_extentd.is_null() {
         return -libc::EINVAL;
     }
-    let (tag, path) = unsafe {
+    let (tag, path, extentd) = unsafe {
         match (
             CStr::from_ptr(c_tag).to_str(),
             CStr::from_ptr(c_path).to_str(),
+            CStr::from_ptr(c_extentd).to_str(),
         ) {
-            (Ok(tag), Ok(path)) if !tag.is_empty() && tag.len() <= 36 => (tag, path),
+            (Ok(tag), Ok(path), Ok(extentd)) if !tag.is_empty() && tag.len() <= 36 => {
+                (tag, path, extentd)
+            }
             _ => return -libc::EINVAL,
         }
     };
@@ -829,53 +787,7 @@ pub unsafe extern "C" fn krun_add_extent_store(
                 path: path.to_string(),
                 capacity,
                 shm_size,
-            });
-            KRUN_SUCCESS
-        }
-        Entry::Vacant(_) => -libc::ENOENT,
-    }
-}
-
-#[unsafe(no_mangle)]
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
-pub extern "C" fn krun_set_fxdax_memory(memory_bytes: u64) -> i32 {
-    match devices::virtio::fs::set_fxdax_kernel_memory(memory_bytes) {
-        Ok(()) => KRUN_SUCCESS,
-        Err(errno) => -errno,
-    }
-}
-
-/// Adds a virtio-fs device tagged `c_tag` serving the fxdax `source`, with a
-/// DAX window of `shm_size` bytes, or none if it is 0.
-#[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
-fn add_fxdax_device(ctx_id: u32, c_tag: *const c_char, source: FsSource, shm_size: u64) -> i32 {
-    if c_tag.is_null() {
-        return -libc::EINVAL;
-    }
-    let Ok(tag) = (unsafe { CStr::from_ptr(c_tag) }).to_str() else {
-        return -libc::EINVAL;
-    };
-    let shm_size = match shm_size {
-        0 => None,
-        size => match size.try_into() {
-            Ok(size) => Some(size),
-            Err(_) => return -libc::EINVAL,
-        },
-    };
-
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            let mut virtual_entries = Vec::new();
-            if tag == "/dev/root" && !cfg.disable_implicit_init {
-                virtual_entries.push(init_virtual_entry());
-            }
-            cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag.to_string(),
-                source,
-                shm_size,
-                read_only: false,
-                virtual_entries,
+                extentd: extentd.to_string(),
             });
             KRUN_SUCCESS
         }
@@ -2258,7 +2170,7 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
         KRUN_FEATURE_INTEL_TDX => cfg!(feature = "tdx"),
         KRUN_FEATURE_AWS_NITRO => cfg!(feature = "aws-nitro"),
         KRUN_FEATURE_VIRGL_RESOURCE_MAP2 => cfg!(feature = "virgl_resource_map2"),
-        KRUN_FEATURE_FXDAX => cfg!(feature = "fxdax"),
+        KRUN_FEATURE_FXDAX => cfg!(all(feature = "fxdax", target_os = "linux")),
         _ => return -libc::EINVAL,
     };
 
@@ -2695,7 +2607,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
 
                 ctx_cfg.vmr.add_fs_device(FsDeviceConfig {
                     fs_id: "/dev/root".into(),
-                    source: FsSource::Virtual,
+                    shared_dir: None,
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
@@ -3327,9 +3239,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         vmm::timing_event("start_enter.restore.resumed");
     }
 
-    // The worker maps GPU blobs and virtio-fs DAX windows into the guest.
     #[cfg(target_os = "macos")]
-    if ctx_cfg.gpu_virgl_flags.is_some() || ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
+    if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
     }
 

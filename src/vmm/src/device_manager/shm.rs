@@ -63,7 +63,11 @@ impl ShmManager {
         self.fs_regions.get(&index)
     }
 
-    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    #[cfg(all(
+        feature = "fxdax",
+        target_os = "linux",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
     pub fn extent_region(&self, index: usize) -> Option<&ShmRegion> {
         self.extent_regions.get(&index)
     }
@@ -105,7 +109,11 @@ impl ShmManager {
         Ok(())
     }
 
-    #[cfg(all(feature = "fxdax", not(any(feature = "tee", feature = "aws-nitro"))))]
+    #[cfg(all(
+        feature = "fxdax",
+        target_os = "linux",
+        not(any(feature = "tee", feature = "aws-nitro"))
+    ))]
     pub fn create_extent_region(&mut self, index: usize, size: usize) -> Result<(), Error> {
         let region = self.create_region(size)?;
         self.extent_regions.insert(index, region);

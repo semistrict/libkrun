@@ -16,14 +16,8 @@ pub struct InodeAllocator {
 
 impl InodeAllocator {
     pub fn new() -> Self {
-        Self::starting_at(fuse::ROOT_ID + 1)
-    }
-
-    /// An allocator whose first inode number is `first`, for sharing an
-    /// inode space with a filesystem that numbers inodes below it.
-    pub fn starting_at(first: u64) -> Self {
         Self {
-            next: AtomicU64::new(first),
+            next: AtomicU64::new(fuse::ROOT_ID + 1),
         }
     }
 

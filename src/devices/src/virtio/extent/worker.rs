@@ -16,7 +16,8 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::super::DeviceQueue;
 use super::{
     CommitArgs, Info, IoArgs, MAX_ROOT, MAX_TRANSFER, MapArgs, RequestHeader, Response, RootLen,
-    UnmapArgs, VIRTIO_EXTENT_COMMIT_ROOT, VIRTIO_EXTENT_MAP_WRITE, VIRTIO_EXTENT_T_COMMIT,
+    UnmapArgs, VIRTIO_EXTENT_COMMIT_DURABLE, VIRTIO_EXTENT_COMMIT_ROOT, VIRTIO_EXTENT_MAP_WRITE,
+    VIRTIO_EXTENT_T_COMMIT,
     VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ,
     VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE,
     VIRTIO_EXTENT_WRITE_BARRIER,
@@ -248,8 +249,8 @@ fn serve(
             let mut data = vec![0; len as usize];
             reader.read_exact(&mut data).map_err(invalid)?;
             if flags & VIRTIO_EXTENT_WRITE_BARRIER != 0 {
-                // Commits are barriers, and durable.
-                store.commit(None)?;
+                // A barrier, which orders, without waiting for durability (doc-4).
+                store.commit_ordered(None)?;
             }
             store.write(
                 args.id.into(),
@@ -280,17 +281,23 @@ fn serve(
         }
         VIRTIO_EXTENT_T_COMMIT => {
             let args: CommitArgs = reader.read_obj().map_err(invalid)?;
-            if flags & VIRTIO_EXTENT_COMMIT_ROOT == 0 {
-                // Every commit is durable.
-                return store.commit(None);
+            let mut root = None;
+            if flags & VIRTIO_EXTENT_COMMIT_ROOT != 0 {
+                let len = u32::from_le(args.root_len);
+                if len > MAX_ROOT {
+                    return Err(Errno::EINVAL);
+                }
+                let mut data = vec![0; len as usize];
+                reader.read_exact(&mut data).map_err(invalid)?;
+                root = Some(data);
             }
-            let len = u32::from_le(args.root_len);
-            if len > MAX_ROOT {
-                return Err(Errno::EINVAL);
+            // Without COMMIT_DURABLE, the commit completes once ordered: the daemon makes it
+            // durable soon after (doc-4).
+            if flags & VIRTIO_EXTENT_COMMIT_DURABLE != 0 {
+                store.commit(root.as_deref())
+            } else {
+                store.commit_ordered(root.as_deref())
             }
-            let mut root = vec![0; len as usize];
-            reader.read_exact(&mut root).map_err(invalid)?;
-            store.commit(Some(&root))
         }
         VIRTIO_EXTENT_T_ROOT => {
             let root = store.root()?;

@@ -577,15 +577,14 @@ mod guest {
     /// doesn't).
     fn crash(dax: bool) -> ! {
         assert_eq!(names(MNT), Vec::<String>::new());
-        // A file of 1 MiB or more maps its data from the window once read in again; a small one
-        // doesn't.
+        // Files map their data from the window, if there is one: small ones too.
         let (probe, small) = (format!("{MNT}/probe"), format!("{MNT}/small"));
         fs::write(&probe, pattern(2 << 20, 1)).unwrap();
         fs::write(&small, b"small").unwrap();
         evict(&probe);
         evict(&small);
         assert_eq!(is_dax(&probe), dax, "the DAX attribute");
-        assert!(!is_dax(&small), "a small file is DAX");
+        assert_eq!(is_dax(&small), dax, "a small file's DAX attribute");
         fs::remove_file(&probe).unwrap();
         fs::remove_file(&small).unwrap();
         std::thread::spawn(|| fsync_files(1));
@@ -626,27 +625,52 @@ mod guest {
             .unwrap_or_else(|| panic!("no count of {kind} requests"))
     }
 
-    /// A file's data maps from the window: read in again after its inode is evicted, it takes a
-    /// MAP of each of its extents, and no READ. Written back a MiB at a time (FXFS_IO_MAX), 3 MiB
-    /// and a bit are in four extents: two in each 2 MiB chunk. Its window ranges outlive its
-    /// inode: evicted and read in again, it takes neither.
+    /// A file's data is written through the window, and its window ranges outlive its inode:
+    /// evicted and read in again, it takes no MAP and no READ.
     fn read_maps() {
         let path = format!("{MNT}/mapped-read");
         let data = pattern((3 << 20) + 5, 0x3c);
         fs::write(&path, &data).unwrap();
-        // In the page cache as written; read in again, from the window.
-        assert!(!is_dax(&path), "{path} is DAX as written");
-        evict(&path);
         assert!(is_dax(&path), "{path} is not DAX");
+        evict(&path);
         let (reads, maps) = (requests("read"), requests("map"));
         assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(requests("read"), reads, "reading the file read from the device");
-        assert_eq!(requests("map"), maps + 4, "the file's extents' MAPs");
-        evict(&path);
-        assert_eq!(fs::read(&path).unwrap(), data);
-        assert_eq!(requests("read"), reads, "reading the file again read from the device");
-        assert_eq!(requests("map"), maps + 4, "reading the file again mapped its extents");
+        assert_eq!(requests("map"), maps, "reading the file mapped its extents");
         fs::remove_file(&path).unwrap();
+    }
+
+    /// Small files are DAX, and share an extent, which the window maps once for them all: as the
+    /// files' blocks are handed out, further each time, doubling (1, 2, 4... pages), so 32 files of
+    /// a block take 6 MAPs, and no READ. Evicted and read in again, they take neither.
+    fn small_files_share() {
+        let dir = format!("{MNT}/small");
+        fs::create_dir(&dir).unwrap();
+        let files: Vec<(String, Vec<u8>)> = (0..32)
+            .map(|i| (format!("{dir}/file-{i}"), pattern(100 + i, i as u8)))
+            .collect();
+        // Sealed, the next small write takes a new extent.
+        unsafe { libc::sync() };
+        let (reads, maps) = (requests("read"), requests("map"));
+        for (path, data) in &files {
+            fs::write(path, data).unwrap();
+        }
+        assert_eq!(requests("map"), maps + 6, "the small files' MAPs");
+        assert_eq!(requests("read"), reads, "writing small files read from the device");
+        assert!(is_dax(&files[0].0), "a small file is not DAX");
+        for (path, _) in &files {
+            evict(path);
+        }
+        let (reads, maps) = (requests("read"), requests("map"));
+        for (path, data) in &files {
+            assert_eq!(&fs::read(path).unwrap(), data, "{path}");
+        }
+        assert_eq!(requests("map"), maps, "reading small files again mapped them");
+        assert_eq!(requests("read"), reads, "reading small files again read from the device");
+        for (path, _) in &files {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(&dir).unwrap();
     }
 
     /// The extent-store device's count of the requests it has taken, by type.
@@ -699,6 +723,8 @@ mod guest {
 
     impl Test for TestFxfsGuest {
         fn in_guest(self: Box<Self>) {
+            // The filesystem's warnings, which `quiet` keeps off the console, go to the log.
+            fs::write("/proc/sys/kernel/printk", b"5").unwrap();
             fs::create_dir_all(MNT).unwrap();
             // A tag no device has.
             assert_eq!(
@@ -721,13 +747,14 @@ mod guest {
             );
 
             write(&format!("{MNT}/guest-dir"));
-            // Read in again, a file of 1 MiB or more maps its data from the window.
+            // Read in again, a file maps its data from the window, if there is one.
             let renamed = format!("{MNT}/guest-dir/renamed");
             evict(&renamed);
             assert_eq!(is_dax(&renamed), self.dax, "the DAX attribute");
             metadata_cached();
             if self.dax {
                 read_maps();
+                small_files_share();
             }
 
             // The store mounted again, elsewhere, is the same filesystem.

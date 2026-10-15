@@ -306,13 +306,9 @@ mod guest {
             .open(path("dax-mapped"))
             .unwrap();
         file.set_len(MAPPED_SIZE as u64).unwrap();
-        // The guest's Fxfs maps a file's data from the window only once its inode is read in
-        // again, large (`reloaded_dax`); virtio-fs as it is created.
-        assert_eq!(
-            is_dax(&path("dax-mapped")),
-            dax && !reloaded_dax,
-            "dax-mapped's DAX attribute"
-        );
+        // The guest's Fxfs, as virtio-fs, maps a file's data from the window as it is created;
+        // its mappings outlive its inode, which is read in again (`reloaded_dax`).
+        assert_eq!(is_dax(&path("dax-mapped")), dax, "dax-mapped's DAX attribute");
 
         let map = unsafe {
             libc::mmap(

@@ -368,7 +368,14 @@ impl HvfSecondStage {
 
 #[cfg(target_os = "macos")]
 impl fxdax::SecondStage for HvfSecondStage {
-    fn map(&self, offset: u64, host_addr: *mut u8, len: u64, protection: Protection) {
+    fn map(
+        &self,
+        offset: u64,
+        host_addr: *mut u8,
+        _phys_offset: u64,
+        len: u64,
+        protection: Protection,
+    ) {
         let guest_addr = self.guest_addr + offset;
         hvf::map_guest_memory(host_addr as u64, guest_addr, len, Self::flags(protection))
             .unwrap_or_else(|err| panic!("mapping DAX window memory at {guest_addr:#x}: {err}"));

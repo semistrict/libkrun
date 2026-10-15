@@ -559,6 +559,33 @@ mod guest {
         assert_eq!(get_xattr(&path("acl-file"), "system.posix_acl_access"), access);
         // The group's bits are the mask's.
         assert_eq!(fs::metadata(path("acl-file")).unwrap().mode() & 0o777, 0o660);
+        // The ACL is enforced: user 1234, which it names, may read; user 1236 may not.
+        let may_read = |uid: u32| {
+            let file = CString::new(path("acl-file")).unwrap();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                // In the child: drop to `uid`, try, and say how it went.
+                let status = unsafe {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(uid, uid, uid) != 0
+                        || libc::setresuid(uid, uid, uid) != 0
+                    {
+                        2
+                    } else {
+                        let fd = libc::open(file.as_ptr(), libc::O_RDONLY);
+                        if fd >= 0 { 0 } else { 1 }
+                    }
+                };
+                unsafe { libc::_exit(status) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status), "child {status:#x}");
+            libc::WEXITSTATUS(status)
+        };
+        assert_eq!(may_read(1234), 0, "the user the ACL names can't read");
+        assert_eq!(may_read(1236), 1, "another user could read");
 
         let old_umask = unsafe { libc::umask(0o077) };
         fs::create_dir(path("acl-dir")).unwrap();

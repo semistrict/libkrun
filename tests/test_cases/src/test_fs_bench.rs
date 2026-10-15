@@ -753,7 +753,7 @@ mod guest {
             let callers = Command::new("perf")
                 .args([
                     "report", "-i", &data, "--stdio", "--sort", "comm,sym", "--children", "-g",
-                    "none", "--percent-limit", "1.5", "-q",
+                    "none", "--percent-limit", "0.5", "-q",
                 ])
                 .output()
                 .expect("perf report");

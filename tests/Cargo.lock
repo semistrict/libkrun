@@ -794,6 +794,7 @@ dependencies = [
  "refaults_vmo",
  "storage_device",
  "tokio",
+ "vfs",
  "zerocopy",
  "zircon",
  "zx",

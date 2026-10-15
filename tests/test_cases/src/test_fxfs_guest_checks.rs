@@ -575,6 +575,9 @@ mod guest {
         const SIZE: usize = 64 << 10;
         const PAGE: usize = 4096;
         const ROUNDS: usize = 200;
+        /// At most: each seal starts a staging extent, which stays while any of its blocks lives
+        /// (partly used ones aren't compacted yet), and the image is small.
+        const SEALS: usize = 300;
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -609,7 +612,10 @@ mod guest {
         let sealing = AtomicBool::new(true);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                while sealing.load(Ordering::Relaxed) {
+                for _ in 0..SEALS {
+                    if !sealing.load(Ordering::Relaxed) {
+                        break;
+                    }
                     fs::write(path("seal-race-other"), b"other").unwrap();
                     fs::File::open(path("seal-race-other")).unwrap().sync_all().unwrap();
                 }

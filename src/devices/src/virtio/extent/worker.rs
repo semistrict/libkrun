@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
-use fxdax::{Errno, ExtentStore, VolatileSlice, VolatileSliceMut};
+use fxdax::{Errno, Extents, VolatileSlice, VolatileSliceMut};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -26,7 +26,7 @@ pub struct ExtentWorker {
     queue: DeviceQueue,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
-    store: Arc<ExtentStore>,
+    store: Arc<Extents>,
     stop_fd: EventFd,
 }
 
@@ -35,7 +35,7 @@ impl ExtentWorker {
         queue: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        store: Arc<ExtentStore>,
+        store: Arc<Extents>,
         stop_fd: EventFd,
     ) -> Self {
         Self {
@@ -119,7 +119,7 @@ impl ExtentWorker {
 /// Serves the request in `chain` with `store`, and returns the length of what
 /// the device writes to it: its writable buffers, whose last bytes hold the
 /// response.
-pub fn handle(store: &ExtentStore, mem: &GuestMemoryMmap, chain: DescriptorChain) -> u32 {
+pub fn handle(store: &Extents, mem: &GuestMemoryMmap, chain: DescriptorChain) -> u32 {
     let (mut reader, mut writer) = match (Reader::new(mem, chain.clone()), Writer::new(mem, chain))
     {
         (Ok(reader), Ok(writer)) => (reader, writer),
@@ -167,7 +167,7 @@ fn invalid(_: io::Error) -> Errno {
 /// Serves the request `reader` holds, appending what it returns to `out`,
 /// which the driver gave `room` bytes for.
 fn serve(
-    store: &ExtentStore,
+    store: &Extents,
     reader: &mut Reader,
     room: usize,
     out: &mut Vec<u8>,
@@ -275,6 +275,7 @@ fn serve(
 
 #[cfg(test)]
 mod tests {
+    use fxdax::ExtentStore;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -309,10 +310,10 @@ mod tests {
         }
     }
 
-    fn store() -> (ExtentStore, TestDir) {
+    fn store() -> (Extents, TestDir) {
         let dir = TestDir::new();
         (
-            ExtentStore::create(dir.0.join("store"), 1 << 20).unwrap(),
+            Extents::Local(ExtentStore::create(dir.0.join("store"), 1 << 20).unwrap()),
             dir,
         )
     }
@@ -335,7 +336,7 @@ mod tests {
     /// Serves a request of `readable` bytes, with `writable` bytes for the
     /// device to write, the response included, and returns what the device
     /// wrote, the response apart, and the response's status.
-    fn request(store: &ExtentStore, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
+    fn request(store: &Extents, readable: &[u8], writable: usize) -> (Vec<u8>, u32) {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1 << 20)]).unwrap();
         mem.write_slice(readable, BUFFERS).unwrap();
         let chain = create_descriptor_chain(
@@ -366,7 +367,7 @@ mod tests {
         (written, response.status)
     }
 
-    fn io(store: &ExtentStore, sequence: u64, offset: u64, len: usize) -> IoArgs {
+    fn io(store: &Extents, sequence: u64, offset: u64, len: usize) -> IoArgs {
         IoArgs {
             id: ExtentIdLe {
                 branch: store.branch(),

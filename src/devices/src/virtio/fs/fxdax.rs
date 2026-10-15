@@ -89,7 +89,8 @@ pub(crate) type DaxFaults = hvf::DemandPagedRegion;
 pub(crate) type DaxFaults = ();
 
 /// What a DAX window is created for: an fxdax filesystem, or an extent
-/// store, which map into it what the guest asks for.
+/// store (this process's, or the extent daemon's), which map into it what the
+/// guest asks for.
 pub(crate) trait DaxOwner {
     /// Creates the owner's window, for a hypervisor whose `second_stage` the
     /// VMM maintains.
@@ -111,7 +112,7 @@ pub(crate) trait DaxOwner {
         base: std::ptr::NonNull<u8>,
         size: u64,
         prefault: Option<Arc<dyn fxdax::Prefault>>,
-    ) -> Result<fxdax::DaxWindow, fxdax::Error>;
+    ) -> Result<(), fxdax::Error>;
 }
 
 macro_rules! dax_owner {
@@ -132,16 +133,17 @@ macro_rules! dax_owner {
                 base: std::ptr::NonNull<u8>,
                 size: u64,
                 prefault: Option<Arc<dyn fxdax::Prefault>>,
-            ) -> Result<fxdax::DaxWindow, fxdax::Error> {
+            ) -> Result<(), fxdax::Error> {
                 // SAFETY: The caller's guarantees are the owner's.
                 unsafe { <$owner>::create_dax_window_in_host_memory(self, base, size, prefault) }
+                    .map(drop)
             }
         }
     };
 }
 
 dax_owner!(Filesystem);
-dax_owner!(fxdax::ExtentStore);
+dax_owner!(fxdax::Extents);
 
 impl FxdaxServer {
     /// Opens the fxdax image at `image`, and serves the filesystem on it, or

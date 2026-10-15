@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use fxdax::ExtentStore;
+use fxdax::{ExtentStore, Extents};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use vm_memory::{ByteValued, GuestMemoryMmap};
@@ -26,7 +26,7 @@ use crate::virtio::{
 };
 
 pub struct Extent {
-    store: Arc<ExtentStore>,
+    store: Arc<Extents>,
     config: Config,
     avail_features: u64,
     acked_features: u64,
@@ -44,13 +44,12 @@ pub struct Extent {
 
 impl Extent {
     /// A device tagged `tag` serving the extent store at `path`, which is
-    /// created, holding at most `capacity` bytes, if it doesn't exist.
+    /// created, holding at most `capacity` bytes, if it doesn't exist: in this
+    /// process, or, where FXDAX_EXTENTD names its socket, in fxdax's extent
+    /// daemon, which shares its memory with the host's other VMs.
     pub fn new(tag: &str, path: &Path, capacity: u64) -> io::Result<Self> {
-        let store = if path.exists() {
-            ExtentStore::open(path)
-        } else {
-            ExtentStore::create(path, capacity)
-        }
+        let daemon = std::env::var_os("FXDAX_EXTENTD").filter(|socket| !socket.is_empty());
+        let store = Extents::open_or_create(path, capacity, daemon.as_deref().map(Path::new))
         .map_err(|err| {
             io::Error::other(format!("opening extent store {}: {err:#}", path.display()))
         })?;

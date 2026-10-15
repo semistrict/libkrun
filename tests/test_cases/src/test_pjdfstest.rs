@@ -70,6 +70,10 @@ mod host {
                 "Linux"
             };
             let host_os_env = CString::new(format!("PJDFSTEST_HOST_OS={host_os}"))?;
+            // FXDAX_PJDFSTEST_TESTS names pjdfstest's directories of tests to run, separated by
+            // commas (such as `open,chmod`), for a quick run: all of them otherwise.
+            let only = std::env::var("FXDAX_PJDFSTEST_TESTS").unwrap_or_default();
+            let only_env = CString::new(format!("PJDFSTEST_ONLY={only}"))?;
             unsafe {
                 let ctx = krun_call_u32!(krun_create_ctx())?;
                 krun_call!(krun_set_vm_config(ctx, 2, 1024))?;
@@ -79,7 +83,11 @@ mod host {
                     let window = if self.dax { 1 << 28 } else { 0 };
                     add_extent_store(ctx, c"extents", &store, 1 << 30, window)?;
                 }
-                setup_fs_and_enter_with_env(ctx, test_setup, &[host_os_env.as_c_str()])?;
+                setup_fs_and_enter_with_env(
+                    ctx,
+                    test_setup,
+                    &[host_os_env.as_c_str(), only_env.as_c_str()],
+                )?;
             }
             Ok(())
         }
@@ -135,11 +143,18 @@ mod guest {
             let mut prove = Command::new("/usr/bin/prove");
             prove.arg("-rv");
             if self.guest_fxfs {
-                // Each test but those skipped, in the order prove's -r would run them.
+                // Each test but those skipped, in the order prove's -r would run them: of the
+                // directories PJDFSTEST_ONLY names, if it names any.
+                let only = std::env::var("PJDFSTEST_ONLY").unwrap_or_default();
+                let only: Vec<&str> = only.split(',').filter(|dir| !dir.is_empty()).collect();
                 let mut tests = Vec::new();
                 for dir in std::fs::read_dir("/pjdfstest/tests").unwrap() {
                     let dir = dir.unwrap().path();
                     if !dir.is_dir() {
+                        continue;
+                    }
+                    let name = dir.file_name().unwrap().to_str().unwrap();
+                    if !only.is_empty() && !only.contains(&name) {
                         continue;
                     }
                     for test in std::fs::read_dir(&dir).unwrap() {

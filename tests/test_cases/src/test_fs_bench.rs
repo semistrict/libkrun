@@ -13,7 +13,8 @@
 // iteration of each case to take well under a minute.
 //
 // The cases only run when FXDAX_BENCH_ITERATIONS is set. FXDAX_BENCH_GROUPS limits them to some
-// of the groups of workloads: io, metadata and build, separated by commas. With
+// of the groups of workloads: io, metadata and build, separated by commas, or parts of metadata:
+// files, fsync, tree, large-dir and concurrent. With
 // FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
 // JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
 // FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory,
@@ -991,12 +992,21 @@ mod guest {
         fs::remove_dir(&shared).unwrap();
     }
 
-    fn metadata_workloads() {
-        files_workloads();
-        fsync_workloads();
-        tree_workloads();
-        large_dir_workloads();
-        concurrent_workloads();
+    /// The metadata workloads, those of the parts of them that `runs` says run, or all.
+    fn metadata_workloads(runs: impl Fn(&str) -> bool) {
+        let all = runs("metadata");
+        let parts: [(&str, fn()); 5] = [
+            ("files", files_workloads),
+            ("fsync", fsync_workloads),
+            ("tree", tree_workloads),
+            ("large-dir", large_dir_workloads),
+            ("concurrent", concurrent_workloads),
+        ];
+        for (part, workloads) in parts {
+            if all || runs(part) {
+                workloads();
+            }
+        }
     }
 
     /// Observes how far ahead of the guest's clock a file it writes is timestamped, in
@@ -1091,9 +1101,7 @@ mod guest {
                 if runs("io") {
                     io_workloads();
                 }
-                if runs("metadata") {
-                    metadata_workloads();
-                }
+                metadata_workloads(runs);
                 // A failed build is recorded, and the other iterations still run.
                 if runs("build") && std::panic::catch_unwind(build_workload).is_err() {
                     println!("FAILED build");

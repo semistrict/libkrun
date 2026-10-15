@@ -146,6 +146,11 @@ mod host {
             assert_eq!(read_path(&fs, "tmpfile-linked"), b"unnamed, then linked");
             assert_eq!(lookup_path(&fs, "tmpfile-linked").nlink, 1);
             assert_eq!(read_path(&fs, "fallocated"), vec![0; 8192]);
+            // Unlinked, later, in batches, before the fsync of their directory.
+            assert!(block_on(fs.lookup(Inode::ROOT, b"delayed")).is_err(), "delayed/ remains");
+            assert_eq!(read_path(&fs, "delayed-kept/again"), b"recreated");
+            assert_eq!(lookup_path(&fs, "delayed-kept/linked").nlink, 1);
+            assert!(block_on(fs.lookup(lookup_path(&fs, "delayed-kept").inode, b"gone")).is_err());
 
             TestOutcome::Pass
         }
@@ -553,6 +558,54 @@ mod guest {
         assert_eq!(fs::read(path("thawed")).unwrap(), b"writes go on");
     }
 
+    /// Unlinks the guest's Fxfs makes later, in batches (doc-6): what reads the directory sees them
+    /// at once, and an fsync of the directory makes them durable.
+    fn test_delayed_unlinks() {
+        let dir = path("delayed");
+        fs::create_dir(&dir).unwrap();
+        // More than a batch, and a directory emptied by them removed.
+        for i in 0..100 {
+            fs::write(format!("{dir}/f{i}"), b"x").unwrap();
+        }
+        for i in 0..100 {
+            fs::remove_file(format!("{dir}/f{i}")).unwrap();
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir(&dir).unwrap();
+
+        let kept = path("delayed-kept");
+        fs::create_dir(&kept).unwrap();
+        fs::write(format!("{kept}/again"), b"first").unwrap();
+        fs::remove_file(format!("{kept}/again")).unwrap();
+        // Read right after: the unlink is seen, and the name is free again.
+        let names: Vec<_> = fs::read_dir(&kept)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+        fs::write(format!("{kept}/again"), b"recreated").unwrap();
+        // A file's other name keeps it, with one link fewer.
+        fs::write(format!("{kept}/gone"), b"two names").unwrap();
+        fs::hard_link(format!("{kept}/gone"), format!("{kept}/linked")).unwrap();
+        fs::remove_file(format!("{kept}/gone")).unwrap();
+        assert_eq!(fs::metadata(format!("{kept}/linked")).unwrap().nlink(), 1);
+        assert_eq!(fs::read(format!("{kept}/linked")).unwrap(), b"two names");
+        // An open file unlinked stays readable until closed.
+        let mut open = fs::File::open(format!("{kept}/again")).unwrap();
+        fs::write(format!("{kept}/doomed"), b"open").unwrap();
+        let mut doomed = fs::File::open(format!("{kept}/doomed")).unwrap();
+        fs::remove_file(format!("{kept}/doomed")).unwrap();
+        let mut read = Vec::new();
+        doomed.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"open");
+        drop(doomed);
+        read.clear();
+        open.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"recreated");
+        fsync_dir(&kept);
+        fsync_dir(MNT);
+    }
+
     impl Test for TestFxfsGuestChecks {
         fn in_guest(self: Box<Self>) {
             let dax = self.dax;
@@ -570,6 +623,7 @@ mod guest {
                 ("fallocate", &test_fallocate),
                 ("acls", &test_acls),
                 ("freeze", &test_freeze),
+                ("delayed_unlinks", &test_delayed_unlinks),
             ];
             let mut failed = Vec::new();
             for (name, test) in tests {

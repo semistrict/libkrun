@@ -650,6 +650,8 @@ mod guest {
         for (path, data) in &files {
             fs::write(path, data).unwrap();
         }
+        // A sync waits for the region to grow as far ahead of the writes as it does.
+        unsafe { libc::sync() };
         assert_eq!(requests("map"), maps + 3, "the small files' MAPs");
         assert_eq!(requests("read"), reads, "writing small files read from the device");
         assert!(is_dax(&files[0].0), "a small file is not DAX");

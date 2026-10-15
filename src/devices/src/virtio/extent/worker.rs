@@ -1,9 +1,11 @@
-// The extent-store device's worker: a thread that serves the request queue,
-// blocking on the store's I/O as it serves each request in turn.
+// The extent-store device's worker: a thread that takes the requests off the queue, and threads
+// that serve them, blocking on the store's I/O, several at once: the device applies requests in any
+// order but across barriers (doc-4), so a guest's MAP doesn't wait for the writes and durable
+// commits queued before it.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use fxdax::{Errno, RemoteExtentStore, VolatileSlice, VolatileSliceMut};
@@ -21,6 +23,9 @@ use super::{
 };
 use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::{DescriptorChain, InterruptTransport};
+
+/// How many requests the worker serves at once: as many as the daemon does for a connection.
+const SERVERS: usize = 8;
 
 pub struct ExtentWorker {
     queue: DeviceQueue,
@@ -55,64 +60,110 @@ impl ExtentWorker {
             .unwrap()
     }
 
-    fn work(mut self) -> DeviceQueue {
-        let queue_fd = self.queue.event.as_raw_fd();
-        let stop_fd = self.stop_fd.as_raw_fd();
-        let mut epoll = Epoll::new().unwrap();
-        for fd in [queue_fd, stop_fd] {
-            epoll
-                .ctl(
-                    ControlOperation::Add,
-                    fd,
-                    &EpollEvent::new(EventSet::IN, fd as u64),
-                )
-                .unwrap();
-        }
-        let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 2];
-        loop {
-            let count = match epoll.wait(events.len(), -1, &mut events) {
-                Ok(count) => count,
-                Err(err) => {
-                    debug!("extent worker: epoll: {err}");
+    fn work(self) -> DeviceQueue {
+        let Self {
+            queue,
+            interrupt,
+            mem,
+            store,
+            stop_fd,
+        } = self;
+        let queue = Mutex::new(queue);
+        let (requests, received) = mpsc::channel::<DescriptorChain>();
+        let received = Mutex::new(received);
+        thread::scope(|scope| {
+            for server in 0..SERVERS {
+                let (queue, interrupt, mem, store, received) =
+                    (&queue, &interrupt, &mem, &store, &received);
+                thread::Builder::new()
+                    .name(format!("extent server {server}"))
+                    .spawn_scoped(scope, move || loop {
+                        let Ok(chain) = received.lock().unwrap().recv() else {
+                            return;
+                        };
+                        let index = chain.index;
+                        let len = handle(store, mem, chain);
+                        complete(&mut queue.lock().unwrap(), interrupt, mem, index, len);
+                    })
+                    .unwrap();
+            }
+            // Once stopped, the servers finish what they took and return as the channel closes.
+            take_requests(&queue, &mem, &stop_fd, requests);
+        });
+        queue.into_inner().unwrap()
+    }
+}
+
+/// Takes the requests off `queue` as the driver notifies it, and sends them to `requests`, until
+/// `stop_fd` is written.
+fn take_requests<'a>(
+    queue: &Mutex<DeviceQueue>,
+    mem: &'a GuestMemoryMmap,
+    stop_fd: &EventFd,
+    requests: mpsc::Sender<DescriptorChain<'a>>,
+) {
+    let queue_fd = queue.lock().unwrap().event.as_raw_fd();
+    let stop_raw_fd = stop_fd.as_raw_fd();
+    let mut epoll = Epoll::new().unwrap();
+    for fd in [queue_fd, stop_raw_fd] {
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                fd,
+                &EpollEvent::new(EventSet::IN, fd as u64),
+            )
+            .unwrap();
+    }
+    let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 2];
+    loop {
+        let count = match epoll.wait(events.len(), -1, &mut events) {
+            Ok(count) => count,
+            Err(err) => {
+                debug!("extent worker: epoll: {err}");
+                continue;
+            }
+        };
+        for event in &events[..count] {
+            if event.fd() == stop_raw_fd {
+                let _ = stop_fd.read();
+                return;
+            }
+            if event.fd() == queue_fd {
+                let mut queue = queue.lock().unwrap();
+                if let Err(err) = queue.event.read() {
+                    error!("extent worker: queue event: {err}");
                     continue;
                 }
-            };
-            for event in &events[..count] {
-                if event.fd() == stop_fd {
-                    let _ = self.stop_fd.read();
-                    return self.queue;
-                }
-                if event.fd() == queue_fd {
-                    if let Err(err) = self.queue.event.read() {
-                        error!("extent worker: queue event: {err}");
-                        continue;
+                loop {
+                    queue.queue.disable_notification(mem).unwrap();
+                    while let Some(chain) = queue.queue.pop(mem) {
+                        // The servers outlive this sender.
+                        requests.send(chain).unwrap();
                     }
-                    self.serve_queue();
+                    if !queue.queue.enable_notification(mem).unwrap() {
+                        break;
+                    }
                 }
             }
         }
     }
+}
 
-    fn serve_queue(&mut self) {
-        let mem = self.mem.clone();
-        loop {
-            self.queue.queue.disable_notification(&mem).unwrap();
-            while let Some(chain) = self.queue.queue.pop(&mem) {
-                let index = chain.index;
-                let len = handle(&self.store, &mem, chain);
-                if let Err(err) = self.queue.queue.add_used(&mem, index, len) {
-                    error!("extent worker: adding a used element: {err:?}");
-                }
-                if self.queue.queue.needs_notification(&mem).unwrap()
-                    && let Err(err) = self.interrupt.try_signal_used_queue()
-                {
-                    error!("extent worker: signalling the queue: {err:?}");
-                }
-            }
-            if !self.queue.queue.enable_notification(&mem).unwrap() {
-                break;
-            }
-        }
+/// Returns the request at `index` to the driver, with `len` bytes written to it.
+fn complete(
+    queue: &mut DeviceQueue,
+    interrupt: &InterruptTransport,
+    mem: &GuestMemoryMmap,
+    index: u16,
+    len: u32,
+) {
+    if let Err(err) = queue.queue.add_used(mem, index, len) {
+        error!("extent worker: adding a used element: {err:?}");
+    }
+    if queue.queue.needs_notification(mem).unwrap()
+        && let Err(err) = interrupt.try_signal_used_queue()
+    {
+        error!("extent worker: signalling the queue: {err:?}");
     }
 }
 

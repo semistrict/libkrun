@@ -21,11 +21,9 @@ const FXFS_SKIPPED: &[(&str, &str)] = &[];
 #[host]
 mod host {
     use super::*;
-    use crate::common::{
-        add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_fs_and_enter_with_env,
-    };
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
+    use crate::common::{fxdax_guest_should_run, setup_rootfs};
+    use crate::vm::Vm;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use std::ffi::CString;
 
     use macros::env_or_default;
@@ -76,22 +74,16 @@ mod host {
             // commas (such as `open,chmod`), for a quick run: all of them otherwise.
             let only = std::env::var("FXDAX_PJDFSTEST_TESTS").unwrap_or_default();
             let only_env = CString::new(format!("PJDFSTEST_ONLY={only}"))?;
-            unsafe {
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 2, 1024))?;
-                if self.guest_fxfs {
-                    set_guest_kernel(ctx)?;
-                    let store = test_setup.tmp_dir.join("extents");
-                    let window = if self.dax { 1 << 28 } else { 0 };
-                    add_extent_store(ctx, c"extents", &store, 1 << 30, window)?;
-                }
-                setup_fs_and_enter_with_env(
-                    ctx,
-                    test_setup,
-                    &[host_os_env.as_c_str(), only_env.as_c_str()],
-                )?;
+            let mut vm = Vm::new(2, 1024)?;
+            if self.guest_fxfs {
+                vm.guest_kernel()?;
+                let store = test_setup.tmp_dir.join("extents");
+                let window = if self.dax { 1 << 28 } else { 0 };
+                vm.extent_store("extents", &store, 1 << 30, window)?;
             }
-            Ok(())
+            vm.env(&host_os_env);
+            vm.env(&only_env);
+            vm.enter(&setup_rootfs(&test_setup)?, &test_setup.test_case)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, _test_setup: TestSetup) -> TestOutcome {

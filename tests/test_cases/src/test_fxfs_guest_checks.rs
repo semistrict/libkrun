@@ -43,13 +43,11 @@ fn pattern(offset: usize) -> u8 {
 mod host {
     use super::*;
 
-    use crate::common::{
-        add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_fs_and_enter,
-    };
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
+    use crate::common::{fxdax_guest_should_run, setup_rootfs};
+    use crate::vm::Vm;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
     use futures::executor::block_on;
     use fxdax::{Attr, Filesystem, Inode, Owner, Storage};
-    use krun_sys::*;
     use std::path::Path;
 
     fn create_image(path: &Path) -> anyhow::Result<()> {
@@ -98,16 +96,11 @@ mod host {
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let image = test_setup.tmp_dir.join("fxdax.img");
             create_image(&image)?;
-            unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_WARN))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 2, 512))?;
-                set_guest_kernel(ctx)?;
-                let window = if self.dax { 1 << 29 } else { 0 };
-                add_extent_store(ctx, c"fxdax", &image, IMAGE_SIZE, window)?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            unreachable!()
+            let window = if self.dax { 1 << 29 } else { 0 };
+            let mut vm = Vm::new(2, 512)?;
+            vm.guest_kernel()?;
+            vm.extent_store("fxdax", &image, IMAGE_SIZE, window)?;
+            vm.enter(&setup_rootfs(&test_setup)?, &test_setup.test_case)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {

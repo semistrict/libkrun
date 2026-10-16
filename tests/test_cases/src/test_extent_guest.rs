@@ -20,11 +20,9 @@ const ROOT: &[u8] = b"fxdax extent store self-test";
 mod host {
     use super::*;
 
-    use crate::common::{
-        add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_fs_and_enter,
-    };
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
-    use krun_sys::*;
+    use crate::common::{fxdax_guest_should_run, setup_rootfs};
+    use crate::vm::Vm;
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup};
 
     impl Test for TestExtentGuest {
         fn should_run(&self) -> ShouldRun {
@@ -33,15 +31,10 @@ mod host {
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let store = test_setup.tmp_dir.join("extents");
-            unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_WARN))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 2, 512))?;
-                set_guest_kernel(ctx)?;
-                add_extent_store(ctx, c"extents", &store, 64 << 20, 64 << 20)?;
-                setup_fs_and_enter(ctx, test_setup)?;
-            }
-            unreachable!()
+            let mut vm = Vm::new(2, 512)?;
+            vm.guest_kernel()?;
+            vm.extent_store("extents", &store, 64 << 20, 64 << 20)?;
+            vm.enter(&setup_rootfs(&test_setup)?, &test_setup.test_case)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {

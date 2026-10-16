@@ -73,13 +73,12 @@ const SOURCE_TARBALL: &str = "/opt/lua-5.4.7.tar.gz";
 mod host {
     use super::*;
 
-    use crate::common::{add_extent_store, fxdax_guest_should_run, set_guest_kernel, setup_rootfs};
-    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call, krun_call_u32};
+    use crate::common::{fxdax_guest_should_run, setup_rootfs};
+    use crate::vm::{Vm, Vmm};
+    use crate::{ShouldRun, Test, TestOutcome, TestSetup, krun_call_u32};
     use krun_sys::*;
     use std::collections::BTreeMap;
     use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::ptr::null;
 
     const CONTAINERFILE: &str = "\
 FROM alpine:3.22
@@ -122,6 +121,8 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
         case: String,
         backend: String,
         host_os: &'static str,
+        /// The VMM: libkrun or Firecracker.
+        vmm: &'static str,
         iterations: usize,
         results: Vec<Measurements>,
         /// How many iterations of each workload failed, which have no measurement.
@@ -245,8 +246,13 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             if self.backend.guest_kernel() && std::env::var_os("FXDAX_GUEST_KERNEL").is_none() {
                 return ShouldRun::No("FXDAX_GUEST_KERNEL does not name a guest kernel");
             }
+            let vmm = Vmm::from_env();
             let feature = match self.backend {
                 Backend::FxfsGuest | Backend::FxfsGuestDax => return fxdax_guest_should_run(),
+                Backend::Ext4 | Backend::Passthrough if vmm == Vmm::Firecracker => {
+                    return ShouldRun::No("Firecracker boots fxdax's guest kernel only");
+                }
+                _ if vmm == Vmm::Firecracker => return ShouldRun::Yes,
                 Backend::Ext4 | Backend::Ext4GuestKernel => KRUN_FEATURE_BLK,
                 Backend::Passthrough | Backend::Ext4DaxPmem => return ShouldRun::Yes,
             };
@@ -266,8 +272,6 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
             let root_dir = setup_rootfs(&test_setup)?;
-            let c_root = CString::new(root_dir.as_os_str().as_bytes())?;
-            let test_case = CString::new(test_setup.test_case.clone())?;
             let iterations = CString::new(format!(
                 "FXDAX_BENCH_ITERATIONS={}",
                 iterations().unwrap_or(1)
@@ -313,76 +317,46 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 return Err(error.into());
             }
 
-            unsafe {
-                // Warnings only, whatever RUST_LOG says: logging every request costs time.
-                krun_call!(krun_init_log(
-                    KRUN_LOG_TARGET_DEFAULT,
-                    KRUN_LOG_LEVEL_WARN,
-                    KRUN_LOG_STYLE_NEVER,
-                    KRUN_LOG_OPTION_NO_ENV,
-                ))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, 2, 2048))?;
-                krun_call!(krun_set_root(ctx, c_root.as_ptr()))?;
-                if self.backend.guest_kernel() {
-                    set_guest_kernel(ctx)?;
-                }
-                match self.backend {
-                    Backend::FxfsGuest | Backend::FxfsGuestDax => {
-                        // A new store, which the guest's Fxfs formats as it mounts it.
-                        let store = test_setup.tmp_dir.join("extents");
-                        let window = if self.backend == Backend::FxfsGuestDax { 1 << 31 } else { 0 };
-                        add_extent_store(ctx, c"bench", &store, IMAGE_SIZE, window)?;
-                    }
-                    Backend::Ext4DaxPmem => {
-                        let image = test_setup.tmp_dir.join("pmem.img");
-                        std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
-                        let c_image = CString::new(image.as_os_str().as_bytes())?;
-                        krun_call!(krun_add_pmem(ctx, c"bench".as_ptr(), c_image.as_ptr(), false))?;
-                    }
-                    Backend::Ext4 | Backend::Ext4GuestKernel => {
-                        let image = test_setup.tmp_dir.join("ext4.img");
-                        std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
-                        let c_image = CString::new(image.as_os_str().as_bytes())?;
-                        // The defaults: the host's page cache, and flushes that reach the
-                        // host's disk cache on macOS, as libkrun recommends.
-                        krun_call!(krun_add_disk3(
-                            ctx,
-                            c"bench".as_ptr(),
-                            c_image.as_ptr(),
-                            KRUN_DISK_FORMAT_RAW,
-                            false,
-                            false,
-                            KRUN_SYNC_RELAXED,
-                        ))?;
-                    }
-                    Backend::Passthrough => {
-                        let dir = test_setup.tmp_dir.join("passthrough");
-                        std::fs::create_dir(&dir)?;
-                        let c_dir = CString::new(dir.as_os_str().as_bytes())?;
-                        krun_call!(krun_add_virtiofs(ctx, c"bench".as_ptr(), c_dir.as_ptr()))?;
-                    }
-                }
-                krun_call!(krun_set_workdir(ctx, c"/".as_ptr()))?;
-                let argv = [test_case.as_ptr(), null()];
-                // The compiler finds the assembler and linker through PATH.
-                let envp = [
-                    iterations.as_ptr(),
-                    groups.as_ptr(),
-                    guest_perf.as_ptr(),
-                    c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".as_ptr(),
-                    c"HOME=/root".as_ptr(),
-                    null(),
-                ];
-                krun_call!(krun_set_exec(
-                    ctx,
-                    c"/guest-agent".as_ptr(),
-                    argv.as_ptr(),
-                    envp.as_ptr(),
-                ))?;
-                krun_call!(krun_start_enter(ctx))?;
+            let mut vm = Vm::new(2, 2048)?;
+            if self.backend.guest_kernel() {
+                vm.guest_kernel()?;
             }
-            unreachable!()
+            // The filesystem's device in the guest, for those on one.
+            let device = match self.backend {
+                Backend::FxfsGuest | Backend::FxfsGuestDax => {
+                    // A new store, which the guest's Fxfs formats as it mounts it.
+                    let store = test_setup.tmp_dir.join("extents");
+                    let window = if self.backend == Backend::FxfsGuestDax { 1 << 31 } else { 0 };
+                    vm.extent_store("bench", &store, IMAGE_SIZE, window)?;
+                    None
+                }
+                Backend::Ext4DaxPmem => {
+                    let image = test_setup.tmp_dir.join("pmem.img");
+                    std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
+                    Some(vm.pmem("bench", &image)?)
+                }
+                Backend::Ext4 | Backend::Ext4GuestKernel => {
+                    let image = test_setup.tmp_dir.join("ext4.img");
+                    std::fs::File::create(&image)?.set_len(IMAGE_SIZE)?;
+                    Some(vm.disk("bench", &image)?)
+                }
+                Backend::Passthrough => {
+                    let dir = test_setup.tmp_dir.join("passthrough");
+                    std::fs::create_dir(&dir)?;
+                    vm.virtiofs("bench", &dir)?;
+                    None
+                }
+            };
+            if let Some(device) = device {
+                vm.env(&CString::new(format!("FXDAX_BENCH_DEVICE={device}"))?);
+            }
+            vm.env(&iterations);
+            vm.env(&groups);
+            vm.env(&guest_perf);
+            // The compiler finds the assembler and linker through PATH.
+            vm.env(c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+            vm.env(c"HOME=/root");
+            vm.enter(&root_dir, &test_setup.test_case)
         }
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
@@ -394,6 +368,10 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                 case: test_setup.test_case.clone(),
                 backend: self.name().to_string(),
                 host_os: std::env::consts::OS,
+                vmm: match Vmm::from_env() {
+                    Vmm::Libkrun => "libkrun",
+                    Vmm::Firecracker => "firecracker",
+                },
                 ..BenchReport::default()
             };
             if let Err(err) = parse(&stdout, &mut report) {
@@ -470,6 +448,11 @@ mod guest {
             )
         };
         assert_eq!(ret, 0, "mount: {}", std::io::Error::last_os_error());
+    }
+
+    /// The device of the filesystem the host made, which it names.
+    fn bench_device() -> String {
+        std::env::var("FXDAX_BENCH_DEVICE").expect("FXDAX_BENCH_DEVICE names the device")
     }
 
     /// Writes back and drops the guest's caches, so that the next reads miss them.
@@ -1088,13 +1071,15 @@ mod guest {
             match self.backend {
                 Backend::Passthrough => mount("bench", "virtiofs", "dax=never"),
                 Backend::Ext4 | Backend::Ext4GuestKernel => {
-                    run("mkfs.ext4", &["-q", "-F", "/dev/vda"]);
-                    mount("/dev/vda", "ext4", "");
+                    let device = bench_device();
+                    run("mkfs.ext4", &["-q", "-F", &device]);
+                    mount(&device, "ext4", "");
                 }
                 Backend::FxfsGuest | Backend::FxfsGuestDax => mount("bench", "fxfs", ""),
                 Backend::Ext4DaxPmem => {
-                    run("mkfs.ext4", &["-q", "-F", "/dev/pmem0"]);
-                    mount("/dev/pmem0", "ext4", "dax=always");
+                    let device = bench_device();
+                    run("mkfs.ext4", &["-q", "-F", &device]);
+                    mount(&device, "ext4", "dax=always");
                 }
             }
             let iterations: u32 = std::env::var("FXDAX_BENCH_ITERATIONS")

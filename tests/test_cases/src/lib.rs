@@ -298,10 +298,22 @@ mod krun;
 
 #[cfg(feature = "host")]
 pub mod rootfs;
+
+#[cfg(feature = "host")]
+pub mod vm;
 mod tcp_tester;
 
 #[cfg(feature = "guest")]
 pub mod freebsd_network;
+
+#[cfg(all(feature = "guest", target_os = "linux"))]
+pub mod guest_init;
+
+/// Under a VMM whose guest has a single console (Firecracker's serial port), the guest agent's
+/// standard error goes there too, between these bytes (shift out, shift in), which the host
+/// splits off its standard output.
+pub const STDERR_START: u8 = 0x0e;
+pub const STDERR_END: u8 = 0x0f;
 
 #[host]
 #[derive(Clone, Debug)]

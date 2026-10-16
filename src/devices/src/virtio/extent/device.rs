@@ -16,7 +16,7 @@ use super::dax::{PrefaultGuestMemory, create_dax_window};
 use super::worker::ExtentWorker;
 use super::{
     Config, MAX_EXTENT, MAX_ROOT, MAX_TRANSFER, NUM_QUEUES, QUEUE_CONFIG, QUEUE_SIZE, TYPE_EXTENT,
-    VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE,
+    VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
@@ -73,7 +73,7 @@ impl Extent {
         Ok(Self {
             store: Arc::new(store),
             config,
-            avail_features: 1 << VIRTIO_F_VERSION_1,
+            avail_features: (1 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT),
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,

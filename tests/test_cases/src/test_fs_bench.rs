@@ -19,7 +19,8 @@
 // FXDAX_BENCH_PGBENCH_SECS how long pgbench's transactions run (20). With
 // FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
 // JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
-// FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory,
+// FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory
+// (`record-all`, the whole host, fxdax's extent daemon too),
 // or with `record:EVENTS` records the events, such as the scheduler's tracepoints, with stacks;
 // set to `stat:EVENTS`, perf counts the events, such as KVM's tracepoints, each 100 ms of the run,
 // into the case's log, where they line up with the guest's results. With FXDAX_BENCH_GUEST_PERF
@@ -300,8 +301,13 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
                         let record = match perf.strip_prefix("record:") {
                             Some(events) => vec!["record", "-g", "-e", events],
                             None if perf == "record" => vec!["record", "-g", "-F", "999"],
+                            // The whole host, fxdax's extent daemon included.
+                            None if perf == "record-all" => {
+                                vec!["record", "-a", "-g", "-F", "999"]
+                            }
                             None => anyhow::bail!(
-                                "FXDAX_BENCH_PERF is record, record:EVENTS or stat:EVENTS"
+                                "FXDAX_BENCH_PERF is record, record-all, record:EVENTS or \
+                                 stat:EVENTS"
                             ),
                         };
                         command
@@ -355,7 +361,7 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             vm.env(&iterations);
             vm.env(&groups);
             vm.env(&guest_perf);
-            for var in ["FXDAX_BENCH_FILES", "FXDAX_BENCH_PGBENCH_SECS"] {
+            for var in ["FXDAX_BENCH_FILES", "FXDAX_BENCH_PGBENCH_SECS", "FXDAX_BENCH_WATCHDOG_SECS"] {
                 if let Ok(value) = std::env::var(var) {
                     vm.env(&CString::new(format!("{var}={value}"))?);
                 }
@@ -471,7 +477,40 @@ mod guest {
         fs::write("/proc/sys/vm/drop_caches", b"3").unwrap();
     }
 
+    /// When the last result was reported, in seconds since the epoch: what the watchdog watches.
+    static PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    /// Watches for a workload making no progress for FXDAX_BENCH_WATCHDOG_SECS (180): then the
+    /// kernel's blocked tasks' stacks (sysrq w), and its log, go to standard error, once, so that
+    /// a hang says where.
+    fn start_watchdog() {
+        let limit: u64 = std::env::var("FXDAX_BENCH_WATCHDOG_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(180);
+        PROGRESS.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let last = PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs().saturating_sub(last) >= limit {
+                    eprintln!("WATCHDOG: no progress for {limit} s: blocked tasks follow");
+                    let _ = fs::write("/proc/sysrq-trigger", b"w");
+                    print_kernel_log();
+                    return;
+                }
+            }
+        });
+    }
+
     fn result(workload: &str, unit: &str, higher_is_better: bool, value: f64) {
+        PROGRESS.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
         let better = if higher_is_better { "higher" } else { "lower" };
         println!("RESULT {workload} {unit} {better} {value:.3}");
         std::io::stdout().flush().unwrap();
@@ -1063,36 +1102,56 @@ mod guest {
         let secs = std::env::var("FXDAX_BENCH_PGBENCH_SECS").unwrap_or_else(|_| "20".into());
         // PostgreSQL refuses to run as root.
         let as_postgres = |command: &str| {
-            let status = Command::new("su")
+            Command::new("su")
                 .args(["postgres", "-s", "/bin/sh", "-c", command])
-                .stdout(std::process::Stdio::null())
-                .status()
-                .expect("su");
-            assert!(status.success(), "{command}: {status}");
+                .output()
+                .expect("su")
         };
+        let check = |what: &str, output: &std::process::Output| {
+            assert!(
+                output.status.success(),
+                "{what}: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        /// Stops the server and removes its data, however the workload ends.
+        struct Server<'a>(&'a str, &'a dyn Fn(&str) -> std::process::Output);
+        impl Drop for Server<'_> {
+            fn drop(&mut self) {
+                let stop = (self.1)(&format!("pg_ctl -D {} -w -m fast stop", self.0));
+                if !stop.status.success() {
+                    eprintln!("pg_ctl stop: {}", String::from_utf8_lossy(&stop.stderr));
+                    if let Ok(log) = fs::read_to_string(format!("{}/server.log", self.0)) {
+                        eprintln!("server.log:\n{log}");
+                    }
+                }
+                run("rm", &["-rf", self.0]);
+            }
+        }
         fs::create_dir_all(socket).unwrap();
         fs::create_dir(&data).unwrap();
         run("chown", &["postgres:postgres", &data, socket]);
-        as_postgres(&format!("initdb -D {data} -U postgres -A trust >/dev/null"));
-        as_postgres(&format!(
-            "pg_ctl -D {data} -w -l {data}/server.log start -o \"-c listen_addresses='' -c \
-             unix_socket_directories={socket}\""
-        ));
+        check("initdb", &as_postgres(&format!("initdb -D {data} -U postgres -A trust")));
+        check(
+            "pg_ctl start",
+            &as_postgres(&format!(
+                "pg_ctl -D {data} -w -l {data}/server.log start -o \"-c listen_addresses='' -c \
+                 unix_socket_directories={socket}\""
+            )),
+        );
+        let _server = Server(&data, &as_postgres);
         let start = Instant::now();
-        as_postgres(&format!("pgbench -h {socket} -i -s 10 -q postgres 2>/dev/null"));
+        check("pgbench -i", &as_postgres(&format!("pgbench -h {socket} -i -s 10 -q postgres")));
         result("pgbench-init", "s", false, start.elapsed().as_secs_f64());
-        let output = Command::new("su")
-            .args([
-                "postgres",
-                "-s",
-                "/bin/sh",
-                "-c",
-                &format!("pgbench -h {socket} -c 4 -j 2 -T {secs} postgres 2>/dev/null"),
-            ])
-            .output()
-            .expect("pgbench");
+        // Observed per transaction, at about the rate ext4 commits them.
+        let expected = secs.parse::<usize>().unwrap_or(20) * 1600;
+        let output = observed("pgbench-tps", expected, || {
+            as_postgres(&format!("pgbench -h {socket} -c 4 -j 2 -T {secs} postgres"))
+        });
+        check("pgbench", &output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "pgbench: {stdout}");
         // "tps = 1234.5 (without initial connection time)"
         let tps = stdout
             .lines()
@@ -1101,8 +1160,6 @@ mod guest {
             .and_then(|tps| tps.parse::<f64>().ok())
             .unwrap_or_else(|| panic!("no tps in pgbench's output: {stdout}"));
         result("pgbench-tps", "tps", true, tps);
-        as_postgres(&format!("pg_ctl -D {data} -w -m fast stop >/dev/null"));
-        run("rm", &["-rf", &data]);
     }
 
     /// Prints the kernel's messages, from /dev/kmsg, to say what a filesystem logged when a
@@ -1126,6 +1183,7 @@ mod guest {
 
     impl Test for TestFsBench {
         fn in_guest(self: Box<Self>) {
+            start_watchdog();
             let default_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 default_hook(info);

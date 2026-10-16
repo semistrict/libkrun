@@ -370,7 +370,12 @@ fn enter_firecracker(
         .arg("--log-path")
         .arg(dir.join("firecracker.log"))
         .arg("--level")
-        .arg(std::env::var("FXDAX_FIRECRACKER_LOG_LEVEL").unwrap_or_else(|_| "Warning".into()))
+        .arg(
+            std::env::var("FXDAX_FIRECRACKER_LOG_LEVEL")
+                .ok()
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| "Warning".into()),
+        )
         .stdin(std::process::Stdio::null())
         // A file, not a pipe: Firecracker drops what its serial port says when its standard
         // output would block.

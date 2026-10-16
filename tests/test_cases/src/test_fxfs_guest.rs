@@ -620,6 +620,9 @@ mod guest {
         fs::write(&path, &data).unwrap();
         assert!(is_dax(&path), "{path} is not DAX");
         evict(&path);
+        // The spare a seal leaves mapped, before counting: a sync waits for it.
+        unsafe { libc::sync() };
+        unsafe { libc::sync() };
         let (reads, maps) = (requests("read"), requests("map"));
         assert_eq!(fs::read(&path).unwrap(), data);
         assert_eq!(requests("read"), reads, "reading the file read from the device");
@@ -629,21 +632,27 @@ mod guest {
 
     /// Small files are DAX, and share an extent, which the window maps once for them all: as the
     /// files' blocks are handed out, further each time, 16 pages first, then doubling, a step
-    /// ahead of them once they reach the second half of what is mapped, so 32 files of a block
-    /// take 3 MAPs (to 64 pages), and no READ. Evicted and read in again, they take neither.
+    /// ahead of them once they reach the second half of what is mapped. The first 16 pages are
+    /// mapped as a seal ends, before the writes (the spare), and the next extent's once the next
+    /// seal does, so 32 files of a block take 3 MAPs (to 64 pages, and the next spare), and no
+    /// READ. Evicted and read in again, they take neither.
     fn small_files_share() {
         let dir = format!("{MNT}/small");
         fs::create_dir(&dir).unwrap();
         let files: Vec<(String, Vec<u8>)> = (0..32)
             .map(|i| (format!("{dir}/file-{i}"), pattern(100 + i, i as u8)))
             .collect();
-        // Sealed, the next small write takes a new extent.
+        // Sealed, the next small write takes a new extent, mapped ahead of it: a sync waits for
+        // the spare the seal before it left to be mapped.
+        fs::write(format!("{dir}/seed"), b"seed").unwrap();
+        unsafe { libc::sync() };
         unsafe { libc::sync() };
         let (reads, maps) = (requests("read"), requests("map"));
         for (path, data) in &files {
             fs::write(path, data).unwrap();
         }
         // A sync waits for the region to grow as far ahead of the writes as it does.
+        unsafe { libc::sync() };
         unsafe { libc::sync() };
         assert_eq!(requests("map"), maps + 3, "the small files' MAPs");
         assert_eq!(requests("read"), reads, "writing small files read from the device");
@@ -660,6 +669,7 @@ mod guest {
         for (path, _) in &files {
             fs::remove_file(path).unwrap();
         }
+        fs::remove_file(format!("{dir}/seed")).unwrap();
         fs::remove_dir(&dir).unwrap();
     }
 
@@ -681,6 +691,10 @@ mod guest {
         // Read in what the operations will touch.
         let _ = names(MNT);
         let _ = fs::metadata(format!("{MNT}/guest-dir/renamed")).unwrap();
+        // What earlier writes left to do in the background, done: a sync waits for the frees,
+        // and the next for the spare mapped once the first's seal ended.
+        unsafe { libc::sync() };
+        unsafe { libc::sync() };
         let before = device_requests();
         for i in 0..20 {
             let path = format!("{dir}/file-{i}");

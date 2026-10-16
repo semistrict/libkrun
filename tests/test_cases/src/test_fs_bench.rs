@@ -502,7 +502,7 @@ mod guest {
                 if now_secs().saturating_sub(last) >= limit {
                     eprintln!("WATCHDOG: no progress for {limit} s: blocked tasks follow");
                     let _ = fs::write("/proc/sysrq-trigger", b"w");
-                    print_kernel_log();
+                    crate::kernel_log::print();
                     return;
                 }
             }
@@ -1162,32 +1162,13 @@ mod guest {
         result("pgbench-tps", "tps", true, tps);
     }
 
-    /// Prints the kernel's messages, from /dev/kmsg, to say what a filesystem logged when a
-    /// workload fails.
-    fn print_kernel_log() {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let Ok(mut kmsg) = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open("/dev/kmsg")
-        else {
-            return;
-        };
-        let mut record = [0u8; 8192];
-        // Each read is a record, until there are no more.
-        while let Ok(n) = kmsg.read(&mut record) {
-            eprint!("kernel: {}", String::from_utf8_lossy(&record[..n]));
-        }
-    }
-
     impl Test for TestFsBench {
         fn in_guest(self: Box<Self>) {
             start_watchdog();
             let default_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 default_hook(info);
-                print_kernel_log();
+                crate::kernel_log::print();
             }));
             match self.backend {
                 Backend::Passthrough => mount("bench", "virtiofs", "dax=never"),

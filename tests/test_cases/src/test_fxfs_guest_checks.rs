@@ -912,6 +912,8 @@ mod guest {
             if failed.is_empty() {
                 println!("OK");
             } else {
+                // What the guest's Fxfs logged.
+                crate::kernel_log::print();
                 println!("FAILED: {}", failed.join(", "));
             }
         }

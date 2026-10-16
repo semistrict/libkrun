@@ -45,6 +45,9 @@ mod test_fxfs_guest_checks;
 #[cfg(any(feature = "host", target_os = "linux"))]
 use test_fxfs_guest_checks::TestFxfsGuestChecks;
 
+#[cfg(target_os = "linux")]
+mod kernel_log;
+
 #[cfg(any(feature = "host", target_os = "linux"))]
 mod test_fs_bench;
 #[cfg(any(feature = "host", target_os = "linux"))]

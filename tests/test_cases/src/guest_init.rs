@@ -10,20 +10,21 @@ use nix::libc;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::{STDERR_END, STDERR_START};
 
-/// The guest, set up: what forwards the agent's standard error to the console.
+/// The guest, set up: the console, and what forwards the agent's output to it.
 pub struct Init {
-    /// Says the forwarder has forwarded all there was.
-    forwarded: mpsc::Receiver<()>,
+    console: File,
+    /// Say the forwarders have forwarded all there was.
+    forwarded: Vec<mpsc::Receiver<()>>,
 }
 
 /// Mounts what libkrun's init mounts, has the console pass the test's output as it is written,
-/// and frames standard error on it.
+/// and forwards the agent's output there, framing standard error.
 pub fn set_up() -> Init {
     const NOEXEC: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
     let mounts: [(&CStr, &CStr, &CStr, libc::c_ulong); 6] = [
@@ -81,32 +82,43 @@ pub fn set_up() -> Init {
             libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &termios);
         }
     }
-    Init {
-        forwarded: forward_stderr(),
-    }
+    // The workload's output goes through pipes, as libkrun's init has it, so that programs that
+    // act differently on a terminal, such as fio, do not.
+    // SAFETY: Duplicates the console, which the copy owned below refers to.
+    let console = unsafe {
+        let console = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0);
+        assert!(console >= 0, "dup: {}", std::io::Error::last_os_error());
+        File::from(OwnedFd::from_raw_fd(console))
+    };
+    let forwarded = vec![
+        forward(libc::STDOUT_FILENO, None, &console),
+        forward(
+            libc::STDERR_FILENO,
+            Some((STDERR_START, STDERR_END)),
+            &console,
+        ),
+    ];
+    Init { console, forwarded }
 }
 
-/// Makes standard error a pipe, which the agent's children inherit, and forwards what is written
-/// to it to the console, a write at a time, each framed. Returns what says it is all forwarded.
-fn forward_stderr() -> mpsc::Receiver<()> {
+/// Makes `fd` a pipe, which the agent's children inherit, and forwards what is written to it to
+/// the console, a write at a time, each between `frame`'s bytes if any. Returns what says it is
+/// all forwarded.
+fn forward(fd: libc::c_int, frame: Option<(u8, u8)>, console: &File) -> mpsc::Receiver<()> {
     let mut fds = [0; 2];
-    // SAFETY: Plain system calls; the descriptors made are owned below.
-    let (pipe, console) = unsafe {
+    // SAFETY: Plain system calls; the read end is owned below.
+    let pipe = unsafe {
         assert_eq!(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC), 0);
-        assert_eq!(libc::dup2(fds[1], libc::STDERR_FILENO), libc::STDERR_FILENO);
+        assert_eq!(libc::dup2(fds[1], fd), fd);
         libc::close(fds[1]);
-        let console = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0);
-        assert!(console >= 0);
-        (
-            File::from(OwnedFd::from_raw_fd(fds[0])),
-            File::from(OwnedFd::from_raw_fd(console)),
-        )
+        File::from(OwnedFd::from_raw_fd(fds[0]))
     };
+    let mut console = console.try_clone().expect("dup the console");
     let (done, forwarded) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut pipe, mut console) = (pipe, console);
+        let mut pipe = pipe;
         let mut buffer = vec![0; 4096];
-        let mut frame = Vec::with_capacity(buffer.len() + 2);
+        let mut framed = Vec::with_capacity(buffer.len() + 2);
         loop {
             let n = match pipe.read(&mut buffer) {
                 Ok(0) => break,
@@ -114,12 +126,17 @@ fn forward_stderr() -> mpsc::Receiver<()> {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            frame.clear();
-            frame.push(STDERR_START);
-            frame.extend_from_slice(&buffer[..n]);
-            frame.push(STDERR_END);
-            // One write, which a write to standard output cannot come in the middle of.
-            if console.write_all(&frame).is_err() {
+            framed.clear();
+            match frame {
+                Some((start, end)) => {
+                    framed.push(start);
+                    framed.extend_from_slice(&buffer[..n]);
+                    framed.push(end);
+                }
+                None => framed.extend_from_slice(&buffer[..n]),
+            }
+            // One write, which the other forwarder's cannot come in the middle of.
+            if console.write_all(&framed).is_err() {
                 break;
             }
         }
@@ -132,16 +149,23 @@ impl Init {
     /// Resets the VM, which ends it, once the test's output has reached the host.
     pub fn reset(self) -> ! {
         let _ = std::io::stdout().flush();
-        // The forwarder forwards all there is once nothing has standard error open, which a
-        // process the test left running may still.
-        // SAFETY: Closes the agent's standard error, which nothing uses from now on.
-        unsafe { libc::close(libc::STDERR_FILENO) };
-        let _ = self.forwarded.recv_timeout(Duration::from_secs(1));
+        // The forwarders forward all there is once nothing has the pipes open, which a process
+        // the test left running may still.
+        // SAFETY: Closes the agent's output, which nothing uses from now on.
+        unsafe {
+            libc::close(libc::STDOUT_FILENO);
+            libc::close(libc::STDERR_FILENO);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        for forwarded in &self.forwarded {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = forwarded.recv_timeout(left);
+        }
         // SAFETY: Plain system calls.
         unsafe {
             // What the test wrote reaches the host's storage, as libkrun's init has it.
             libc::sync();
-            libc::tcdrain(libc::STDOUT_FILENO);
+            libc::tcdrain(self.console.as_raw_fd());
             // Not a word more on the console: the kernel would say it restarts.
             const SYSLOG_ACTION_CONSOLE_OFF: libc::c_int = 6;
             libc::klogctl(SYSLOG_ACTION_CONSOLE_OFF, std::ptr::null_mut(), 0);

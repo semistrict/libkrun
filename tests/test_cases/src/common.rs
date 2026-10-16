@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null;
 
-use crate::{ShouldRun, TestSetup, krun_call, krun_call_u32};
+use crate::{ShouldRun, TestSetup, krun_call};
 use krun_sys::*;
 
 fn copy_guest_agent(dir: &Path) -> anyhow::Result<()> {

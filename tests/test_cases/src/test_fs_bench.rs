@@ -14,7 +14,9 @@
 //
 // The cases only run when FXDAX_BENCH_ITERATIONS is set. FXDAX_BENCH_GROUPS limits them to some
 // of the groups of workloads: io, metadata and build, separated by commas, or parts of metadata:
-// files, fsync, tree, large-dir and concurrent. With
+// files, fsync, tree, large-dir and concurrent; pgbench, PostgreSQL's benchmark, runs only when it
+// names it. FXDAX_BENCH_FILES sets how many files the metadata workloads make (2000), and
+// FXDAX_BENCH_PGBENCH_SECS how long pgbench's transactions run (20). With
 // FXDAX_BENCH_RESULTS set to a directory, the host also writes each case's measurements there as
 // JSON, which scripts/bench-report.py turns into tables comparing the filesystems. With
 // FXDAX_BENCH_PERF set to `record`, perf profiles each case's VMM into perf.data in its directory,
@@ -82,7 +84,7 @@ mod host {
 
     const CONTAINERFILE: &str = "\
 FROM alpine:3.22
-RUN apk add --no-cache fio gcc make musl-dev e2fsprogs perf
+RUN apk add --no-cache fio gcc make musl-dev e2fsprogs perf postgresql postgresql-contrib
 RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
     && echo '9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30  /opt/lua-5.4.7.tar.gz' \\
     | sha256sum -c
@@ -353,6 +355,11 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
             vm.env(&iterations);
             vm.env(&groups);
             vm.env(&guest_perf);
+            for var in ["FXDAX_BENCH_FILES", "FXDAX_BENCH_PGBENCH_SECS"] {
+                if let Ok(value) = std::env::var(var) {
+                    vm.env(&CString::new(format!("{var}={value}"))?);
+                }
+            }
             // The compiler finds the assembler and linker through PATH.
             vm.env(c"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
             vm.env(c"HOME=/root");
@@ -412,8 +419,11 @@ mod guest {
     const RANDOM_SIZE: u64 = 64 << 20;
     const RUNTIME: &str = "--runtime=2";
     const MIB: f64 = (1 << 20) as f64;
-    /// The number of files the metadata workloads create, stat, list and remove.
-    const FILES: usize = 2_000;
+    /// The number of files the metadata workloads create, stat, list and remove: FXDAX_BENCH_FILES,
+    /// or 2000, whose workloads take milliseconds.
+    fn files() -> usize {
+        std::env::var("FXDAX_BENCH_FILES").ok().and_then(|n| n.parse().ok()).unwrap_or(2_000)
+    }
     /// The files created and fsynced one at a time.
     const FSYNCED: usize = 200;
     /// The tree's directories, and the files in each.
@@ -421,7 +431,7 @@ mod guest {
     const TREE_FILES: usize = 40;
     /// The files in the large directory.
     const LARGE_DIR: usize = 20_000;
-    /// The threads of the concurrent workloads, each making `FILES` files.
+    /// The threads of the concurrent workloads, each making `files()` files.
     const THREADS: usize = 4;
 
     fn run(program: &str, args: &[&str]) {
@@ -790,43 +800,44 @@ mod guest {
 
     /// Operations on the names and attributes of many small files in one directory.
     fn files_workloads() {
+        let files = files();
         let dir = format!("{MNT}/meta");
         let other = format!("{MNT}/meta-other");
         fs::create_dir(&dir).unwrap();
         fs::create_dir(&other).unwrap();
-        let paths: Vec<String> = (0..FILES).map(|i| format!("{dir}/file-{i}")).collect();
+        let paths: Vec<String> = (0..files).map(|i| format!("{dir}/file-{i}")).collect();
 
-        timed("create", FILES, || {
+        timed("create", files, || {
             for path in &paths {
                 fs::write(path, b"a small file").unwrap();
             }
         });
         drop_caches();
-        timed("stat-cold", FILES, || {
+        timed("stat-cold", files, || {
             for path in &paths {
                 fs::metadata(path).unwrap();
             }
         });
-        timed("stat-warm", FILES, || {
+        timed("stat-warm", files, || {
             for path in &paths {
                 fs::metadata(path).unwrap();
             }
         });
-        timed("lookup-missing", FILES, || {
-            for i in 0..FILES {
+        timed("lookup-missing", files, || {
+            for i in 0..files {
                 assert!(fs::metadata(format!("{dir}/missing-{i}")).is_err());
             }
         });
-        timed("readdir", FILES, || {
-            assert_eq!(fs::read_dir(&dir).unwrap().count(), FILES);
+        timed("readdir", files, || {
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), files);
         });
         drop_caches();
-        timed("read-small-cold", FILES, || {
+        timed("read-small-cold", files, || {
             for path in &paths {
                 assert_eq!(fs::read(path).unwrap().len(), 12);
             }
         });
-        timed("chmod", FILES, || {
+        timed("chmod", files, || {
             for path in &paths {
                 fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                     .unwrap();
@@ -839,34 +850,34 @@ mod guest {
             }
             first => {
                 first.unwrap();
-                timed("setxattr", FILES, || {
+                timed("setxattr", files, || {
                     for path in &paths {
                         setxattr(path, "user.bench", b"a value").unwrap();
                     }
                 });
             }
         }
-        timed("link", FILES, || {
+        timed("link", files, || {
             for (i, path) in paths.iter().enumerate() {
                 fs::hard_link(path, format!("{dir}/link-{i}")).unwrap();
             }
         });
-        timed("rename", FILES, || {
-            for i in 0..FILES {
+        timed("rename", files, || {
+            for i in 0..files {
                 fs::rename(format!("{dir}/link-{i}"), format!("{dir}/renamed-{i}")).unwrap();
             }
         });
-        timed("rename-across", FILES, || {
-            for i in 0..FILES {
+        timed("rename-across", files, || {
+            for i in 0..files {
                 fs::rename(format!("{dir}/renamed-{i}"), format!("{other}/moved-{i}")).unwrap();
             }
         });
-        timed("unlink", FILES, || {
+        timed("unlink", files, || {
             for path in &paths {
                 fs::remove_file(path).unwrap();
             }
         });
-        for i in 0..FILES {
+        for i in 0..files {
             fs::remove_file(format!("{other}/moved-{i}")).unwrap();
         }
         fs::remove_dir(&dir).unwrap();
@@ -947,23 +958,24 @@ mod guest {
     /// `THREADS` threads creating, statting and removing files at once: each in a directory of its
     /// own, and all in one.
     fn concurrent_workloads() {
-        let count = THREADS * FILES;
+        let files = files();
+        let count = THREADS * files;
         let own = |thread: usize| format!("{MNT}/thread-{thread}");
         for thread in 0..THREADS {
             fs::create_dir(own(thread)).unwrap();
         }
         parallel("create-parallel", count, |thread| {
-            for i in 0..FILES {
+            for i in 0..files {
                 fs::File::create(format!("{}/f{i}", own(thread))).unwrap();
             }
         });
         parallel("stat-parallel", count, |thread| {
-            for i in 0..FILES {
+            for i in 0..files {
                 fs::metadata(format!("{}/f{i}", own(thread))).unwrap();
             }
         });
         parallel("unlink-parallel", count, |thread| {
-            for i in 0..FILES {
+            for i in 0..files {
                 fs::remove_file(format!("{}/f{i}", own(thread))).unwrap();
             }
         });
@@ -974,12 +986,12 @@ mod guest {
         let shared = format!("{MNT}/shared");
         fs::create_dir(&shared).unwrap();
         parallel("create-shared-dir", count, |thread| {
-            for i in 0..FILES {
+            for i in 0..files {
                 fs::File::create(format!("{shared}/t{thread}-f{i}")).unwrap();
             }
         });
         parallel("unlink-shared-dir", count, |thread| {
-            for i in 0..FILES {
+            for i in 0..files {
                 fs::remove_file(format!("{shared}/t{thread}-f{i}")).unwrap();
             }
         });
@@ -1042,6 +1054,57 @@ mod guest {
         run("rm", &["-rf", &dir]);
     }
 
+    /// PostgreSQL's pgbench, its TPC-B-like transactions, on a database on the filesystem: the
+    /// database made (`pgbench -i`, scale 10, about 160 MiB) and FXDAX_BENCH_PGBENCH_SECS (default
+    /// 20) of transactions from 4 clients, each committing durably.
+    fn pgbench_workload() {
+        let data = format!("{MNT}/pgdata");
+        let socket = "/run/pgbench";
+        let secs = std::env::var("FXDAX_BENCH_PGBENCH_SECS").unwrap_or_else(|_| "20".into());
+        // PostgreSQL refuses to run as root.
+        let as_postgres = |command: &str| {
+            let status = Command::new("su")
+                .args(["postgres", "-s", "/bin/sh", "-c", command])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("su");
+            assert!(status.success(), "{command}: {status}");
+        };
+        fs::create_dir_all(socket).unwrap();
+        fs::create_dir(&data).unwrap();
+        run("chown", &["postgres:postgres", &data, socket]);
+        as_postgres(&format!("initdb -D {data} -U postgres -A trust >/dev/null"));
+        as_postgres(&format!(
+            "pg_ctl -D {data} -w -l {data}/server.log start -o \"-c listen_addresses='' -c \
+             unix_socket_directories={socket}\""
+        ));
+        let start = Instant::now();
+        as_postgres(&format!("pgbench -h {socket} -i -s 10 -q postgres 2>/dev/null"));
+        result("pgbench-init", "s", false, start.elapsed().as_secs_f64());
+        let output = Command::new("su")
+            .args([
+                "postgres",
+                "-s",
+                "/bin/sh",
+                "-c",
+                &format!("pgbench -h {socket} -c 4 -j 2 -T {secs} postgres 2>/dev/null"),
+            ])
+            .output()
+            .expect("pgbench");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "pgbench: {stdout}");
+        // "tps = 1234.5 (without initial connection time)"
+        let tps = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("tps = "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|tps| tps.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no tps in pgbench's output: {stdout}"));
+        result("pgbench-tps", "tps", true, tps);
+        as_postgres(&format!("pg_ctl -D {data} -w -m fast stop >/dev/null"));
+        run("rm", &["-rf", &data]);
+    }
+
     /// Prints the kernel's messages, from /dev/kmsg, to say what a filesystem logged when a
     /// workload fails.
     fn print_kernel_log() {
@@ -1099,6 +1162,12 @@ mod guest {
                 if runs("build") && std::panic::catch_unwind(build_workload).is_err() {
                     println!("FAILED build");
                     run("rm", &["-rf", &format!("{MNT}/build")]);
+                }
+                // pgbench runs only when named, which keeps a run of every other group short.
+                if groups.split(',').any(|g| g == "pgbench")
+                    && std::panic::catch_unwind(pgbench_workload).is_err()
+                {
+                    println!("FAILED pgbench");
                 }
                 drop_caches();
             }

@@ -5,7 +5,7 @@
 // FXDAX_GUEST_KERNEL names, with an extent-store device on a new store, which
 // the guest formats as it mounts it. Then, step by step, as the guest asks by
 // creating a file in its root (the host's directory, shared), the host resizes
-// the store through fxdax's extent daemon, as fxdax-branch resize does, and
+// the store through fxdax's extent daemon, as fxdaxctl resize does, and
 // answers with another file: it grows the store, which the guest's statfs and
 // allocator take while mounted, the guest then writing more than the first size
 // held; shrinks it, above what the filesystem holds, which the guest agrees to;

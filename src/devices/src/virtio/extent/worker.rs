@@ -23,6 +23,7 @@ use super::{
     VIRTIO_EXTENT_T_FREE, VIRTIO_EXTENT_T_INFO, VIRTIO_EXTENT_T_MAP, VIRTIO_EXTENT_T_READ,
     VIRTIO_EXTENT_T_ROOT, VIRTIO_EXTENT_T_UNMAP, VIRTIO_EXTENT_T_WRITE, write_barriers,
 };
+use super::{Resizing, ResizedArgs, VIRTIO_EXTENT_RESIZED_TOOK, VIRTIO_EXTENT_T_RESIZED};
 use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::{DescriptorChain, InterruptTransport};
 
@@ -34,20 +35,20 @@ const SERVERS: usize = 8;
 /// costs.
 #[derive(Default)]
 struct Served {
-    count: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
-    nanos: [AtomicU64; VIRTIO_EXTENT_T_INFO as usize + 1],
+    count: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
+    nanos: [AtomicU64; VIRTIO_EXTENT_T_RESIZED as usize + 1],
 }
 
 impl Served {
     fn add(&self, type_: Option<u32>, nanos: u64) {
-        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_INFO) {
+        if let Some(type_) = type_.filter(|t| *t <= VIRTIO_EXTENT_T_RESIZED) {
             self.count[type_ as usize].fetch_add(1, Ordering::Relaxed);
             self.nanos[type_ as usize].fetch_add(nanos, Ordering::Relaxed);
         }
     }
 
     fn log(&self) {
-        for type_ in 0..=VIRTIO_EXTENT_T_INFO as usize {
+        for type_ in 0..=VIRTIO_EXTENT_T_RESIZED as usize {
             let count = self.count[type_].load(Ordering::Relaxed);
             if count > 0 {
                 let mean = self.nanos[type_].load(Ordering::Relaxed) as f64 / count as f64;
@@ -87,13 +88,14 @@ fn serve_one(
     interrupt: &InterruptTransport,
     mem: &GuestMemoryMmap,
     store: &RemoteExtentStore,
+    resizing: &Resizing,
     served: &Served,
     chain: DescriptorChain,
 ) {
     let index = chain.index;
     let type_ = request_type(mem, &chain);
     let start = Instant::now();
-    let len = handle(store, mem, chain);
+    let len = handle(store, resizing, mem, chain);
     served.add(type_, start.elapsed().as_nanos() as u64);
     complete(&mut queue.lock().unwrap(), interrupt, mem, index, len);
 }
@@ -103,6 +105,7 @@ pub struct ExtentWorker {
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
     store: Arc<RemoteExtentStore>,
+    resizing: Arc<Resizing>,
     stop_fd: EventFd,
 }
 
@@ -112,6 +115,7 @@ impl ExtentWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         store: Arc<RemoteExtentStore>,
+        resizing: Arc<Resizing>,
         stop_fd: EventFd,
     ) -> Self {
         Self {
@@ -119,6 +123,7 @@ impl ExtentWorker {
             interrupt,
             mem,
             store,
+            resizing,
             stop_fd,
         }
     }
@@ -137,6 +142,7 @@ impl ExtentWorker {
             interrupt,
             mem,
             store,
+            resizing,
             stop_fd,
         } = self;
         let queue = Mutex::new(queue);
@@ -145,20 +151,21 @@ impl ExtentWorker {
         let received = Mutex::new(received);
         thread::scope(|scope| {
             for server in 0..SERVERS {
-                let (queue, interrupt, mem, store, received, served) =
-                    (&queue, &interrupt, &mem, &store, &received, &served);
+                let (queue, interrupt, mem, store, resizing, received, served) =
+                    (&queue, &interrupt, &mem, &store, &resizing, &received, &served);
                 thread::Builder::new()
                     .name(format!("extent server {server}"))
                     .spawn_scoped(scope, move || loop {
                         let Ok(chain) = received.lock().unwrap().recv() else {
                             return;
                         };
-                        serve_one(queue, interrupt, mem, store, served, chain);
+                        serve_one(queue, interrupt, mem, store, resizing, served, chain);
                     })
                     .unwrap();
             }
             // Once stopped, the servers finish what they took and return as the channel closes.
-            let inline = |chain| serve_one(&queue, &interrupt, &mem, &store, &served, chain);
+            let inline =
+                |chain| serve_one(&queue, &interrupt, &mem, &store, &resizing, &served, chain);
             take_requests(&queue, &mem, &stop_fd, requests, inline);
         });
         served.log();
@@ -253,7 +260,12 @@ fn complete(
 /// Serves the request in `chain` with `store`, and returns the length of what
 /// the device writes to it: its writable buffers, whose last bytes hold the
 /// response.
-pub fn handle(store: &RemoteExtentStore, mem: &GuestMemoryMmap, chain: DescriptorChain) -> u32 {
+pub fn handle(
+    store: &RemoteExtentStore,
+    resizing: &Resizing,
+    mem: &GuestMemoryMmap,
+    chain: DescriptorChain,
+) -> u32 {
     let (mut reader, mut writer) = match (Reader::new(mem, chain.clone()), Writer::new(mem, chain))
     {
         (Ok(reader), Ok(writer)) => (reader, writer),
@@ -269,7 +281,7 @@ pub fn handle(store: &RemoteExtentStore, mem: &GuestMemoryMmap, chain: Descripto
         return 0;
     };
     let mut data = Vec::new();
-    let status = match serve(store, &mut reader, data_len, &mut data) {
+    let status = match serve(store, resizing, &mut reader, data_len, &mut data) {
         Ok(()) => 0,
         Err(errno) => {
             data.clear();
@@ -302,6 +314,7 @@ fn invalid(_: io::Error) -> Errno {
 /// which the driver gave `room` bytes for.
 fn serve(
     store: &RemoteExtentStore,
+    resizing: &Resizing,
     reader: &mut Reader,
     room: usize,
     out: &mut Vec<u8>,
@@ -410,6 +423,13 @@ fn serve(
             out.extend_from_slice(info.as_slice());
             Ok(())
         }
+        VIRTIO_EXTENT_T_RESIZED => {
+            let args: ResizedArgs = reader.read_obj().map_err(invalid)?;
+            let capacity = u64::from_le(args.capacity);
+            let took = flags & VIRTIO_EXTENT_RESIZED_TOOK != 0;
+            resizing.answered(capacity, took);
+            store.resized(capacity, took)
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -496,7 +516,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let used = handle(store, &mem, chain) as usize;
+        let used = handle(store, &Resizing::default(), &mem, chain) as usize;
         let mut written = vec![0; writable];
         mem.read_slice(
             &mut written,

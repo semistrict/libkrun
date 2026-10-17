@@ -15,8 +15,9 @@ use vm_memory::{ByteValued, GuestMemoryMmap};
 use super::dax::{PrefaultGuestMemory, create_dax_window};
 use super::worker::ExtentWorker;
 use super::{
-    Config, MAX_EXTENT, MAX_ROOT, MAX_TRANSFER, NUM_QUEUES, QUEUE_CONFIG, QUEUE_SIZE, TYPE_EXTENT,
-    VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_WRITE_COMMIT,
+    Config, MAX_EXTENT, MAX_ROOT, MAX_TRANSFER, NUM_QUEUES, QUEUE_CONFIG, QUEUE_SIZE, Resizing,
+    TYPE_EXTENT, VIRTIO_EXTENT_F_DAX, VIRTIO_EXTENT_F_DAX_WRITE, VIRTIO_EXTENT_F_RESIZE,
+    VIRTIO_EXTENT_F_WRITE_COMMIT,
 };
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
@@ -26,6 +27,8 @@ use crate::virtio::{
 pub struct Extent {
     store: Arc<RemoteExtentStore>,
     config: Config,
+    /// The store's capacity, as the daemon changes it.
+    resizing: Arc<Resizing>,
     avail_features: u64,
     acked_features: u64,
     device_state: DeviceState,
@@ -61,7 +64,14 @@ impl Extent {
             max_root: MAX_ROOT.to_le(),
             branch: store.branch().to_le(),
             max_extent: MAX_EXTENT.to_le(),
+            capacity: 0,
+            asked: 0,
         };
+        let resizing = Arc::new(Resizing::default());
+        let capacity = store.info().map_err(|err| io::Error::other(format!("{err:#}")))?.capacity;
+        resizing.capacity.store(capacity, std::sync::atomic::Ordering::Release);
+        let changes = resizing.clone();
+        store.on_capacity(move |capacity, ask| changes.changed(capacity, ask));
         let tag = tag.as_bytes();
         if tag.len() > config.tag.len() {
             return Err(io::Error::other(format!(
@@ -73,7 +83,10 @@ impl Extent {
         Ok(Self {
             store: Arc::new(store),
             config,
-            avail_features: (1 << VIRTIO_F_VERSION_1) | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT),
+            resizing,
+            avail_features: (1 << VIRTIO_F_VERSION_1)
+                | (1 << VIRTIO_EXTENT_F_WRITE_COMMIT)
+                | (1 << VIRTIO_EXTENT_F_RESIZE),
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
@@ -137,7 +150,13 @@ impl VirtioDevice for Extent {
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
-        let config = self.config.as_slice();
+        use std::sync::atomic::Ordering;
+        let config = Config {
+            capacity: self.resizing.capacity.load(Ordering::Acquire).to_le(),
+            asked: self.resizing.asked.load(Ordering::Acquire).to_le(),
+            ..self.config
+        };
+        let config = config.as_slice();
         let len = config.len() as u64;
         if offset >= len {
             error!("extent device: reading config past its end");
@@ -187,9 +206,11 @@ impl VirtioDevice for Extent {
             interrupt.clone(),
             mem.clone(),
             self.store.clone(),
+            self.resizing.clone(),
             stop_fd,
         );
         self.worker = Some(worker.run());
+        *self.resizing.interrupt.lock().unwrap() = Some(interrupt.clone());
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
     }

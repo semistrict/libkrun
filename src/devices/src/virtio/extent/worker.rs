@@ -405,6 +405,7 @@ fn serve(
                 used: info.used.to_le(),
                 available: info.available.to_le(),
                 next_sequence: info.next_sequence.to_le(),
+                sequence_floor: info.sequence_floor.to_le(),
             };
             out.extend_from_slice(info.as_slice());
             Ok(())
@@ -668,7 +669,8 @@ mod tests {
                 capacity: 1 << 20,
                 used: 0,
                 available: 1 << 20,
-                next_sequence: 0
+                next_sequence: 0,
+                sequence_floor: 0
             }
         );
     }

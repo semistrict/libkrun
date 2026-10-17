@@ -272,10 +272,13 @@ RUN wget -q -O /opt/lua-5.4.7.tar.gz https://www.lua.org/ftp/lua-5.4.7.tar.gz \\
         /// reports what the daemon serving the fork counted.
         pub fn run(backend: Backend, test_setup: &TestSetup) -> anyhow::Result<()> {
             let extentd = PathBuf::from(std::env::var_os("FXDAX_EXTENTD").context("FXDAX_EXTENTD")?);
-            let base = test_setup.tmp_dir.join("base");
+            // Under `extents`, which what keeps a run's results leaves out (bench-linux-host.sh).
+            let stores = test_setup.tmp_dir.join("extents");
+            std::fs::create_dir_all(&stores)?;
+            let base = stores.join("base");
             role(test_setup, "base", &base, &extentd)?;
             for i in 0..iterations().unwrap_or(1) {
-                let fork = test_setup.tmp_dir.join(format!("fork-{i}"));
+                let fork = stores.join(format!("fork-{i}"));
                 {
                     let store = opened(&extentd, &base)?;
                     store

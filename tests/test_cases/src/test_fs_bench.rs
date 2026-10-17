@@ -1099,7 +1099,11 @@ mod guest {
     fn pgbench_workload() {
         let data = format!("{MNT}/pgdata");
         let socket = "/run/pgbench";
-        let secs = std::env::var("FXDAX_BENCH_PGBENCH_SECS").unwrap_or_else(|_| "20".into());
+        // Set and empty, as scripts pass what they were not given, it is the default too.
+        let secs: u64 = std::env::var("FXDAX_BENCH_PGBENCH_SECS")
+            .ok()
+            .filter(|secs| !secs.is_empty())
+            .map_or(20, |secs| secs.parse().expect("FXDAX_BENCH_PGBENCH_SECS is a count"));
         // PostgreSQL refuses to run as root.
         let as_postgres = |command: &str| {
             Command::new("su")
@@ -1146,7 +1150,7 @@ mod guest {
         check("pgbench -i", &as_postgres(&format!("pgbench -h {socket} -i -s 10 -q postgres")));
         result("pgbench-init", "s", false, start.elapsed().as_secs_f64());
         // Observed per transaction, at about the rate ext4 commits them.
-        let expected = secs.parse::<usize>().unwrap_or(20) * 1600;
+        let expected = secs as usize * 1600;
         let output = observed("pgbench-tps", expected, || {
             as_postgres(&format!("pgbench -h {socket} -c 4 -j 2 -T {secs} postgres"))
         });
